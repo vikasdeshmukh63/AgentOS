@@ -28,5 +28,5 @@ body:
     attributes:
       label: Pre-submission checks
       options:
-        - label: I checked the current English source and its Korean mirror when applicable.
+        - label: I checked the current English source.
           required: true

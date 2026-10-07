@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 description = "AgentOS: a local AI workbench. Plan, queue, route, validate, and hand off long-running work using your already-installed Codex and Claude Code CLIs as hidden workers."
 license = "MIT"
-repository = "https://www.build01.com"
+repository = "https://github.com/vikasdeshmukh63/AgentOS"
 keywords = ["ai", "agent", "tui", "workbench", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # Ship only what is needed to build/use the crate. Keeps internal/non-public

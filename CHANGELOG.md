@@ -20,7 +20,7 @@
   plus an unrelated-sounding confirm error, with nothing saying the screen was
   dead (issue #138). The last good projection is still kept — a blank Home is
   worse — but Home now leads with one red row naming the failure and the `g`
-  retry key, in English and Korean, and clears it the moment a reload succeeds.
+  retry key, and clears it the moment a reload succeeds.
 
 ### Added
 
@@ -243,7 +243,7 @@
 
 - **TUI strings follow the selected language consistently.** Chrome, status,
   progress, completion, and error-prefix text authored by AgentOS now routes
-  through the localization tables in both Korean and English, including
+  through the localization tables, including
   previously leaking dynamic labels (`done:`, task and worker labels, and every
   TaskState variant). A static audit test fails the build if a forbidden literal
   reappears in production code.
@@ -252,7 +252,7 @@
   keys with something to act on, restoring the state-aware guide that had
   eroded as content-dependent keys were added without gating.
 
-- Review-screen shortcuts now apply the Korean-jamo fallback while a Korean IME
+- Review-screen shortcuts now apply the jamo fallback while an IME
   is active with `auto_ime` disabled.
 
 ## 0.10.2 - 2026-07-24
@@ -635,7 +635,7 @@
   before final verification instead of sharing the verifier's stale worktree
   snapshot. The barrier is scheduler-only rather than a hard dependency, so
   failed, deferred, or gated work cannot strand the verifier indefinitely.
-- **Korean status labels no longer leak English tokens.** The terminal UI task
+- **Status labels no longer leak English tokens.** The terminal UI task
   state labels (running, done, failed, blocked, needs-you, partial, deferred,
   queued) now render from the localized label table for the detected language
   instead of hardcoded English, so a Korean session shows Korean state labels
@@ -702,7 +702,7 @@
   monitor, done = view handoff, deferred = revive hint. An approval-required
   task without a grant is never run from Enter; it points at the approval flow
   instead. Stop messages now say why nothing ran and which key to press next,
-  in both the English and Korean label tables.
+  in the label tables.
 - **Cascade defer and revive.** `agentos defer <id> --cascade [reason]`
   now sets the target task and every queued task stranded behind it,
   transitively, to `Deferred` as one recorded group. `agentos revive <id>`
@@ -915,7 +915,7 @@
 - **Capability-based worker routing replaces the image-keyword router.** A task
   routes by a typed `required_capabilities` (planner-assigned) matched against a
   worker's declared `capabilities` in workers.yaml, instead of a hardcoded
-  English/Korean keyword list in the router. Routing restricts both the
+  keyword list in the router. Routing restricts both the
   candidate and the fallback set to workers that declare the capability; an
   explicit override to an incapable worker fails with a clear message. The
   "is this image generation?" judgment moves to the planner (the right layer);
@@ -1236,7 +1236,7 @@
   keeps the model it was spawned with, but `run_next` re-reads workers.yaml
   every task, so the switch takes effect without stopping the drain.
 
-- Input caret position with Korean text: the cursor drifted one cell per
+- Input caret position with CJK text: the cursor drifted one cell per
   wrapped line (width/box-width division ignored word wrap and double-width
   Hangul at the right edge). The caret now simulates the renderer's
   wrapping, including explicit newlines on earlier lines.
@@ -1295,7 +1295,7 @@
   probes every second (which froze the event loop ~100ms and ate keystrokes),
   and the Run Monitor renders from a cache instead of rescanning the runs
   directory and re-parsing the whole worker log every frame.
-- Keyboard shortcuts work with the Korean IME on: 2-beolsik jamo map back to
+- Keyboard shortcuts work with the IME on: jamo map back to
   their QWERTY keys on shortcut screens (ㅡ→m, ㅗ→h, Shift+ㅁ→A).
 - Single-press shortcuts under a CJK IME (macOS): on shortcut screens AgentOS
   auto-selects an ASCII input source (the im-select pattern), so the first

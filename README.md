@@ -1,11 +1,11 @@
 # AgentOS
 
 [![crates.io](https://img.shields.io/crates/v/agentos.svg)](https://crates.io/crates/agentos)
-[![CI](https://github.com/zzunkie/agentos/actions/workflows/ci.yml/badge.svg)](https://github.com/zzunkie/agentos/actions/workflows/ci.yml)
+[![CI](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml)
 [![downloads](https://img.shields.io/crates/d/agentos.svg)](https://crates.io/crates/agentos)
 [![license: MIT](https://img.shields.io/crates/l/agentos.svg)](LICENSE)
 
-**English** | [한국어](README.ko.md)
+
 
 > **Rent the intelligence. Own the loop.**
 > AgentOS owns the loop around the coding agents you already run. Describe

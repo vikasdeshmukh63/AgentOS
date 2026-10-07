@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes target the latest released version of Yardlet and the current
+Security fixes target the latest released version of AgentOS and the current
 `main` branch. Older releases may be affected and are supported on a best-effort
 basis. Reports should identify the exact Yardlet version or commit.
 
@@ -12,11 +12,11 @@ Do not open a public issue or pull request for a suspected vulnerability.
 
 Use GitHub's private vulnerability reporting:
 
-<https://github.com/zzunkie/yardlet/security/advisories/new>
+<https://github.com/vikasdeshmukh63/AgentOS/security/advisories/new>
 
 If that form is unavailable, use the contact method listed on the
-[@zzunkie GitHub profile](https://github.com/zzunkie) with the subject
-`[yardlet security]` and no secrets in the subject line.
+[@vikasdeshmukh63 GitHub profile](https://github.com/vikasdeshmukh63) with the subject
+`[AgentOS security]` and no secrets in the subject line.
 
 Include as much of the following as possible:
 
@@ -48,7 +48,7 @@ Reports are especially useful when they involve:
 
 An ordinary functional bug without a security-boundary impact can use the
 public bug form. A vulnerability in a third-party worker CLI should also be
-reported to that provider; report it to Yardlet when Yardlet causes or worsens
+reported to that provider; report it to AgentOS when AgentOS causes or worsens
 the exposure.
 
 ## Coordinated disclosure

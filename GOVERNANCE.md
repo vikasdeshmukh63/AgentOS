@@ -6,7 +6,7 @@ from proposal to release.
 
 ## Stewardship
 
-The repository owner, [@zzunkie](https://github.com/zzunkie), is the current
+The repository owner, [@vikasdeshmukh63](https://github.com/vikasdeshmukh63), is the current
 maintainer and final steward for:
 
 - product direction and public contracts;

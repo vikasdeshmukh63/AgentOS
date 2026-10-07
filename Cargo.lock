@@ -3,7 +3,7 @@
 version = 3
 
 [[package]]
-name = "agentos"
+name = "agentos-build01"
 version = "0.10.3"
 dependencies = [
  "anyhow",

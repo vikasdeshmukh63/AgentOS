@@ -404,8 +404,8 @@ EOF
     audit_digest="$(json_digest "$EVIDENCE_DIR/restart-after-scout-before.json" capability_audits)"
     initial_scout_count="$(scout_count "$root")"
     proposal_count="$(record_count "$root" '*/proposals/*.yaml')"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-once.json"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-twice.json"
+    bash "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-once.json"
+    bash "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-twice.json"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-after-scout-once.json" capability_audits)" == "$audit_digest" ]] || \
       fail "restart changed capability evidence"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-after-scout-twice.json" capability_audits)" == "$audit_digest" ]] || \
@@ -432,8 +432,8 @@ EOF
     audit_digest="$(json_digest "$EVIDENCE_DIR/restart-before-confirm-before.json" capability_audits)"
     initial_scout_count="$(scout_count "$root")"
     proposal_count="$(record_count "$root" '*/proposals/*.yaml')"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-once.json"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-twice.json"
+    bash "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-once.json"
+    bash "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-twice.json"
     [[ "$(json_get "$EVIDENCE_DIR/restart-before-confirm-twice.json" session.current_head)" == "$head" ]] || \
       fail "restart lost confirm-ready head"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-before-confirm-twice.json" capability_audits)" == "$audit_digest" ]] || \
@@ -510,7 +510,7 @@ EOF
       fail "dogfood did not leave exactly one typed task disposition"
     [[ "$(active_digest "$root")" == "$active_before" ]] || fail "dogfood activated before confirm"
     [[ "$(scout_count "$root")" == "1" ]] || fail "dogfood scout count mismatch"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/dogfood-after-restart.json"
+    bash "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/dogfood-after-restart.json"
     [[ "$(scout_count "$root")" == "1" ]] || fail "dogfood restart duplicated scout"
     head="$(json_get "$EVIDENCE_DIR/dogfood-after-restart.json" session.current_head)"
     pre_confirm="$(active_digest "$root")"

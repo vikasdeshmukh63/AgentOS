@@ -36,9 +36,9 @@ You need:
 After forking the repository:
 
 ```bash
-git clone https://github.com/YOUR-USER/agentos.git
-cd agentos
-git remote add upstream https://github.com/zzunkie/agentos.git
+git clone https://github.com/YOUR-USER/AgentOS.git
+cd AgentOS
+git remote add upstream https://github.com/vikasdeshmukh63/AgentOS.git
 git switch -c fix/short-description
 rustup update stable
 rustup component add rustfmt clippy

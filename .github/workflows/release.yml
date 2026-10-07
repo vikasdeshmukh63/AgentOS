@@ -2,7 +2,7 @@ name: release
 
 # On a version tag, build prebuilt binaries for the common desktop targets and
 # attach them to the GitHub release, so users can grab a binary (or use
-# `cargo binstall agentos`) instead of compiling.
+# `cargo binstall agentos-build01`) instead of compiling.
 on:
   push:
     tags: ["v*"]

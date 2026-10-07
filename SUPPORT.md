@@ -7,7 +7,7 @@ Before opening an issue:
 
 1. read the current `README.md` and `CHANGELOG.md`;
 2. search existing issues;
-3. run `yardlet --version` and `yardlet worker status`;
+3. run `agentos --version` and `agentos worker status`;
 4. separate a Yardlet failure from a worker CLI's own authentication, billing,
    or provider-service failure.
 

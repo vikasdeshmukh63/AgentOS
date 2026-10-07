@@ -11,6 +11,8 @@
 [![downloads](https://img.shields.io/crates/d/agentos.svg)](https://crates.io/crates/agentos)
 [![license: MIT](https://img.shields.io/crates/l/agentos.svg)](LICENSE)
 
+Built by [Build01](https://www.build01.com).
+
 
 
 > **Rent the intelligence. Own the loop.**

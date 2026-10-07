@@ -1,0 +1,164 @@
+schema_version: 1
+
+workers:
+  - id: codex
+    kind: cli_worker
+    # capabilities are HARD routing constraints (not the soft best_for rubric):
+    # a task whose required_capabilities lists one only runs on a worker that
+    # declares it. This replaces the old image-keyword router. Add a capability
+    # here and the planner can route to it by meaning, with no magic keywords.
+    capabilities:
+      - image_generation
+    # best_for / not_for are the planner's rubric: task characteristics, not
+    # model names, so they survive model changes. Keep them contrastive between
+    # workers (one worker's not_for is roughly the other's best_for) so the
+    # planner can tell them apart. Refine by hand or via `yardlet routing review`.
+    best_for: >-
+      terminal-first execution with deterministic feedback; repository-grounded
+      implementation planning and decomposition; issue-to-patch implementation;
+      test-driven bugfixes; CI/build/debug loops; tool-heavy integration and
+      defensive code or security work; schema/format constrained and mechanical
+      changes; native image and asset generation
+    not_for: >-
+      open-ended product or policy decisions whose quality is not mechanically
+      checkable; high-stakes legal, medical, or financial judgment; long-form or
+      multi-document synthesis; vision-heavy interpretation of screenshots,
+      diagrams, PDFs, charts, or tables; final review of Codex-authored work when
+      an independent worker is available
+    cost_weight: low
+    # Optional. Empty = the CLI's own default. codex: `-m <model>` +
+    # `-c model_reasoning_effort=<model-supported effort>`.
+    model: ""
+    effort: ""
+    # Optional, case-insensitive LITERAL signatures from this worker/provider.
+    # Yardlet checks only a resultless attempt's own worker-output.log span.
+    # Keep this narrow (max 16 entries, 256 bytes each). A match permits one
+    # same-worker, result-first output-contract recovery, never task rewording.
+    # Example: ["provider declined response"]
+    provider_response_refusal_patterns: []
+    role_strengths:
+      - image_asset_generation
+      - planning_gate
+      - implementation_planning
+      - terminal_agentic_execution
+      - tool_orchestration
+      - focused_implementation
+      - test_driven_bugfix
+      - shell_heavy_repo_changes
+      - defensive_security
+      - local_code_review
+    billing:
+      mode: subscription_backed_only
+    invocation:
+      command: codex
+      supports_noninteractive: true
+      output_contract: files
+    limits:
+      max_wall_minutes: 45
+      max_retries: 1
+
+  - id: claude-code
+    kind: cli_worker
+    best_for: >-
+      long-horizon implementation and large migrations with ambiguous or
+      cross-cutting scope; multi-repo architecture and refactor planning; deep
+      research and evidence synthesis; product strategy, PRDs, roadmaps, and
+      acceptance design; vision-heavy screenshot, diagram, PDF, chart, and table
+      interpretation including faithful UI reconstruction; style-sensitive
+      long-form work; high-stakes or policy-bound reasoning; independent review
+      of Codex-authored work
+    not_for: >-
+      native image or asset generation; tightly-scoped terminal tasks with
+      executable acceptance; routine issue-to-patch work, mechanical transforms,
+      or simple boilerplate; shell-heavy fast iteration; final review of
+      Claude-authored work when an independent worker is available
+    cost_weight: high
+    # Optional. Empty = the CLI's own default. claude: `--model <alias|id>` +
+    # `--effort <level>`.
+    model: ""
+    effort: ""
+    # Configure exact public refusal text observed from this CLI/provider.
+    # Empty preserves the legacy resultless retry/failover behavior.
+    provider_response_refusal_patterns: []
+    role_strengths:
+      - planning_gate
+      - ambiguity_reduction
+      - acceptance_criteria
+      - long_horizon_implementation
+      - large_scale_migration
+      - research_synthesis
+      - knowledge_work
+      - vision_reasoning
+      - faithful_ui_reconstruction
+      - long_form_writing
+      - policy_bound_reasoning
+      - architecture_reasoning
+      - independent_review
+      - review
+      - handoff_quality
+    billing:
+      mode: subscription_backed_only
+    invocation:
+      command: claude
+      supports_noninteractive: true
+      output_contract: json_or_files
+    limits:
+      max_wall_minutes: 45
+      max_retries: 1
+
+  # Generic CLI example. Uncomment and customize the whole block.
+  # Existing profiles may omit prompt_transport to send the packet on stdin
+  # and omit version_args to probe with --version. Native session resume is
+  # also backward-compatible and opt-in: omit the whole session block to keep
+  # ExplicitPacket answer continuation.
+  # - id: mytool
+  #   kind: cli_worker
+  #   best_for: "tasks this CLI handles well"
+  #   billing:
+  #     mode: subscription_backed_only
+  #   invocation:
+  #     command: mytool
+  #     supports_noninteractive: true
+  #     output_contract: files
+  #     # Shape of this CLI's stdout: text (default when omitted; one message
+  #     # per line), json (one document per attempt), or stream-json (one
+  #     # object per line). json/stream-json also let Yardlet tolerantly
+  #     # recover a missing result from stdout, marked as recovered in the run
+  #     # record so it never reads as a written result file.
+  #     output_format: stream-json
+  #     version_args: ["version", "--offline"]
+  #     prompt_transport: argument
+  #     # {prompt} is exactly one argv item. Yardlet never builds a shell string.
+  #     args: ["run", "--out", "{run_dir}", "--prompt", "{prompt}"]
+  #     session:
+  #       # The non-empty suffix after this exact fresh-child raw line prefix
+  #       # becomes the opaque session ref. stream is stdout or stderr.
+  #       capture: { stream: stdout, prefix: "SESSION_REF=" }
+  #       # Exactly one {session}; {prompt} follows prompt_transport above.
+  #       resume_args: ["resume", "--session", "{session}", "--prompt", "{prompt}"]
+  #     # Required under sandboxed access: Yardlet cannot verify a sandbox it
+  #     # does not own, so a generic profile must declare one (or the workspace
+  #     # must grant full access explicitly with `yardlet access full`).
+  #     sandbox_args: ["--sandbox"]
+  #     full_access_args: ["--full-access"]
+  #     model_args: ["--model", "{model}"]
+  #     effort_args: ["--effort", "{effort}"]
+  #     image_args: ["--image", "{image}"]
+  #   limits:
+  #     max_wall_minutes: 45
+  #     max_retries: 1
+
+routing:
+  # The human cost dial the planner weighs: cheap | balanced | quality.
+  cost_bias: balanced
+  # Run-time default + fallback order when a task names no worker / its worker
+  # is not ready. Resolution is deterministic; telemetry never overrides it.
+  default_worker: codex
+  fallback_order: [codex, claude-code]
+  # A task that names preferred_worker stays on that worker unless this is
+  # explicitly enabled. Default-off prevents silent provider/model cost changes.
+  allow_preferred_worker_failover: false
+  # The planner itself runs on this worker (primary, then fallback if not ready).
+  planning_gate:
+    primary: codex
+    fallback: claude-code

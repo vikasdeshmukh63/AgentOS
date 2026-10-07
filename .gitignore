@@ -1,0 +1,55 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Yard runtime state. This repo now self-hosts Yard: we TRACK the shared
+# .agents/ policy content (*-policy.yaml, skills/) and ignore per-run
+# operational artifacts AND per-machine state below. The work queue is
+# runtime state, not config (82432d8); yardlet.yaml/yard.yaml holds a
+# machine-generated workspace identity (workspace_id/created_at) plus personal
+# preferences (default_access/max_parallel/auto_ime), so it is per-machine too
+# (other repos may choose to track their own). workers.yaml is per-machine for
+# the same reason: which CLIs are installed plus personal model/effort picks;
+# `yardlet init` regenerates it from templates::WORKERS, and untracking it
+# keeps the parallel-mode git preflight green while you tune it.
+/.agents/runs/
+/.agents/resources/
+/.agents/task-channels/
+/.agents/checkpoints/
+/.agents/handoffs/
+/.agents/telemetry/
+/.agents/transitions/
+/.agents/intents/
+/.agents/intent-contract.yaml
+/.agents/work-queue.yaml
+/.agents/conversations/
+/.agents/git-finish-target.log
+/.agents/approvals.yaml
+/.agents/planning.lock
+/.agents/locks/
+/.agents/planning-sessions/
+/.agents/activations/
+/.agents/runtime-task-receipts/
+/.agents/runtime-capability-receipts/
+/.agents/activation-required.yaml
+/.agents/gc-salvage/
+/.agents/yardlet.yaml
+/.agents/yard.yaml
+/.agents/workers.yaml
+
+# Personal / per-machine harness files
+*.local
+.claude/settings.local.json
+.codex/settings.local.json
+.claude/worktrees/
+
+# OS / editor
+.DS_Store
+*.swp
+/.agents/worktrees/
+
+# internal planning docs (kept local, not public)
+docs/yardlet-final-plan.md
+docs/yardlet-roadmap.md
+docs/yardlet-queue-ownership-design.md

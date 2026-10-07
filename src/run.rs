@@ -1,0 +1,19297 @@
+//! Run orchestration: select one bounded task, prepare it, and (optionally)
+//! execute it through a hidden worker, then evaluate and compact.
+//!
+//! Yardlet stays deterministic until a worker is invoked. By default `run_next`
+//! prepares everything (run dir, evidence, packet, sanitized env) and stops
+//! *before* spawning, because spawning a subscription-backed worker consumes
+//! real usage. Pass `execute: true` to actually invoke the worker.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::Local;
+use serde::{Deserialize, Serialize};
+
+use crate::guard;
+use crate::inspect;
+use crate::packet::{self, PacketInputs};
+use crate::schemas::{
+    AnswerActionRequest, AttemptState, ChannelEvent, ChannelEventType, ContinuationMode,
+    ConversationTurn, EventActor, EventActorKind, OutputContractCause, OutputContractIncident,
+    Question, QuestionState, ResultRecoveredFromStdout, RunResult, TaskState, TransitionActor,
+    TransitionCause, TurnRole, WorkQueue, WorkerAttempt, WorkerOutputLogSpan, WorkerProfile,
+    WorkersFile,
+};
+use crate::state::{self, append_str, write_str, PlanningLock, Workspace};
+use crate::ui::i18n::{self, Lang};
+use crate::{compact, evaluator, routing, telemetry, workers};
+
+pub(crate) use crate::state::IntegrationProvenance;
+
+/// A live worker session a previous task finished in, offered to the next
+/// task: same worker + dependency link = the worker keeps its hot context
+/// (P1 — the bounded-task model without the cold-boot tax).
+#[derive(Clone)]
+pub struct ChainHandle {
+    pub prev_task_id: String,
+    pub worker_id: String,
+    pub session: String,
+    /// How many tasks this session has already run (cap guards context rot).
+    pub length: u32,
+}
+
+/// Longest run of tasks one session may carry before a forced fresh start —
+/// hot context helps until it rots.
+pub const CHAIN_CAP: u32 = 3;
+
+pub struct RunOptions {
+    pub execute: bool,
+    pub worker_override: Option<String>,
+    /// Run a specific task by id (bypasses queue selection). Used to resume a
+    /// task that is waiting on the user.
+    pub target: Option<String>,
+    /// The user's answer to a worker's prior question, threaded into the packet.
+    pub answer: Option<String>,
+    /// Explicit, opt-in escalation: drop the worker sandbox (network, installs,
+    /// etc.). Off by default; this is a human-granted permission.
+    pub full_access: bool,
+    /// Run even though the planner scored ambiguity "high" (gate override).
+    pub accept_ambiguity: bool,
+    /// Continue in this session instead of booting a fresh worker, when the
+    /// resolved worker matches (run_auto offers it for dependent tasks).
+    pub chain: Option<ChainHandle>,
+}
+
+pub struct RunReport {
+    pub run_id: String,
+    pub task_id: String,
+    pub worker_id: String,
+    pub run_dir: PathBuf,
+    pub prepared: bool,
+    pub executed: bool,
+    pub lines: Vec<String>,
+    /// The task's state after evaluation (None when only prepared).
+    pub result_state: Option<TaskState>,
+    /// The worker session this run used (for chaining the next task).
+    pub session: Option<String>,
+    /// Whether this run continued a previous task's session.
+    pub chained: bool,
+}
+
+struct SerialWorktree {
+    path: PathBuf,
+    branch: String,
+    baseline_oid: String,
+    worker_run_dir: PathBuf,
+    core_input_overlays: Vec<state::SerialInputOverlay>,
+    dependency_input_overlays: Vec<state::DependencyInputOverlay>,
+}
+
+struct SerialWorktreeErrorCleanup<'a> {
+    ws: &'a Workspace,
+    owned: Option<&'a SerialWorktree>,
+    armed: bool,
+}
+
+impl<'a> SerialWorktreeErrorCleanup<'a> {
+    fn new(ws: &'a Workspace, owned: Option<&'a SerialWorktree>) -> Self {
+        Self {
+            ws,
+            owned,
+            armed: owned.is_some(),
+        }
+    }
+
+    fn cleanup_now(&mut self) {
+        if self.armed {
+            remove_unused_serial_worktree(self.ws, self.owned);
+            self.armed = false;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SerialWorktreeErrorCleanup<'_> {
+    fn drop(&mut self) {
+        self.cleanup_now();
+    }
+}
+
+const SERIAL_CANONICAL_SEED_DIR: &str = "evidence/canonical-state-seed";
+pub(crate) const HARNESS_SEED_DIR: &str = "evidence/harness-state-seed";
+
+fn git_stdout(root: &std::path::Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn prepare_serial_worktree(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    run_id: &str,
+    task_id: &str,
+) -> Result<SerialWorktree> {
+    crate::parallel::ensure_worktrees_excluded(&ws.root);
+    let baseline_oid = git_stdout(&ws.root, &["rev-parse", "--verify", "HEAD^{commit}"])?
+        .trim()
+        .to_string();
+    let branch = format!("yard/{}/{}", task_id.to_lowercase(), run_id);
+    let path = ws.agents_dir().join("worktrees").join(run_id);
+    crate::parallel::create_worktree(&ws.root, &path, &branch)?;
+
+    let prepared = (|| -> Result<SerialWorktree> {
+        let wt_agents = path.join(crate::state::STATE_DIR);
+        std::fs::create_dir_all(&wt_agents)?;
+        let canonical_seed_dir = run_dir.join(SERIAL_CANONICAL_SEED_DIR);
+        std::fs::create_dir_all(&canonical_seed_dir)?;
+        let intent = ws.intent_path();
+        if intent.is_file() {
+            std::fs::copy(&intent, wt_agents.join("intent-contract.yaml"))?;
+            std::fs::copy(&intent, canonical_seed_dir.join("intent-contract.yaml"))?;
+        }
+        let queue = ws.queue_path();
+        std::fs::copy(&queue, wt_agents.join("work-queue.yaml"))?;
+        std::fs::copy(&queue, canonical_seed_dir.join("work-queue.yaml"))?;
+        let harness_seed_dir = run_dir.join(HARNESS_SEED_DIR);
+        let mut harness_copy_warnings: Vec<String> = Vec::new();
+        for directory in ["rules", "skills", "agents"] {
+            harness_copy_warnings.extend(crate::parallel::copy_dir(
+                &ws.agents_dir().join(directory),
+                &wt_agents.join(directory),
+            ));
+            harness_copy_warnings.extend(crate::parallel::copy_dir(
+                &ws.agents_dir().join(directory),
+                &harness_seed_dir.join(directory),
+            ));
+        }
+        state::save_harness_copy_warnings(run_dir, &harness_copy_warnings)?;
+        let core_input_overlays = capture_serial_input_overlays(&path, &harness_seed_dir)?;
+        let queue = ws.load_queue()?;
+        let task = queue
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| anyhow!("task {task_id} disappeared during worktree preparation"))?;
+        let dependency_input_overlays =
+            state::materialize_resolved_dependency_outputs(ws, &queue, task, &path)?;
+        // Refuse BEFORE a worker starts. A dependency overlay pins an upstream
+        // output by digest precisely so downstream work can rely on it; granting
+        // that same path as writable scope authorizes the task to invalidate the
+        // evidence it was handed. Today that is only discovered after the task
+        // has passed its own evaluation and integrated, when a later review finds
+        // the pinned digest no longer reproduces (issue #15) — the whole run, and
+        // the one after it, spent before anyone notices.
+        if let Some(conflict) = scope_conflicts_with_pinned_evidence(
+            task,
+            &core_input_overlays,
+            &dependency_input_overlays,
+        ) {
+            crate::parallel::remove_worktree(&ws.root, &path, &branch);
+            return Err(anyhow!("{conflict}"));
+        }
+        let worker_run_dir = wt_agents.join("runs").join(run_id);
+        std::fs::create_dir_all(&worker_run_dir)?;
+        Ok(SerialWorktree {
+            path: path.clone(),
+            branch: branch.clone(),
+            baseline_oid: baseline_oid.clone(),
+            worker_run_dir,
+            core_input_overlays,
+            dependency_input_overlays,
+        })
+    })();
+    match prepared {
+        Ok(owned) => {
+            let receipt = state::SerialIntegrationReceipt {
+                schema_version: 1,
+                run_id: run_id.to_string(),
+                task_id: task_id.to_string(),
+                worktree: path.display().to_string(),
+                branch,
+                baseline_oid,
+                core_input_overlays: owned.core_input_overlays.clone(),
+                dependency_input_overlays: owned.dependency_input_overlays.clone(),
+            };
+            if let Err(error) = ws.save_serial_integration_receipt(&receipt) {
+                crate::parallel::remove_worktree(&ws.root, &path, &receipt.branch);
+                return Err(error);
+            }
+            Ok(owned)
+        }
+        Err(error) => {
+            crate::parallel::remove_worktree(&ws.root, &path, &branch);
+            Err(error)
+        }
+    }
+}
+
+fn seeded_canonical_file_unchanged(seed: &std::path::Path, current: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(current) else {
+        return false;
+    };
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && std::fs::read(seed)
+            .and_then(|seed_bytes| std::fs::read(current).map(|bytes| seed_bytes == bytes))
+            .unwrap_or(false)
+}
+
+struct SerialCommittedEvidence {
+    paths: Vec<String>,
+    merge_target_oid: String,
+}
+
+struct SerialWorktreeEvidence {
+    paths: Vec<String>,
+    merge_target_oid: String,
+    core_input_overlays: Vec<state::SerialInputOverlay>,
+    dependency_input_overlays: Vec<state::DependencyInputOverlay>,
+}
+
+fn serial_committed_paths(
+    worktree: &std::path::Path,
+    run_dir: &std::path::Path,
+) -> Option<SerialCommittedEvidence> {
+    let record = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")).ok()?;
+    let baseline_oid = record.baseline_oid;
+    let merge_target = if record.worktree_branch.is_empty() {
+        "HEAD^{commit}".to_string()
+    } else {
+        format!("refs/heads/{}^{{commit}}", record.worktree_branch)
+    };
+    let merge_target_oid = git_stdout(worktree, &["rev-parse", "--verify", &merge_target])
+        .ok()?
+        .trim()
+        .to_string();
+    if baseline_oid.is_empty() {
+        return Some(SerialCommittedEvidence {
+            paths: Vec::new(),
+            merge_target_oid,
+        });
+    }
+    let range = format!("{baseline_oid}..{merge_target_oid}");
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--name-only", "--no-renames", "-z", &range])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(SerialCommittedEvidence {
+        paths: output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect(),
+        merge_target_oid,
+    })
+}
+
+/// Paths committed on a run-owned worktree branch since its pinned baseline.
+///
+/// Shared by both evidence paths: a worker that commits its work leaves a clean
+/// `git status`, so status alone would report no changes at all for it. The
+/// serial path has always unioned these; the parallel path did not, which left
+/// the forbidden-path gate certifying a diff it never saw (issue #83).
+///
+/// A missing or baseline-less run record yields no committed paths rather than
+/// an error: legacy runs predate the pinned baseline, and their status-only
+/// evidence is what they have always been evaluated on.
+pub(crate) fn committed_paths_since_baseline(
+    worktree: &std::path::Path,
+    run_dir: &std::path::Path,
+) -> Result<Vec<String>> {
+    let Ok(record) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+        return Ok(Vec::new());
+    };
+    if record.baseline_oid.is_empty() {
+        return Ok(Vec::new());
+    }
+    let merge_target = if record.worktree_branch.is_empty() {
+        "HEAD^{commit}".to_string()
+    } else {
+        format!("refs/heads/{}^{{commit}}", record.worktree_branch)
+    };
+    let tip = git_stdout(worktree, &["rev-parse", "--verify", &merge_target])
+        .with_context(|| format!("resolving {merge_target} for committed change evidence"))?
+        .trim()
+        .to_string();
+    committed_paths_since(worktree, &format!("{}..{tip}", record.baseline_oid)).ok_or_else(|| {
+        anyhow!(
+            "could not enumerate committed changes in {}",
+            worktree.display()
+        )
+    })
+}
+
+/// Actual serial-worktree changes with only Yardlet's unchanged canonical seed
+/// copies removed. The main run owns an exact pre-worker snapshot, so a worker
+/// create, edit, delete, or symlink replacement stays in the evidence and is
+/// rejected by the evaluator's forbidden-path gate. Status alone is not enough:
+/// a worker may commit its own changes and detach HEAD, so paths committed on
+/// the exact run-owned branch tip after the pinned baseline are unioned after
+/// filtering the unchanged seed copies. The returned OID binds that evidence
+/// to the later integration target. When receipt-backed overlay provenance is
+/// what fails (receipt entry missing or its digest no longer matching the
+/// tree), `overlay_failure` carries the path-specific diagnostic while the
+/// return stays `None` so every caller keeps failing closed.
+fn serial_worktree_evidence(
+    ws: &Workspace,
+    worktree: &std::path::Path,
+    run_dir: &std::path::Path,
+    overlay_failure: &mut Option<String>,
+) -> Option<SerialWorktreeEvidence> {
+    let mut paths = evaluator::changed_paths(worktree)?;
+    let committed = serial_committed_paths(worktree, run_dir)?;
+    let seed_dir = run_dir.join(SERIAL_CANONICAL_SEED_DIR);
+    if !seed_dir.is_dir() {
+        // Compatibility for runs created before exact seed snapshots existed:
+        // retain their previous recovery behavior instead of attributing every
+        // Yardlet-seeded untracked canonical copy to the worker.
+        paths.retain(|path| !evaluator::is_canonical_state_path(path));
+        paths.extend(committed.paths);
+        paths.sort();
+        paths.dedup();
+        return Some(SerialWorktreeEvidence {
+            paths,
+            merge_target_oid: committed.merge_target_oid,
+            core_input_overlays: Vec::new(),
+            dependency_input_overlays: Vec::new(),
+        });
+    }
+
+    let mut seeded = std::collections::BTreeSet::new();
+    let mut modified = std::collections::BTreeSet::new();
+    let entries = std::fs::read_dir(&seed_dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_str()?.to_string();
+        let path = format!(".agents/{name}");
+        if !evaluator::is_canonical_state_path(&path) {
+            continue;
+        }
+        seeded.insert(path.clone());
+        if !seeded_canonical_file_unchanged(&entry.path(), &worktree.join(&path)) {
+            modified.insert(path);
+        }
+    }
+
+    paths.retain(|path| {
+        if !evaluator::is_canonical_state_path(path) {
+            return true;
+        }
+        !seeded.contains(path) || modified.contains(path)
+    });
+    for path in modified {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    let harness_seed_dir = run_dir.join(HARNESS_SEED_DIR);
+    let mut unchanged_seeded_harness = Vec::new();
+    if harness_seed_dir.is_dir() {
+        let (seeded_harness, modified_harness) =
+            seeded_harness_evidence(&harness_seed_dir, worktree)?;
+        unchanged_seeded_harness = paths
+            .iter()
+            .filter(|path| seeded_harness.contains(*path) && !modified_harness.contains(*path))
+            .cloned()
+            .collect();
+        paths.retain(|path| !seeded_harness.contains(path) || modified_harness.contains(path));
+        for path in modified_harness {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    let committed_paths = committed
+        .paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    paths.extend(committed.paths);
+    paths.sort();
+    paths.dedup();
+    let run_id = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()?
+        .run_id;
+    let unchanged_seeded_harness = unchanged_seeded_harness
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let core_candidates = unchanged_seeded_harness
+        .into_iter()
+        .filter(|path| !committed_paths.contains(path))
+        .collect::<Vec<_>>();
+    let receipt = match ws.load_serial_integration_receipt(&run_id) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            *overlay_failure = Some(format!(
+                "serial_input_overlay_receipt_unavailable:run={run_id}:paths={}:{error}",
+                core_candidates.join(",")
+            ));
+            return None;
+        }
+    };
+    let mut core_input_overlays = Vec::new();
+    for path in core_candidates {
+        let Some(overlay) = receipt.core_input_overlays.iter().find(|overlay| {
+            overlay.path == path && serial_input_overlay_matches(worktree, overlay)
+        }) else {
+            *overlay_failure = Some(serial_core_overlay_evidence_failure(
+                worktree,
+                &receipt.core_input_overlays,
+                &path,
+            ));
+            return None;
+        };
+        core_input_overlays.push(overlay.clone());
+    }
+    // Materialized dependency outputs (issue #21) whose exact receipted digest
+    // is still on disk are core-delivered inputs, not downstream worker
+    // evidence. A path the worker committed or rewrote loses that provenance
+    // and stays attributed to the worker.
+    let mut dependency_input_overlays = Vec::new();
+    paths.retain(|path| {
+        let Some(overlay) = receipt
+            .dependency_input_overlays
+            .iter()
+            .find(|overlay| overlay.path == *path)
+        else {
+            return true;
+        };
+        if committed_paths.contains(path) || !dependency_input_overlay_matches(worktree, overlay) {
+            return true;
+        }
+        dependency_input_overlays.push(overlay.clone());
+        false
+    });
+    Some(SerialWorktreeEvidence {
+        paths,
+        merge_target_oid: committed.merge_target_oid,
+        core_input_overlays,
+        dependency_input_overlays,
+    })
+}
+
+/// Enumerate dependency outputs for a manual `Partial -> Done` resolution from
+/// the same core-owned Git evidence used by finalization. A missing or
+/// contradictory serial receipt is a hard proof failure: result.json paths are
+/// worker claims and are never substituted for the actual worktree diff.
+pub(crate) fn resolved_dependency_output_paths(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    worktree: &std::path::Path,
+    task_id: &str,
+) -> Result<Vec<String>> {
+    let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).with_context(|| {
+        format!("dependency_output_proof_missing:dependency={task_id}:run_record")
+    })?;
+    let directory_run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if record.task_id != task_id
+        || record.run_id.trim().is_empty()
+        || record.run_id != directory_run_id
+        || record.integration_provenance != IntegrationProvenance::SerialCoreStaged
+    {
+        bail!("dependency_output_proof_missing:dependency={task_id}:unsupported_or_mismatched_run");
+    }
+    let receipt = ws
+        .load_serial_integration_receipt(&record.run_id)
+        .with_context(|| {
+            format!(
+                "dependency_output_proof_missing:dependency={task_id}:serial_integration_receipt"
+            )
+        })?;
+    if receipt.task_id != task_id
+        || receipt.run_id != record.run_id
+        || receipt.worktree != record.worktree
+        || receipt.branch != record.worktree_branch
+        || receipt.baseline_oid != record.baseline_oid
+    {
+        bail!(
+            "dependency_output_proof_mismatch:dependency={task_id}:run={}",
+            record.run_id
+        );
+    }
+    let declared = std::fs::canonicalize(&receipt.worktree).with_context(|| {
+        format!(
+            "dependency_output_bytes_missing:dependency={task_id}:worktree={}",
+            receipt.worktree
+        )
+    })?;
+    let actual = std::fs::canonicalize(worktree).with_context(|| {
+        format!(
+            "dependency_output_bytes_missing:dependency={task_id}:worktree={}",
+            worktree.display()
+        )
+    })?;
+    if declared != actual {
+        bail!("dependency_output_proof_mismatch:dependency={task_id}:worktree");
+    }
+    let mut overlay_failure = None;
+    let evidence = serial_worktree_evidence(ws, worktree, run_dir, &mut overlay_failure)
+        .ok_or_else(|| match overlay_failure {
+            Some(reason) => {
+                anyhow!("dependency_output_proof_missing:dependency={task_id}:actual_diff:{reason}")
+            }
+            None => anyhow!("dependency_output_proof_missing:dependency={task_id}:actual_diff"),
+        })?;
+    let mut paths = evidence
+        .paths
+        .into_iter()
+        .filter(|path| evaluator::is_integratable_path(path))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        bail!("dependency_output_proof_missing:dependency={task_id}:no_repository_outputs");
+    }
+    Ok(paths)
+}
+
+/// True when the run's recorded integration commit is already an ancestor of
+/// `worktree`'s HEAD (#53): the run's outputs reached this history through
+/// normal integration, so later commits may legitimately supersede them and a
+/// resolve-time snapshot of those paths is stale provenance rather than bytes
+/// that still need delivering. Fail-closed by default: a run with no recorded
+/// integration commit, a worktree that is not a git repository, or any git
+/// failure answers `false`, leaving the caller's conflict guard in force.
+pub(crate) fn integration_is_in_worktree_history(
+    run_dir: &std::path::Path,
+    worktree: &std::path::Path,
+) -> bool {
+    let Ok(record) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+        return false;
+    };
+    let oid = record.integration_oid.trim();
+    if oid.is_empty() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["merge-base", "--is-ancestor", oid, "HEAD"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Fallback proof source for a manually resolved Partial whose retained
+/// worktree is already cleaned up (#47): the integration merge landed in the
+/// owning root, only the push was blocked, and post-integration cleanup
+/// removed the worktree. Derives the task's output paths from the committed
+/// integration evidence instead. Fail-closed unless the run record carries
+/// serial provenance, a matching receipt, and an integration commit that is an
+/// ancestor of the owning root HEAD. Without committed integration evidence
+/// the pre-#47 diagnostic is preserved so state-only Partials keep their
+/// `--no-outputs` hint.
+pub(crate) fn integrated_dependency_output_paths(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    task_id: &str,
+) -> Result<(String, Vec<String>)> {
+    let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).with_context(|| {
+        format!("dependency_output_proof_missing:dependency={task_id}:run_record")
+    })?;
+    let directory_run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if record.task_id != task_id
+        || record.run_id.trim().is_empty()
+        || record.run_id != directory_run_id
+    {
+        bail!("dependency_output_proof_missing:dependency={task_id}:unsupported_or_mismatched_run");
+    }
+    if record.integration_provenance != IntegrationProvenance::SerialCoreStaged
+        || record.integration_oid.trim().is_empty()
+        || record.baseline_oid.trim().is_empty()
+    {
+        bail!("dependency_output_bytes_missing:dependency={task_id}:path=<retained-worktree>");
+    }
+    let receipt = ws
+        .load_serial_integration_receipt(&record.run_id)
+        .with_context(|| {
+            format!(
+                "dependency_output_proof_missing:dependency={task_id}:serial_integration_receipt"
+            )
+        })?;
+    if receipt.task_id != task_id
+        || receipt.run_id != record.run_id
+        || receipt.baseline_oid != record.baseline_oid
+    {
+        bail!(
+            "dependency_output_proof_mismatch:dependency={task_id}:run={}",
+            record.run_id
+        );
+    }
+    let ancestor = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &record.integration_oid,
+            "HEAD",
+        ])
+        .status()
+        .with_context(|| {
+            format!("dependency_output_proof_missing:dependency={task_id}:integration_not_in_head")
+        })?;
+    if !ancestor.success() {
+        bail!("dependency_output_proof_missing:dependency={task_id}:integration_not_in_head");
+    }
+    let range = format!("{}..{}", record.baseline_oid, record.integration_oid);
+    let diff = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["diff", "--name-only", &range])
+        .output()
+        .with_context(|| {
+            format!("dependency_output_proof_missing:dependency={task_id}:integration_diff")
+        })?;
+    if !diff.status.success() {
+        bail!("dependency_output_proof_missing:dependency={task_id}:integration_diff");
+    }
+    let mut paths = String::from_utf8_lossy(&diff.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|path| evaluator::is_integratable_path(path))
+        .map(String::from)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        bail!("dependency_output_proof_missing:dependency={task_id}:no_repository_outputs");
+    }
+    Ok((record.integration_oid.clone(), paths))
+}
+
+/// Best-effort Git evidence that a Partial run's retained worktree still holds
+/// repository outputs: uncommitted or untracked working-tree changes, plus
+/// commits past the run's recorded baseline. Used by the opt-in no-output
+/// resolve to refuse finalizing a Partial whose outputs are actually
+/// detectable when receipt-grade serial evidence is unavailable. Returns
+/// `None` when no Git evidence exists at all — the caller decides whether the
+/// attested opt-in may proceed without it.
+pub(crate) fn detectable_repository_outputs(
+    run_dir: &std::path::Path,
+    worktree: &std::path::Path,
+) -> Option<Vec<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut evidence = false;
+    if let Some(changed) = evaluator::changed_paths(worktree) {
+        evidence = true;
+        paths.extend(changed);
+    }
+    if let Ok(record) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) {
+        if !record.baseline_oid.is_empty() {
+            if let Some(committed) =
+                committed_paths_since(worktree, &format!("{}..HEAD", record.baseline_oid))
+            {
+                evidence = true;
+                paths.extend(committed);
+            }
+        }
+    }
+    if !evidence {
+        return None;
+    }
+    Some(
+        paths
+            .into_iter()
+            .filter(|path| evaluator::is_integratable_path(path))
+            .collect(),
+    )
+}
+
+fn committed_paths_since(worktree: &std::path::Path, range: &str) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        // `--no-renames` or a committed rename reports only its DESTINATION,
+        // so moving `config/secret.pem` to `config/plain.txt` would hide the
+        // forbidden source from the gate entirely. The serial enumeration has
+        // always passed it.
+        .args(["diff", "--name-only", "--no-renames", "-z", range])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+pub(crate) fn seeded_harness_evidence(
+    seed_root: &std::path::Path,
+    worktree: &std::path::Path,
+) -> Option<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+)> {
+    fn visit(
+        seed_root: &std::path::Path,
+        directory: &std::path::Path,
+        worktree: &std::path::Path,
+        seeded: &mut std::collections::BTreeSet<String>,
+        modified: &mut std::collections::BTreeSet<String>,
+    ) -> Option<()> {
+        for entry in std::fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            let metadata = entry.file_type().ok()?;
+            if metadata.is_dir() {
+                visit(seed_root, &entry.path(), worktree, seeded, modified)?;
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(seed_root).ok()?.to_path_buf();
+            let path = format!(".agents/{}", relative.to_string_lossy());
+            seeded.insert(path.clone());
+            if !seeded_canonical_file_unchanged(&entry.path(), &worktree.join(&path)) {
+                modified.insert(path);
+            }
+        }
+        Some(())
+    }
+
+    let mut seeded = std::collections::BTreeSet::new();
+    let mut modified = std::collections::BTreeSet::new();
+    visit(seed_root, seed_root, worktree, &mut seeded, &mut modified)?;
+    Some((seeded, modified))
+}
+
+fn serial_input_overlay_digest(
+    root: &std::path::Path,
+    overlay: &state::SerialInputOverlay,
+) -> Result<String> {
+    let relative = std::path::Path::new(&overlay.path);
+    let normalized = relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    let harness_input = [".agents/rules/", ".agents/skills/", ".agents/agents/"]
+        .iter()
+        .any(|prefix| overlay.path.starts_with(prefix));
+    if relative.is_absolute()
+        || !normalized
+        || !harness_input
+        || !evaluator::is_integratable_path(&overlay.path)
+    {
+        bail!("invalid core input overlay path");
+    }
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("inspecting core input overlay {}", overlay.path))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("core input overlay is not a regular file");
+    }
+    Ok(state::content_digest(&std::fs::read(&path)?))
+}
+
+pub(crate) fn serial_input_overlay_matches(
+    root: &std::path::Path,
+    overlay: &state::SerialInputOverlay,
+) -> bool {
+    serial_input_overlay_digest(root, overlay).is_ok_and(|digest| digest == overlay.content_digest)
+}
+
+/// Overlay-specific diagnostic for a core input overlay that failed its
+/// receipt lookup during evidence collection: either the receipt has no entry
+/// for the path, or the recorded digest no longer matches the bytes in the
+/// tree. Kept distinct from the integration-time parity gate labels so an
+/// evidence-collection failure stays attributable to its exact path.
+fn serial_core_overlay_evidence_failure(
+    root: &std::path::Path,
+    overlays: &[state::SerialInputOverlay],
+    path: &str,
+) -> String {
+    let Some(overlay) = overlays.iter().find(|overlay| overlay.path == path) else {
+        return format!("serial_input_overlay_receipt_missing:path={path}");
+    };
+    let found = match serial_input_overlay_digest(root, overlay) {
+        Ok(found) => found,
+        Err(error) => format!("unavailable({error})"),
+    };
+    format!(
+        "serial_input_overlay_digest_mismatch:path={path}:expected={}:found={found}",
+        overlay.content_digest
+    )
+}
+
+fn serial_input_overlay_parity_failure(
+    root: &std::path::Path,
+    overlays: &[state::SerialInputOverlay],
+) -> Option<String> {
+    overlays.iter().find_map(|overlay| {
+        let found = match serial_input_overlay_digest(root, overlay) {
+            Ok(found) if found == overlay.content_digest => return None,
+            Ok(found) => found,
+            Err(error) => format!("unavailable({error})"),
+        };
+        Some(format!(
+            "serial_input_overlay_parity_mismatch:path={}:expected={}:found={found}",
+            overlay.path, overlay.content_digest
+        ))
+    })
+}
+
+/// Digest a materialized dependency output inside `root`. Unlike harness input
+/// overlays these may live anywhere integratable in the repository, so only
+/// the traversal/symlink/canonical-state constraints apply.
+fn dependency_input_overlay_digest(
+    root: &std::path::Path,
+    overlay: &state::DependencyInputOverlay,
+) -> Result<String> {
+    let relative = std::path::Path::new(&overlay.path);
+    let normalized = relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if relative.is_absolute() || !normalized || !evaluator::is_integratable_path(&overlay.path) {
+        bail!("invalid dependency input overlay path");
+    }
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("inspecting dependency input overlay {}", overlay.path))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("dependency input overlay is not a regular file");
+    }
+    Ok(state::content_digest(&std::fs::read(&path)?))
+}
+
+pub(crate) fn dependency_input_overlay_matches(
+    root: &std::path::Path,
+    overlay: &state::DependencyInputOverlay,
+) -> bool {
+    dependency_input_overlay_digest(root, overlay)
+        .is_ok_and(|digest| digest == overlay.content_digest)
+}
+
+/// The retained/integration tree must keep the exact dependency-output bytes
+/// validation read. Checked against the worktree only: the bytes come from
+/// core-owned snapshots, so the owning root carries no parity obligation.
+fn dependency_input_overlay_parity_failure(
+    root: &std::path::Path,
+    overlays: &[state::DependencyInputOverlay],
+) -> Option<String> {
+    overlays.iter().find_map(|overlay| {
+        let found = match dependency_input_overlay_digest(root, overlay) {
+            Ok(found) if found == overlay.content_digest => return None,
+            Ok(found) => found,
+            Err(error) => format!("unavailable({error})"),
+        };
+        Some(format!(
+            "dependency_input_overlay_parity_mismatch:path={}:dependency={}:expected={}:found={found}",
+            overlay.path, overlay.dependency_task_id, overlay.content_digest
+        ))
+    })
+}
+
+pub(crate) fn capture_serial_input_overlays(
+    worktree: &std::path::Path,
+    harness_seed_dir: &std::path::Path,
+) -> Result<Vec<state::SerialInputOverlay>> {
+    if !harness_seed_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let changed = evaluator::changed_paths(worktree)
+        .ok_or_else(|| anyhow!("could not enumerate copied serial harness inputs"))?;
+    let (seeded, modified) = seeded_harness_evidence(harness_seed_dir, worktree)
+        .ok_or_else(|| anyhow!("could not compare copied serial harness inputs"))?;
+    if !modified.is_empty() {
+        bail!(
+            "copied serial harness input diverged before worker spawn: {}",
+            modified.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let mut overlays = Vec::new();
+    for path in changed
+        .into_iter()
+        .filter(|path| seeded.contains(path) && evaluator::is_integratable_path(path))
+    {
+        let probe = state::SerialInputOverlay {
+            path,
+            content_digest: String::new(),
+        };
+        let content_digest = serial_input_overlay_digest(worktree, &probe)
+            .with_context(|| format!("capturing core input overlay {}", probe.path))?;
+        overlays.push(state::SerialInputOverlay {
+            path: probe.path,
+            content_digest,
+        });
+    }
+    overlays.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(overlays)
+}
+
+const PROVIDER_REFUSAL_CLASSIFICATION_SKIPS_FILE: &str =
+    "provider-refusal-classification-skips.yaml";
+
+// NOTE: the file prompt transport's `packet-prompt.txt` is deliberately NOT
+// listed. It is written into the staging run directory the worker actually
+// reads, and importing it back is what leaves the exact packet the worker was
+// handed in the canonical run's evidence.
+const MAIN_OWNED_RUN_ARTIFACT_NAMES: [&str; 19] = [
+    "run.yaml",
+    "task-packet.md",
+    "worker.pid",
+    "worker-process.yaml",
+    "worker-output.log",
+    "git-finish.json",
+    "git-integration.json",
+    "feedback.json",
+    "canonical-state-seed",
+    "cancelled",
+    "partial-reason",
+    "failover.json",
+    "evaluation.json",
+    "validation.json",
+    "evidence",
+    "hooks",
+    "attempts",
+    "latest-attempt",
+    PROVIDER_REFUSAL_CLASSIFICATION_SKIPS_FILE,
+];
+
+fn is_main_owned_validation_log_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized
+        .strip_prefix("validation-")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_main_owned_run_artifact_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        MAIN_OWNED_RUN_ARTIFACT_NAMES
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            || is_main_owned_validation_log_name(name)
+    })
+}
+
+fn validation_log_ascii_alias(name: &std::ffi::OsStr) -> Option<String> {
+    let name = name.to_str()?;
+    let bytes = name.as_bytes();
+    let start = bytes.iter().position(|byte| byte.is_ascii_digit())?;
+    let end = start
+        + bytes[start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .unwrap_or(bytes.len() - start);
+    if bytes[end..].iter().any(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("validation-{}.log", &name[start..end]))
+}
+
+fn is_main_owned_run_artifact_component(parent: &std::path::Path, name: &std::ffi::OsStr) -> bool {
+    if is_main_owned_run_artifact_name(name) {
+        return true;
+    }
+
+    let candidate = parent.join(name);
+    let Ok(candidate) = std::fs::canonicalize(candidate) else {
+        return false;
+    };
+    MAIN_OWNED_RUN_ARTIFACT_NAMES.iter().any(|reserved| {
+        std::fs::canonicalize(parent.join(reserved)).is_ok_and(|path| path == candidate)
+    }) || validation_log_ascii_alias(name).is_some_and(|reserved| {
+        std::fs::canonicalize(parent.join(reserved)).is_ok_and(|path| path == candidate)
+    })
+}
+
+fn import_worker_run_artifacts(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if is_main_owned_run_artifact_component(from, &name) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = to.join(&name);
+        if metadata.is_dir() {
+            import_worker_run_artifacts(&entry.path(), &target)?;
+        } else if metadata.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_unused_serial_worktree(ws: &Workspace, owned: Option<&SerialWorktree>) {
+    if let Some(owned) = owned {
+        crate::parallel::remove_worktree(&ws.root, &owned.path, &owned.branch);
+    }
+}
+
+fn cleanup_cancelled_serial_worktree(ws: &Workspace, owned: Option<&SerialWorktree>) {
+    if let Some(owned) = owned {
+        let _ = crate::parallel::cleanup_integrated_worktree(
+            &ws.root,
+            &owned.path,
+            &owned.branch,
+            &owned.baseline_oid,
+            IntegrationProvenance::SerialCoreStaged,
+        );
+    }
+}
+
+fn run_event_lang(ws: &Workspace) -> Lang {
+    let config_lang = ws
+        .load_config()
+        .map(|c| c.language)
+        .unwrap_or_else(|_| "auto".to_string());
+    let sample = ws
+        .load_intent()
+        .ok()
+        .flatten()
+        .map(|i| {
+            if i.raw_request.trim().is_empty() {
+                i.summary
+            } else {
+                i.raw_request
+            }
+        })
+        .or_else(|| {
+            ws.load_queue().ok().map(|q| {
+                q.tasks
+                    .iter()
+                    .map(|t| t.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .unwrap_or_default();
+    i18n::detect(&config_lang, &sample)
+}
+
+fn task_state_progress_line(lang: Lang, task_id: &str, state: TaskState) -> String {
+    format!(
+        "{} \u{2192} {}",
+        task_id,
+        i18n::task_state_label(lang.l(), state)
+    )
+}
+
+// Every field defaults so a partial run.yaml (e.g. an older or hand-written one
+// that only carries run_id/task_id/worker) still deserializes — both
+// `seal_run_record` and `run_worker` read it through `state::load_yaml`.
+/// Read the adoption policy off core-owned config, for the projection a worker
+/// gets to read before it does semantic work (issue #117).
+fn adoption_policy_for(ws: &Workspace) -> Option<AdoptionPolicy> {
+    // The owning ref is where integration will land: the branch the workspace is
+    // on right now, read from git rather than assumed, because a dogfood session
+    // is routinely on something other than main.
+    let owning_ref = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("refs/heads/{name}"))
+        .unwrap_or_else(|| "<unresolved-head>".to_string());
+    let owning_ref = owning_ref.as_str();
+    // No projection rather than a guessed one. Reporting `auto_commit: false`
+    // because the config could not be read would state a policy nobody chose,
+    // and a worker reading it would prove the wrong delivery path. An absent
+    // section makes a preflight fail closed, which is the honest outcome.
+    let config = ws.load_config().ok()?;
+    let auto_commit = config.auto_commit;
+    let push_target_ref = config.git_finish.target_ref.clone();
+    Some(AdoptionPolicy {
+        auto_commit,
+        owning_ref: owning_ref.to_string(),
+        push_target_ref,
+        retention: if auto_commit {
+            "accepted output is adopted into the owning ref by serial integration".to_string()
+        } else {
+            "automatic adoption is disabled; the run-owned worktree is retained and the \
+             operator integrates it, then `yardlet resolve` settles the task"
+                .to_string()
+        },
+    })
+}
+
+/// What will happen to this run's accepted output, decided by the core before
+/// the worker starts.
+///
+/// A serial worker could see its worktree, its run-owned branch, its baseline
+/// and its integration provenance — and still not know whether accepted output
+/// would be adopted at all, or into what. A preflight task asked to prove the
+/// adoption path had nothing to read, so it either trusted prose from whoever
+/// wrote the task or failed closed (issue #117). It failed closed, which was
+/// right, and which is why the missing contract was worth adding.
+///
+/// Read-only by construction: the core writes this before spawn and reads its
+/// own config at finalization. A worker editing its projection changes what it
+/// believes, never what happens.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AdoptionPolicy {
+    /// Will accepted integratable output be adopted without asking?
+    pub auto_commit: bool,
+    /// The ref serial integration will update. Where the work LANDS.
+    pub owning_ref: String,
+    /// `git_finish.target_ref`, the optional push destination. Separate from
+    /// `owning_ref` on purpose: an empty push target means "no push configured",
+    /// which is not the same as "nowhere to adopt into", and conflating them is
+    /// how a worker would read local adoption as disabled.
+    pub push_target_ref: String,
+    /// What happens when `auto_commit` is false, named rather than implied.
+    pub retention: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct RunRecord {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub intent_id: String,
+    #[serde(default)]
+    pub worker: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub fallback_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_provenance: Option<crate::schemas::RoutingProvenance>,
+    /// Lifecycle: `prepared`/`running` at spawn, then sealed by `finalize_run`
+    /// to the run's terminal outcome (`done`/`failed`/`partial`/`needs_user`/…).
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub started_at: String,
+    /// Set when `finalize_run` seals the record; absent while the run is in
+    /// flight. Lets the Trust Report and run-dir scans tell a finished run from
+    /// a stranded one without re-deriving it from the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub worktree: String,
+    /// True only for the serial path introduced by V010-001A. Legacy and
+    /// parallel worktree records deserialize false, preserving their existing
+    /// always-integrate behavior during recovery.
+    #[serde(default)]
+    pub serial_isolated: bool,
+    /// Commit from which this run's isolated worktree was created.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub baseline_oid: String,
+    /// Run-unique branch used by an isolated worktree.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree_branch: String,
+    /// Core-derived answer to "where does accepted output go, and does it go
+    /// there by itself?", written before the worker starts (issue #117).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<AdoptionPolicy>,
+    /// Merge commit attributed to this run, persisted before finish/push.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub integration_oid: String,
+    /// First parent of integration_oid and required remote OID before push.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub integration_base_oid: String,
+    /// Exact isolated commit used as the merge's second parent. Cleanup may
+    /// delete only refs that still point to this OID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub integration_worker_oid: String,
+    /// Identifies the core-controlled integration protocol. Unknown legacy
+    /// parallel runs are handled only through the marker-free parallel path.
+    #[serde(default, skip_serializing_if = "is_unknown_integration_provenance")]
+    pub integration_provenance: IntegrationProvenance,
+    /// Set only after the owned worktree and refs were reconciled. A false
+    /// value makes cleanup restartable after any process interruption.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub integration_cleanup_complete: bool,
+    /// Exact commits newly reachable from baseline through integration_oid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_oids: Vec<String>,
+    /// Core-classified output-contract failure and its one-shot recovery state.
+    /// Written before the recovery spawn so crash recovery cannot create a
+    /// third attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_contract_incident: Option<OutputContractIncident>,
+    /// Set when a result was recovered from a worker's captured stdout instead
+    /// of read from the result file it was asked to write. Recorded so the run
+    /// can never present a tolerant recovery as a written-file success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_recovered_from_stdout: Option<ResultRecoveredFromStdout>,
+}
+
+impl RunRecord {
+    fn resolved_selection(&self) -> Option<crate::schemas::ResolvedWorkerSelection> {
+        let routing_provenance = self.routing_provenance.clone()?;
+        if self.worker.trim().is_empty() || self.model.trim().is_empty() {
+            return None;
+        }
+        Some(crate::schemas::ResolvedWorkerSelection {
+            worker_id: self.worker.clone(),
+            model: self.model.clone(),
+            fallback_enabled: self.fallback_enabled,
+            routing_provenance,
+        })
+    }
+}
+
+fn output_log_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn output_log_span(run_dir: &std::path::Path, byte_start: u64) -> WorkerOutputLogSpan {
+    WorkerOutputLogSpan {
+        path: "worker-output.log".to_string(),
+        byte_start,
+        byte_end: output_log_len(&run_dir.join("worker-output.log")),
+    }
+}
+
+struct OutputContractAttemptClassification {
+    incident: Option<OutputContractIncident>,
+    skip_notice: Option<String>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct OutputContractClassificationSkips {
+    schema_version: u32,
+    notices: Vec<String>,
+}
+
+fn classify_output_contract_attempt(
+    profile: &WorkerProfile,
+    run_dir: &std::path::Path,
+    attempt_id: &str,
+    byte_start: u64,
+) -> OutputContractAttemptClassification {
+    let span = output_log_span(run_dir, byte_start);
+    match workers::classify_output_contract_cause(
+        profile,
+        &run_dir.join("result.json"),
+        &run_dir.join("worker-output.log"),
+        &span,
+    ) {
+        Ok(Some(cause)) => OutputContractAttemptClassification {
+            incident: Some(OutputContractIncident {
+                cause,
+                worker_id: profile.id.clone(),
+                first_attempt_id: attempt_id.to_string(),
+                first_log_span: span,
+                recovery_consumed: false,
+                terminal_attempt_id: None,
+            }),
+            skip_notice: None,
+        },
+        Ok(None) => OutputContractAttemptClassification {
+            incident: None,
+            skip_notice: None,
+        },
+        Err(error) => OutputContractAttemptClassification {
+            incident: None,
+            skip_notice: Some(format!(
+                "output-contract classification skipped for {attempt_id}: {error}"
+            )),
+        },
+    }
+}
+
+fn retain_output_contract_classification(
+    run_dir: &std::path::Path,
+    classification: OutputContractAttemptClassification,
+    lines: &mut Vec<String>,
+) -> Result<Option<OutputContractIncident>> {
+    if let Some(notice) = classification.skip_notice {
+        lines.push(notice.clone());
+        let path = run_dir.join(PROVIDER_REFUSAL_CLASSIFICATION_SKIPS_FILE);
+        let mut record = if path.is_file() {
+            state::load_yaml::<OutputContractClassificationSkips>(&path)?
+        } else {
+            OutputContractClassificationSkips {
+                schema_version: 1,
+                notices: Vec::new(),
+            }
+        };
+        if !record.notices.contains(&notice) {
+            record.notices.push(notice);
+            state::save_yaml_atomic(&path, &record)?;
+        }
+    }
+    Ok(classification.incident)
+}
+
+fn persist_output_contract_incident(
+    run_dir: &std::path::Path,
+    incident: &OutputContractIncident,
+) -> Result<()> {
+    let path = run_dir.join("run.yaml");
+    let mut record: RunRecord = state::load_yaml(&path)?;
+    record.output_contract_incident = Some(incident.clone());
+    state::save_yaml_atomic(&path, &record)
+}
+
+fn load_output_contract_incident(run_dir: &std::path::Path) -> Option<OutputContractIncident> {
+    state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .and_then(|record| record.output_contract_incident)
+}
+
+/// Fail closed, immediately before a worker spawn, unless the run receipt
+/// (`run.yaml` in `run_dir`) still declares the isolated worktree this run was
+/// prepared with and that worktree canonicalizes to the effective spawn cwd.
+/// A tampered, corrupted, or missing receipt must never redirect a worker's
+/// cwd (issue #34); the serial and parallel spawn paths share this predicate,
+/// each passing the isolation flag its receipts are written with.
+pub(crate) fn attest_worker_cwd(
+    run_dir: &std::path::Path,
+    effective_cwd: &std::path::Path,
+    expect_serial_isolated: bool,
+) -> Result<()> {
+    let receipt_path = run_dir.join("run.yaml");
+    let record: RunRecord = state::load_yaml(&receipt_path).with_context(|| {
+        format!(
+            "worker cwd attestation failed: could not read {}; refusing to spawn. Start a fresh run after restoring the run receipt",
+            receipt_path.display()
+        )
+    })?;
+    if record.serial_isolated != expect_serial_isolated {
+        bail!(
+            "worker cwd attestation failed: run.yaml serial_isolated is {} but this spawn path expects {}; refusing to spawn. Start a fresh run after restoring the run receipt",
+            record.serial_isolated,
+            expect_serial_isolated
+        );
+    }
+    if record.worktree.trim().is_empty() || record.worktree == "." {
+        bail!(
+            "worker cwd attestation failed: run.yaml worktree is not an isolated absolute workspace ({:?}); refusing to spawn. Start a fresh run after restoring the run receipt",
+            record.worktree
+        );
+    }
+    let declared_path = std::path::PathBuf::from(&record.worktree);
+    if !declared_path.is_absolute() {
+        bail!(
+            "worker cwd attestation failed: run.yaml worktree '{}' is not absolute; refusing to spawn. Start a fresh run after restoring the run receipt",
+            declared_path.display()
+        );
+    }
+    let declared = std::fs::canonicalize(&declared_path).with_context(|| {
+        format!(
+            "worker cwd attestation failed: run.yaml worktree '{}' cannot be resolved; refusing to spawn. Start a fresh run after restoring the run receipt",
+            declared_path.display()
+        )
+    })?;
+    let effective = std::fs::canonicalize(effective_cwd).with_context(|| {
+        format!(
+            "worker cwd attestation failed: effective cwd '{}' cannot be resolved; refusing to spawn. Start a fresh run after restoring the run worktree",
+            effective_cwd.display()
+        )
+    })?;
+    if declared != effective {
+        bail!(
+            "worker cwd attestation failed: effective cwd '{}' does not match run.yaml worktree '{}'; refusing to spawn. Start a fresh run after restoring the run receipt",
+            effective.display(),
+            declared.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn has_receipted_runtime_selection(
+    ws: &Workspace,
+    intent_id: &str,
+    task_id: &str,
+    selection: &crate::schemas::ResolvedWorkerSelection,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(ws.runs_dir()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let run_dir = entry.path();
+        let Some(path_run_id) = run_dir.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !path_run_id.starts_with("run-") {
+            return false;
+        }
+        let Ok(record) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+            return false;
+        };
+        if record.schema_version != 1
+            || record.run_id != path_run_id
+            || record.task_id != task_id
+            || record.intent_id != intent_id
+            || record.started_at.trim().is_empty()
+            || record.resolved_selection().as_ref() != Some(selection)
+        {
+            return false;
+        }
+        let Ok(process) = workers::load_worker_process_provenance(&run_dir) else {
+            return false;
+        };
+        process.schema_version == 1
+            && process.run_id == record.run_id
+            && !process.attempt_id.trim().is_empty()
+            && process.worker_id == selection.worker_id
+            && process.model == selection.model
+            && process.fallback_enabled == selection.fallback_enabled
+            && process.routing_provenance == selection.routing_provenance
+            && process.pid != 0
+            && !process.process_start_marker.trim().is_empty()
+            && process.state == "exited"
+            && process
+                .completed_at
+                .as_deref()
+                .is_some_and(|completed| !completed.trim().is_empty())
+    })
+}
+
+pub(crate) fn update_run_selection(
+    run_dir: &std::path::Path,
+    selection: &crate::schemas::ResolvedWorkerSelection,
+) -> Result<()> {
+    let path = run_dir.join("run.yaml");
+    let mut record: RunRecord = state::load_yaml(&path)?;
+    record.worker = selection.worker_id.clone();
+    record.model = selection.model.clone();
+    record.fallback_enabled = selection.fallback_enabled;
+    record.routing_provenance = Some(selection.routing_provenance.clone());
+    state::save_yaml_atomic(&path, &record)
+}
+
+pub(crate) fn apply_selection_to_task(
+    task: &mut crate::schemas::Task,
+    selection: &crate::schemas::ResolvedWorkerSelection,
+) {
+    // Stamp the governing CONTRACT, not the runtime attempt. A policy-authorized
+    // fallback/failover may run another ready worker for one attempt (recorded in
+    // the run receipt), but stamping that worker over the governing lineage makes
+    // the task fail `validate_recorded_lineage` on the next drain retry — a
+    // permanent dead-end. The lineage invariant keeps these fields identical to
+    // the selection except in exactly that divergence.
+    let provenance = &selection.routing_provenance;
+    task.preferred_worker = provenance.governing_worker_id.clone();
+    task.model = provenance.governing_model.clone();
+    task.fallback_enabled = Some(provenance.governing_fallback_enabled);
+    task.routing_provenance = Some(provenance.clone());
+}
+
+fn is_unknown_integration_provenance(value: &IntegrationProvenance) -> bool {
+    *value == IntegrationProvenance::Unknown
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct RunFailover {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub at: String,
+}
+
+pub(crate) fn attempt_id_for_ordinal(run_id: &str, ordinal: u32) -> String {
+    if ordinal <= 1 {
+        run_id.to_string()
+    } else {
+        format!("{run_id}-attempt-{ordinal}")
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ChannelRunContext {
+    session_id: String,
+    intent_id: String,
+    task_id: String,
+    correlation_id: String,
+}
+
+pub(crate) fn channel_run_context(
+    ws: &Workspace,
+    intent_id: &str,
+    task_id: &str,
+) -> ChannelRunContext {
+    // Pre-activation/legacy queues had no intent id. Keep that execution path
+    // additive while still giving the durable envelope a non-empty identity.
+    let channel_intent_id = if intent_id.trim().is_empty() {
+        "legacy-intent"
+    } else {
+        intent_id
+    };
+    if let Ok(existing) = ws.load_task_channel(channel_intent_id, task_id) {
+        if !existing.session_id.is_empty() {
+            return ChannelRunContext {
+                correlation_id: existing
+                    .events
+                    .first()
+                    .map(|event| event.correlation_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("cor_{}", existing.channel_id)),
+                session_id: existing.session_id,
+                intent_id: channel_intent_id.to_string(),
+                task_id: task_id.to_string(),
+            };
+        }
+    }
+    let session_id = ws
+        .load_activated_intent()
+        .ok()
+        .flatten()
+        .filter(|intent| intent.intent.id == channel_intent_id)
+        .map(|intent| intent.planning_session_id)
+        .filter(|session| !session.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "ses_{}",
+                gen_session_uuid(channel_intent_id).replace('-', "")
+            )
+        });
+    ChannelRunContext {
+        correlation_id: format!(
+            "cor_{}",
+            gen_session_uuid(channel_intent_id).replace('-', "")
+        ),
+        session_id,
+        intent_id: channel_intent_id.to_string(),
+        task_id: task_id.to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_channel_event(
+    ws: &Workspace,
+    lock: Option<&PlanningLock>,
+    context: &ChannelRunContext,
+    event_type: ChannelEventType,
+    actor: EventActor,
+    attempt_id: Option<&str>,
+    causation_id: Option<String>,
+    payload: serde_json::Value,
+    raw_ref: Option<crate::schemas::RawEventRef>,
+) -> Result<ChannelEvent> {
+    let event = ChannelEvent {
+        schema_version: 1,
+        event_id: String::new(),
+        session_id: context.session_id.clone(),
+        seq: 0,
+        event_type,
+        recorded_at: Local::now().to_rfc3339(),
+        actor,
+        action_id: None,
+        causation_id,
+        correlation_id: context.correlation_id.clone(),
+        task_id: context.task_id.clone(),
+        attempt_id: attempt_id.map(str::to_string),
+        payload,
+        raw_ref,
+    };
+    match lock {
+        Some(lock) => ws.record_task_event_with_lock(lock, &context.intent_id, event),
+        None => ws.record_task_event(&context.intent_id, event),
+    }
+}
+
+fn live_worker_event_sink(
+    ws: &Workspace,
+    context: &ChannelRunContext,
+    attempt: &WorkerAttempt,
+) -> workers::AttemptEventSink {
+    let ws = ws.clone();
+    let context = context.clone();
+    let attempt_id = attempt.attempt_id.clone();
+    let worker_id = attempt.worker_id.clone();
+    std::sync::Arc::new(move |normalized| {
+        let channel = ws
+            .load_task_channel(&context.intent_id, &context.task_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = channel.events.iter().find(|event| {
+            event.attempt_id.as_deref() == Some(&attempt_id)
+                && event.event_type == normalized.event_type
+                && event.raw_ref.as_ref() == Some(&normalized.raw_ref)
+        }) {
+            if existing.payload == normalized.payload {
+                return Ok(());
+            }
+            return Err(format!(
+                "normalized raw event changed for {} at {}..{}",
+                normalized.raw_ref.artifact_id,
+                normalized.raw_ref.byte_start,
+                normalized.raw_ref.byte_end
+            ));
+        }
+        let causation_id = channel
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.attempt_id.as_deref() == Some(&attempt_id))
+            .map(|event| event.event_id.clone());
+        record_channel_event(
+            &ws,
+            None,
+            &context,
+            normalized.event_type,
+            EventActor {
+                kind: EventActorKind::Worker,
+                id: worker_id.clone(),
+            },
+            Some(&attempt_id),
+            causation_id,
+            normalized.payload,
+            Some(normalized.raw_ref),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn raw_attempt_path(ws: &Workspace, reference: &str) -> PathBuf {
+    let path = std::path::Path::new(reference);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(relative) = path.strip_prefix(".agents") {
+        ws.agents_dir().join(relative)
+    } else if reference.starts_with("task-channels/") {
+        ws.agents_dir().join(path)
+    } else {
+        ws.root.join(path)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn begin_worker_attempt(
+    ws: &Workspace,
+    lock: Option<&PlanningLock>,
+    context: &ChannelRunContext,
+    run_dir: &std::path::Path,
+    attempt_id: &str,
+    worker_id: &str,
+    worker_session_ref: Option<String>,
+    continuation: ContinuationMode,
+    caused_by_event_id: Option<String>,
+) -> Result<(WorkerAttempt, workers::AttemptCapture)> {
+    let channel = ws.load_task_channel(&context.intent_id, &context.task_id)?;
+    let attempt = if let Some(existing) = channel
+        .attempts
+        .into_iter()
+        .find(|attempt| attempt.attempt_id == attempt_id)
+    {
+        if existing.state != AttemptState::Prepared
+            || existing.worker_id != worker_id
+            || existing.continuation != continuation
+        {
+            return Err(anyhow!("prepared attempt does not match invocation"));
+        }
+        existing
+    } else {
+        let attempt_dir = run_dir.join("attempts").join(attempt_id);
+        let attempt = WorkerAttempt {
+            schema_version: 1,
+            attempt_id: attempt_id.to_string(),
+            session_id: context.session_id.clone(),
+            intent_id: context.intent_id.clone(),
+            task_id: context.task_id.clone(),
+            worker_id: worker_id.to_string(),
+            worker_session_ref,
+            state: AttemptState::Prepared,
+            continuation,
+            caused_by_event_id,
+            caused_by_action_id: None,
+            raw_stdout_ref: attempt_dir.join("stdout.log").display().to_string(),
+            raw_stderr_ref: attempt_dir.join("stderr.log").display().to_string(),
+        };
+        ws.record_worker_attempt(&attempt)?;
+        attempt
+    };
+    let prepared_exists = ws
+        .load_task_channel(&context.intent_id, &context.task_id)?
+        .events
+        .iter()
+        .any(|event| {
+            event.event_type == ChannelEventType::AttemptPrepared
+                && event.attempt_id.as_deref() == Some(attempt_id)
+        });
+    let prepared_event = if prepared_exists {
+        ws.load_task_channel(&context.intent_id, &context.task_id)?
+            .events
+            .into_iter()
+            .find(|event| {
+                event.event_type == ChannelEventType::AttemptPrepared
+                    && event.attempt_id.as_deref() == Some(attempt_id)
+            })
+            .expect("prepared event checked above")
+    } else {
+        record_channel_event(
+            ws,
+            lock,
+            context,
+            ChannelEventType::AttemptPrepared,
+            EventActor {
+                kind: EventActorKind::System,
+                id: String::new(),
+            },
+            Some(attempt_id),
+            attempt.caused_by_event_id.clone(),
+            serde_json::json!({
+                "worker_id": worker_id,
+                "worker_session_ref": attempt.worker_session_ref,
+                "continuation": continuation
+            }),
+            None,
+        )?
+    };
+    let started_exists = ws
+        .load_task_channel(&context.intent_id, &context.task_id)?
+        .events
+        .iter()
+        .any(|event| {
+            event.event_type == ChannelEventType::WorkerStarted
+                && event.attempt_id.as_deref() == Some(attempt_id)
+        });
+    if !started_exists {
+        record_channel_event(
+            ws,
+            lock,
+            context,
+            ChannelEventType::WorkerStarted,
+            EventActor {
+                kind: EventActorKind::Worker,
+                id: worker_id.to_string(),
+            },
+            Some(attempt_id),
+            Some(prepared_event.event_id),
+            serde_json::json!({"worker_id": worker_id}),
+            None,
+        )?;
+    }
+    state::write_str_atomic(&run_dir.join("latest-attempt"), &format!("{attempt_id}\n"))?;
+    let capture = workers::AttemptCapture {
+        combined_log: run_dir.join("worker-output.log"),
+        stdout_log: raw_attempt_path(ws, &attempt.raw_stdout_ref),
+        stderr_log: raw_attempt_path(ws, &attempt.raw_stderr_ref),
+    };
+    Ok((attempt, capture))
+}
+
+fn worker_attempt_result(
+    run_dir: &std::path::Path,
+    outcome: &workers::WorkerOutcome,
+) -> &'static str {
+    if run_dir.join("cancelled").is_file() {
+        return "cancelled";
+    }
+    // Checked before `result.json`: an interrupted worker may already have
+    // written a result it had not finished acting on, and recording that as a
+    // success would tell the operator their Ctrl-C completed the task.
+    if outcome.stopped {
+        return "stopped";
+    }
+    if outcome.timed_out {
+        return "timed_out";
+    }
+    if let Ok(raw) = std::fs::read_to_string(run_dir.join("result.json")) {
+        if let Ok(result) = serde_json::from_str::<RunResult>(&raw) {
+            return match result.status.as_str() {
+                "needs_user" => "needs_user",
+                "failed" => "failed",
+                _ => "succeeded",
+            };
+        }
+    }
+    "failed"
+}
+
+/// The stdout shape this attempt's worker is normalized against.
+///
+/// Resolution must match what the live publisher used during the attempt: the
+/// end-of-attempt replay dedupes against the events that publisher already
+/// recorded, and two different normalizers over the same bytes would record
+/// two different answers for one raw span. An unreadable workers file falls
+/// back to the core-owned resolution, which is what every profile without a
+/// declaration gets anyway.
+fn declared_output_format(ws: &Workspace, worker_id: &str) -> workers::WorkerOutputFormat {
+    let declared = ws.load_workers().ok().and_then(|workers| {
+        workers
+            .workers
+            .iter()
+            .find(|profile| profile.id == worker_id)
+            .and_then(|profile| profile.invocation.output_format.clone())
+    });
+    workers::resolve_output_format(worker_id, declared.as_deref())
+}
+
+/// Recover a missing result from the attempt's captured stdout when — and only
+/// when — the profile declared structured stdout (`json`/`stream-json`).
+///
+/// Deliberate limits: the built-in adapters never reach this (their format is
+/// a core-owned vendor profile, not a declaration), an existing result file
+/// always wins, and the recovery is abandoned unless its provenance marker can
+/// be written first. A run record that cannot hold the marker must not gain a
+/// result.json that reads as worker-written.
+fn recover_declared_result_from_stdout(
+    run_dir: &std::path::Path,
+    attempt: &WorkerAttempt,
+    capture: &workers::AttemptCapture,
+    format: workers::WorkerOutputFormat,
+) -> Result<Option<ResultRecoveredFromStdout>> {
+    use workers::WorkerOutputFormat;
+
+    let declared = match format {
+        WorkerOutputFormat::Json => "json",
+        WorkerOutputFormat::StreamJson => "stream-json",
+        _ => return Ok(None),
+    };
+    let result_path = run_dir.join("result.json");
+    if result_path.exists() {
+        return Ok(None);
+    }
+    // The run receipt is read BEFORE the stream: it names the run and task the
+    // recovered result has to identify, and a receipt that cannot hold the
+    // provenance marker forfeits the recovery outright.
+    let record_path = run_dir.join("run.yaml");
+    let Ok(mut record) = state::load_yaml::<RunRecord>(&record_path) else {
+        return Ok(None);
+    };
+    let Ok(raw) = std::fs::read(&capture.stdout_log) else {
+        return Ok(None);
+    };
+    let Some(recovered) =
+        workers::recover_result_from_output(&raw, &record.run_id, &record.task_id)
+    else {
+        return Ok(None);
+    };
+    let marker = ResultRecoveredFromStdout {
+        schema_version: 1,
+        attempt_id: attempt.attempt_id.clone(),
+        worker_id: attempt.worker_id.clone(),
+        output_format: declared.to_string(),
+        stream: "stdout".to_string(),
+        byte_start: recovered.byte_start as u64,
+        byte_end: recovered.byte_end as u64,
+    };
+    record.result_recovered_from_stdout = Some(marker.clone());
+    state::save_yaml_atomic(&record_path, &record)?;
+    // The worker's exact bytes, never a re-serialization: a recovered result
+    // stays worker-authored content that Yardlet only relocated.
+    state::write_str_atomic(&result_path, &recovered.json)?;
+    Ok(Some(marker))
+}
+
+fn load_result_recovery_marker(run_dir: &std::path::Path) -> Option<ResultRecoveredFromStdout> {
+    state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .and_then(|record| record.result_recovered_from_stdout)
+}
+
+pub(crate) fn finish_worker_attempt(
+    ws: &Workspace,
+    lock: Option<&PlanningLock>,
+    context: &ChannelRunContext,
+    run_dir: &std::path::Path,
+    attempt: &WorkerAttempt,
+    capture: &workers::AttemptCapture,
+    outcome: &workers::WorkerOutcome,
+) -> Result<()> {
+    let output_format = declared_output_format(ws, &attempt.worker_id);
+    // Before the attempt is judged: a worker that DECLARES structured stdout
+    // may have put its result there instead of in the result file. Recovering
+    // it here keeps the tolerant fallback on the one seam the serial and
+    // parallel paths already share, and the marker it writes is what stops a
+    // recovery from reading back as "the worker wrote result.json".
+    recover_declared_result_from_stdout(run_dir, attempt, capture, output_format)?;
+    let mut channel = ws.load_task_channel(&context.intent_id, &context.task_id)?;
+    let mut causation_id = channel
+        .events
+        .iter()
+        .find(|event| {
+            event.event_type == ChannelEventType::WorkerStarted
+                && event.attempt_id.as_deref() == Some(&attempt.attempt_id)
+        })
+        .map(|event| event.event_id.clone());
+    // A saturated live sink deliberately sheds normalized events so raw pipe
+    // readers can keep draining. Replaying the same backlog synchronously here
+    // would reintroduce the completion stall; exact stdout/stderr remain the
+    // authoritative evidence for the shed tail.
+    if !outcome.public_events_dropped {
+        for (stream, path, artifact_id) in [
+            (
+                workers::RawStreamKind::Stdout,
+                &capture.stdout_log,
+                format!("raw_{}_stdout", attempt.attempt_id),
+            ),
+            (
+                workers::RawStreamKind::Stderr,
+                &capture.stderr_log,
+                format!("raw_{}_stderr", attempt.attempt_id),
+            ),
+        ] {
+            let raw = std::fs::read(path)
+                .with_context(|| format!("reading attempt raw stream {}", path.display()))?;
+            for normalized in workers::normalize_worker_output_with_format(
+                output_format,
+                stream,
+                &raw,
+                &artifact_id,
+            ) {
+                let existing = channel.events.iter().find(|event| {
+                    event.attempt_id.as_deref() == Some(&attempt.attempt_id)
+                        && event.event_type == normalized.event_type
+                        && event.raw_ref.as_ref() == Some(&normalized.raw_ref)
+                });
+                let recorded = if let Some(existing) = existing {
+                    if existing.payload != normalized.payload {
+                        return Err(anyhow!(
+                            "normalized raw event changed for {} at {}..{}",
+                            normalized.raw_ref.artifact_id,
+                            normalized.raw_ref.byte_start,
+                            normalized.raw_ref.byte_end
+                        ));
+                    }
+                    existing.clone()
+                } else {
+                    let recorded = record_channel_event(
+                        ws,
+                        lock,
+                        context,
+                        normalized.event_type,
+                        EventActor {
+                            kind: EventActorKind::Worker,
+                            id: attempt.worker_id.clone(),
+                        },
+                        Some(&attempt.attempt_id),
+                        causation_id,
+                        normalized.payload,
+                        Some(normalized.raw_ref),
+                    )?;
+                    channel.events.push(recorded.clone());
+                    recorded
+                };
+                causation_id = Some(recorded.event_id);
+            }
+        }
+    }
+    if worker_attempt_result(run_dir, outcome) == "needs_user" {
+        if let Ok(result) = std::fs::read_to_string(run_dir.join("result.json")) {
+            if let Ok(result) = serde_json::from_str::<RunResult>(&result) {
+                if let Some(question) = result
+                    .question_for_user
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|question| !question.is_empty())
+                {
+                    if let Some(asked) = record_result_question(
+                        ws,
+                        lock,
+                        context,
+                        run_dir,
+                        question,
+                        EventActorKind::Worker,
+                    )? {
+                        causation_id = Some(asked.event_id);
+                    }
+                }
+            }
+        }
+    }
+    if !channel.events.iter().any(|event| {
+        event.event_type == ChannelEventType::WorkerCompleted
+            && event.attempt_id.as_deref() == Some(&attempt.attempt_id)
+    }) {
+        record_channel_event(
+            ws,
+            lock,
+            context,
+            ChannelEventType::WorkerCompleted,
+            EventActor {
+                kind: EventActorKind::System,
+                id: String::new(),
+            },
+            Some(&attempt.attempt_id),
+            causation_id,
+            serde_json::json!({
+                "result": worker_attempt_result(run_dir, outcome),
+                "exit_ok": outcome.exit_ok,
+                "exit_code": outcome.exit_code,
+                "exit_signal": outcome.exit_signal,
+                "timed_out": outcome.timed_out,
+                "raw_stdout_ref": attempt.raw_stdout_ref,
+                "raw_stderr_ref": attempt.raw_stderr_ref,
+                "worker_session_ref": outcome.session_id
+            }),
+            None,
+        )?;
+    }
+    ws.load_or_rebuild_task_channel(&context.intent_id, &context.task_id)?;
+    Ok(())
+}
+
+pub(crate) fn finish_worker_attempt_error(
+    ws: &Workspace,
+    context: &ChannelRunContext,
+    attempt: &WorkerAttempt,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let channel = ws.load_task_channel(&context.intent_id, &context.task_id)?;
+    if channel.events.iter().any(|event| {
+        event.event_type == ChannelEventType::WorkerCompleted
+            && event.attempt_id.as_deref() == Some(&attempt.attempt_id)
+    }) {
+        return Ok(());
+    }
+    let causation_id = channel
+        .events
+        .into_iter()
+        .rev()
+        .find(|event| event.attempt_id.as_deref() == Some(&attempt.attempt_id))
+        .map(|event| event.event_id);
+    record_channel_event(
+        ws,
+        None,
+        context,
+        ChannelEventType::WorkerCompleted,
+        EventActor {
+            kind: EventActorKind::System,
+            id: String::new(),
+        },
+        Some(&attempt.attempt_id),
+        causation_id,
+        serde_json::json!({
+            "result": "failed",
+            "exit_code": serde_json::Value::Null,
+            "exit_signal": serde_json::Value::Null,
+            "raw_stdout_ref": attempt.raw_stdout_ref,
+            "raw_stderr_ref": attempt.raw_stderr_ref,
+            "spawn_error": error.to_string(),
+            "worker_session_ref": attempt.worker_session_ref
+        }),
+        None,
+    )?;
+    ws.load_or_rebuild_task_channel(&context.intent_id, &context.task_id)?;
+    Ok(())
+}
+
+fn record_result_question(
+    ws: &Workspace,
+    lock: Option<&PlanningLock>,
+    context: &ChannelRunContext,
+    run_dir: &std::path::Path,
+    question_text: &str,
+    actor_kind: EventActorKind,
+) -> Result<Option<ChannelEvent>> {
+    let attempt_id = std::fs::read_to_string(run_dir.join("latest-attempt"))
+        .with_context(|| format!("reading latest attempt for {}", context.task_id))?;
+    let attempt_id = attempt_id.trim();
+    let channel = ws.load_task_channel(&context.intent_id, &context.task_id)?;
+    if channel
+        .questions
+        .iter()
+        .any(|question| question.attempt_id == attempt_id && question.text == question_text)
+    {
+        return Ok(channel
+            .events
+            .iter()
+            .find(|event| {
+                event.event_type == ChannelEventType::QuestionAsked
+                    && event.attempt_id.as_deref() == Some(attempt_id)
+                    && event.payload["text"] == question_text
+            })
+            .cloned());
+    }
+    let question_id = format!("qst_{attempt_id}");
+    let asked = if let Some(existing) = channel.events.iter().find(|event| {
+        event.event_type == ChannelEventType::QuestionAsked
+            && event.attempt_id.as_deref() == Some(attempt_id)
+            && event.payload["question_id"] == question_id
+    }) {
+        if existing.payload["text"] != question_text {
+            return Err(anyhow!("question event payload changed after persistence"));
+        }
+        existing.clone()
+    } else {
+        record_channel_event(
+            ws,
+            lock,
+            context,
+            ChannelEventType::QuestionAsked,
+            EventActor {
+                kind: actor_kind,
+                id: if actor_kind == EventActorKind::Worker {
+                    channel
+                        .attempts
+                        .iter()
+                        .find(|attempt| attempt.attempt_id == attempt_id)
+                        .map(|attempt| attempt.worker_id.clone())
+                        .unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    String::new()
+                },
+            },
+            Some(attempt_id),
+            channel.events.last().map(|event| event.event_id.clone()),
+            serde_json::json!({"question_id": question_id, "text": question_text}),
+            None,
+        )?
+    };
+    let context_start_seq = asked.seq.saturating_sub(20).max(1);
+    ws.record_question(&Question {
+        schema_version: 1,
+        question_id,
+        session_id: context.session_id.clone(),
+        task_id: context.task_id.clone(),
+        attempt_id: attempt_id.to_string(),
+        asked_event_id: asked.event_id.clone(),
+        asked_seq: asked.seq,
+        context_start_seq,
+        text: question_text.to_string(),
+        state: QuestionState::Open,
+        answer_id: None,
+    })?;
+    ws.load_or_rebuild_task_channel(&context.intent_id, &context.task_id)?;
+    Ok(Some(asked))
+}
+
+fn persist_needs_user_question(
+    ws: &Workspace,
+    lock: Option<&PlanningLock>,
+    context: &ChannelRunContext,
+    run_dir: &std::path::Path,
+    question_text: &str,
+    actor_kind: EventActorKind,
+) -> Result<()> {
+    let has_attempt = std::fs::read_to_string(run_dir.join("latest-attempt"))
+        .ok()
+        .is_some_and(|attempt| !attempt.trim().is_empty());
+    if has_attempt {
+        record_result_question(ws, lock, context, run_dir, question_text, actor_kind)?;
+    } else {
+        // Runs created before durable task channels have no attempt identity to
+        // link a typed Question to. Preserve the same non-empty invariant via
+        // the canonical legacy conversation path used by latest_question_for.
+        let run_id = run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        state::append_conversation_turn(
+            ws,
+            &context.intent_id,
+            &context.task_id,
+            ConversationTurn {
+                role: TurnRole::Worker,
+                text: question_text.to_string(),
+                run_id: run_id.to_string(),
+                ts: Local::now().to_rfc3339(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn action_attempt_id(action_id: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in action_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("att-action-{hash:016x}")
+}
+
+fn explicit_continuation_packet(
+    attempt_id: &str,
+    caused_by_event_id: Option<&str>,
+    caused_by_action_id: Option<&str>,
+    public_context: &[(u64, String)],
+    checkpoint: Option<&str>,
+) -> String {
+    const CONTEXT_LIMIT: usize = 20;
+    let retained = public_context.len().saturating_sub(CONTEXT_LIMIT);
+    let mut packet = format!(
+        "Explicit continuation packet\n\
+         continuation_attempt_id: {attempt_id}\n\
+         caused_by_event_id: {}\n\
+         caused_by_action_id: {}\n",
+        caused_by_event_id.unwrap_or("none"),
+        caused_by_action_id.unwrap_or("none")
+    );
+    if let Some(checkpoint) = checkpoint.filter(|value| !value.trim().is_empty()) {
+        packet.push_str("\nCheckpoint:\n");
+        packet.push_str(checkpoint.trim());
+        packet.push('\n');
+    }
+    packet.push_str("\nBounded public channel context:\n");
+    for (seq, text) in &public_context[retained..] {
+        packet.push_str(&format!("[{seq}] {}\n", text.trim()));
+    }
+    packet
+}
+
+fn public_channel_context(channel: &crate::schemas::TaskChannel) -> Vec<(u64, String)> {
+    channel
+        .events
+        .iter()
+        .filter_map(|event| {
+            let text = match event.event_type {
+                ChannelEventType::WorkerMessage
+                | ChannelEventType::QuestionAsked
+                | ChannelEventType::UserAnswered => event
+                    .payload
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                ChannelEventType::ToolStarted | ChannelEventType::ToolCompleted => Some(format!(
+                    "{}: {}",
+                    event.event_type.as_str(),
+                    event
+                        .payload
+                        .get("name")
+                        .or_else(|| event.payload.get("command"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("tool")
+                )),
+                ChannelEventType::WorkerCheckpoint => Some("worker.checkpoint".to_string()),
+                ChannelEventType::WorkerCompleted => Some(format!(
+                    "worker.completed: {}",
+                    event
+                        .payload
+                        .get("result")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                )),
+                _ => None,
+            }?;
+            (!text.trim().is_empty()).then_some((event.seq, text))
+        })
+        .collect()
+}
+
+/// Bind a UI or CLI reply to the exact open channel question before `run_next`
+/// appends the legacy conversation turn. Legacy channels remain additive and
+/// simply return `false`.
+pub(crate) fn prepare_answer_action(
+    ws: &Workspace,
+    task_id: &str,
+    reply: &str,
+    requested_action_id: Option<String>,
+) -> Result<bool> {
+    prepare_answer_action_with_deviations(ws, task_id, reply, requested_action_id, &[])
+}
+
+pub(crate) fn prepare_answer_action_with_deviations(
+    ws: &Workspace,
+    task_id: &str,
+    reply: &str,
+    requested_action_id: Option<String>,
+    accepted_deviation_ids: &[String],
+) -> Result<bool> {
+    let queue = ws.load_queue()?;
+    if queue.intent_id.is_empty() {
+        return Ok(false);
+    }
+    let channel = ws.load_task_channel(&queue.intent_id, task_id)?;
+    let Some(question) = channel
+        .questions
+        .iter()
+        .rev()
+        .find(|question| question.state == QuestionState::Open)
+    else {
+        if channel.questions.is_empty() {
+            return Ok(false);
+        }
+        bail!("question_closed: task {task_id} has no actionable open question");
+    };
+    let producer = channel
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == question.attempt_id)
+        .ok_or_else(|| anyhow!("question producer attempt is missing"))?;
+    let action_id = requested_action_id.unwrap_or_else(|| {
+        format!(
+            "act-answer-{}-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S%6f"),
+            std::process::id()
+        )
+    });
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| anyhow!("task {task_id} not found in queue"))?;
+    let accepted_deviations = if accepted_deviation_ids.is_empty() {
+        Vec::new()
+    } else {
+        let (latest_run_id, latest_run_dir) = latest_run_for(ws, task_id)
+            .ok_or_else(|| anyhow!("task {task_id} has no run with disclosed deviations"))?;
+        let result: RunResult = serde_json::from_str(
+            &std::fs::read_to_string(latest_run_dir.join("result.json"))
+                .context("loading latest deviation disclosure")?,
+        )
+        .context("parsing latest deviation disclosure")?;
+        if result.task_id != task_id || result.run_id != latest_run_id {
+            bail!("deviation_disclosure_identity_mismatch");
+        }
+        let mut selected = Vec::new();
+        for requested in accepted_deviation_ids {
+            let requested = requested.trim();
+            let matches = result
+                .intent_adherence
+                .deviations
+                .iter()
+                .filter(|deviation| deviation.id == requested)
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                bail!(
+                    "deviation_disclosure_ambiguous: latest run disclosed '{}' more than once",
+                    requested
+                );
+            }
+            let deviation = matches.first().copied().ok_or_else(|| {
+                    anyhow!(
+                        "deviation_not_disclosed: latest run for {task_id} did not disclose '{requested}'"
+                    )
+                })?;
+            if deviation.scope.is_empty() {
+                bail!(
+                    "deviation_not_typed: '{}' has no exact scope and cannot be accepted",
+                    deviation.id
+                );
+            }
+            if !selected
+                .iter()
+                .any(|existing: &crate::schemas::IntentDeviation| existing.id == deviation.id)
+            {
+                selected.push(deviation.clone());
+            }
+        }
+        selected
+    };
+    let workers_file = ws.load_workers()?;
+    let billing = ws.load_billing()?;
+    let selected = routing::resolve_worker_for_task(ws, &workers_file, &billing, None, task)?;
+    let same_worker = selected.worker_id == producer.worker_id;
+    let selected_profile = find_worker(&workers_file.workers, &selected.worker_id)?;
+    let supports_native_resume = same_worker && workers::supports_native_resume(selected_profile);
+    ws.answer_question(&AnswerActionRequest {
+        continuation_attempt_id: action_attempt_id(&action_id),
+        answer_id: format!("ans-{}", action_attempt_id(&action_id)),
+        action_id,
+        session_id: channel.session_id.clone(),
+        intent_id: queue.intent_id,
+        task_id: task_id.to_string(),
+        question_id: question.question_id.clone(),
+        text: reply.to_string(),
+        accepted_deviations,
+        worker_id: selected.worker_id.clone(),
+        worker_session_ref: same_worker
+            .then(|| producer.worker_session_ref.clone())
+            .flatten(),
+        supports_native_resume,
+    })?;
+    Ok(true)
+}
+
+pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
+    // Installed at the entry point, not at each caller: `yardlet goal` reaches
+    // `run_auto` without going through `cmd_run`, and an independent review found
+    // exactly that path still orphaning its worker. Every route that can start a
+    // worker passes through here or `run_next` (issue #107).
+    crate::signals::install_stop_handler();
+    // Serialize queue selection and the first runtime transition against a
+    // planning confirmation. Once Running is canonical, confirm observes it
+    // and fails closed; the worker itself never holds this lock.
+    let planning_lock = ws.acquire_planning_lock()?;
+    let mut queue = ws.load_queue()?;
+    let workers = ws.load_workers()?;
+    let billing = ws.load_billing()?;
+    let intent = ws.load_intent()?;
+    let config = ws.load_config()?;
+
+    // V010-002 activation gate. Legacy queues remain compatible, but once any
+    // confirmation provenance is present every contract predicate is required.
+    // Missing or contradictory linkage is visible state, never runnable work.
+    crate::planning::validate_active_activation(ws)?;
+
+    // Ambiguity gate (absorption.md A2): while the planner's own self-report
+    // says it is still guessing, queue-selected runs refuse to start. A named
+    // target or --accept-ambiguity is an explicit human override.
+    if opts.target.is_none() && !opts.accept_ambiguity {
+        if let Some(i) = &intent {
+            if crate::planner::intent_gated(i, config.ambiguity_gate) {
+                return Err(anyhow!(
+                    "the plan is still guessing (ambiguity: high, {} open question(s), \
+                     interview turn {}/{}). Answer with `a` in the TUI or `yardlet answer`, \
+                     or override with --accept-ambiguity.",
+                    i.open_questions.len(),
+                    i.interview_turns,
+                    crate::planner::INTERVIEW_CAP
+                ));
+            }
+        }
+    }
+
+    // ---- select task: a named target, or the next eligible queued one ---
+    let idx = match &opts.target {
+        Some(id) => queue
+            .tasks
+            .iter()
+            .position(|t| &t.id == id)
+            .ok_or_else(|| anyhow!("task {id} not found in the queue"))?,
+        None => {
+            let vocab = routing::declared_capabilities(&workers);
+            select_next_ready(&queue, &vocab, |id| crate::approvals::is_granted(ws, id))?
+                .ok_or_else(|| anyhow!("no eligible queued task to run"))?
+        }
+    };
+    let mut task = queue.tasks[idx].clone();
+
+    // Capability backstop: if this task requires a capability no enabled worker
+    // declares, park it Blocked HERE — before any run dir or worker spawn —
+    // instead of letting routing hard-fail and strand an orphaned run. Queue
+    // creation already grounds capabilities (planner::reconcile_queue_capabilities);
+    // this guards the path that bypasses that: a named `--task` the user forced.
+    {
+        let vocab = routing::declared_capabilities(&workers);
+        let unsatisfiable =
+            routing::unsatisfiable_capabilities(&task.required_capabilities, &vocab);
+        if !unsatisfiable.is_empty() {
+            match routing::classify_stale_gate(&unsatisfiable) {
+                routing::GateShape::Decision => {
+                    migrate_stale_gate_to_decision(
+                        ws,
+                        &planning_lock,
+                        &mut queue,
+                        &task,
+                        &unsatisfiable,
+                    )?;
+                    return Ok(RunReport {
+                        run_id: String::new(),
+                        task_id: task.id.clone(),
+                        worker_id: String::new(),
+                        run_dir: ws.runs_dir(),
+                        prepared: false,
+                        executed: false,
+                        lines: vec![format!(
+                            "{}: migrated stale capability gate to NeedsUser; answer it with `yardlet answer --task {}`",
+                            task.id, task.id
+                        )],
+                        result_state: Some(TaskState::NeedsUser),
+                        session: None,
+                        chained: false,
+                    });
+                }
+                routing::GateShape::ToolGap => {
+                    save_task_state_on_latest_queue_locked(
+                        ws,
+                        &planning_lock,
+                        &mut queue,
+                        &task.id,
+                        TaskState::Deferred,
+                        TransitionCause::TidyDefer,
+                        &format!(
+                            "set aside because no enabled worker declares required capability/capabilities [{}]",
+                            unsatisfiable.join(", ")
+                        ),
+                        TransitionActor::System,
+                    )?;
+                }
+            }
+            return Ok(RunReport {
+                run_id: String::new(),
+                task_id: task.id.clone(),
+                worker_id: String::new(),
+                run_dir: ws.runs_dir(),
+                prepared: false,
+                executed: false,
+                lines: vec![format!(
+                    "{}: set aside Deferred — no enabled worker declares required \
+                     capability/capabilities [{}]; add a capable worker and revive it when ready",
+                    task.id,
+                    unsatisfiable.join(", ")
+                )],
+                result_state: Some(TaskState::Deferred),
+                session: None,
+                chained: false,
+            });
+        }
+    }
+
+    // Resuming after a question: record the user's reply and thread the whole
+    // conversation back so the worker has memory of it. Seed the worker's prior
+    // question for a task that paused before transcripts existed (legacy/first).
+    let conversation: Vec<ConversationTurn> = if let Some(answer) = opts
+        .answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        if ws
+            .load_conversation(&queue.intent_id, &task.id)
+            .turns
+            .is_empty()
+        {
+            if let Some(q) = latest_question_for(ws, &task.id) {
+                let _ = state::append_conversation_turn(
+                    ws,
+                    &queue.intent_id,
+                    &task.id,
+                    ConversationTurn {
+                        role: TurnRole::Worker,
+                        text: q,
+                        run_id: String::new(),
+                        ts: String::new(),
+                    },
+                );
+            }
+        }
+        let _ = state::append_conversation_turn(
+            ws,
+            &queue.intent_id,
+            &task.id,
+            ConversationTurn {
+                role: TurnRole::User,
+                text: answer.to_string(),
+                run_id: String::new(),
+                ts: Local::now().to_rfc3339(),
+            },
+        );
+        ws.load_conversation(&queue.intent_id, &task.id).turns
+    } else {
+        Vec::new()
+    };
+    let prepared_answer_attempt = ws
+        .load_task_channel(&queue.intent_id, &task.id)
+        .ok()
+        .and_then(|channel| {
+            channel.attempts.into_iter().rev().find(|attempt| {
+                attempt.state == AttemptState::Prepared
+                    && matches!(
+                        attempt.continuation,
+                        ContinuationMode::NativeResume
+                            | ContinuationMode::ExplicitPacket
+                            | ContinuationMode::Redirect
+                    )
+            })
+        });
+    #[cfg(debug_assertions)]
+    if prepared_answer_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.continuation == ContinuationMode::Redirect)
+        && std::env::var("YARDLET_TEST_CRASH_AFTER_REDIRECT_RECEIPT").as_deref() == Ok("1")
+    {
+        bail!("injected crash after redirect receipt and before continuation spawn");
+    }
+    // Re-running a Partial task uses its checkpoint. An answer/redirect that
+    // cannot honestly resume a native provider session receives a bounded,
+    // causally explicit packet instead of an unbounded transcript.
+    let continuation = if let Some(attempt) = prepared_answer_attempt.as_ref().filter(|attempt| {
+        matches!(
+            attempt.continuation,
+            ContinuationMode::ExplicitPacket | ContinuationMode::Redirect
+        )
+    }) {
+        let channel = ws.load_task_channel(&queue.intent_id, &task.id)?;
+        let context = public_channel_context(&channel);
+        Some(explicit_continuation_packet(
+            &attempt.attempt_id,
+            attempt.caused_by_event_id.as_deref(),
+            attempt.caused_by_action_id.as_deref(),
+            &context,
+            continuation_context(ws, &task.id).as_deref(),
+        ))
+    } else if task.state == TaskState::Partial {
+        continuation_context(ws, &task.id)
+    } else {
+        None
+    };
+
+    // ---- resolve worker (deterministic: candidate -> readiness -> fallback) --
+    let resolved = routing::resolve_worker_for_task(
+        ws,
+        &workers,
+        &billing,
+        opts.worker_override.as_deref(),
+        &task,
+    );
+    let candidate_id = opts
+        .worker_override
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!task.preferred_worker.is_empty()).then(|| task.preferred_worker.clone()))
+        .unwrap_or_else(|| workers.routing.default_worker.clone());
+    let worker_id = resolved
+        .as_ref()
+        .map(|r| r.worker_id.clone())
+        .unwrap_or_else(|_| candidate_id.clone());
+    let resolved_selection = resolved.as_ref().ok().map(|resolved| resolved.selection());
+    // Keep the confirmed/runtime-added contract as the failover policy input.
+    // The in-flight task below is stamped with the first effective selection
+    // for packet/receipt parity; resolving failover from that stamped copy
+    // would incorrectly pin an `auto` task to the first worker's model and
+    // provenance instead of producing a fresh policy-authorized selection.
+    let failover_task = task.clone();
+    if opts.execute {
+        if let Some(selection) = resolved_selection
+            .as_ref()
+            .filter(|selection| !selection.model.trim().is_empty())
+        {
+            apply_selection_to_task(&mut task, selection);
+        }
+    }
+
+    // ---- run directory ---------------------------------------------------
+    let base_run_id = format!(
+        "run-{}-{}",
+        Local::now().format("%Y%m%d-%H%M%S%9f"),
+        std::process::id()
+    );
+    let (run_id, run_dir) = ws.claim_run_dir(&base_run_id)?;
+    std::fs::create_dir_all(run_dir.join("evidence"))?;
+    let serial_worktree = if opts.execute {
+        Some(prepare_serial_worktree(ws, &run_dir, &run_id, &task.id)?)
+    } else {
+        None
+    };
+    let mut serial_cleanup = SerialWorktreeErrorCleanup::new(ws, serial_worktree.as_ref());
+    let worker_run_dir = serial_worktree
+        .as_ref()
+        .map(|owned| owned.worker_run_dir.as_path())
+        .unwrap_or(run_dir.as_path());
+    let worker_cwd = serial_worktree
+        .as_ref()
+        .map(|owned| owned.path.as_path())
+        .unwrap_or(ws.root.as_path());
+    let run_dir_rel = if serial_worktree.is_some() {
+        worker_run_dir.display().to_string()
+    } else {
+        format!(".agents/runs/{run_id}")
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!("selected task {} ({})", task.id, task.title));
+    if let Some(rat) = &task.worker_rationale {
+        lines.push(format!("planner rationale: {rat}"));
+    }
+    lines.push(format!("run dir: {run_dir_rel}"));
+
+    // ---- deterministic evidence -----------------------------------------
+    let summary = inspect::summarize(&ws.root);
+    let summary_markdown = inspect::to_markdown(&summary);
+    write_str(
+        &run_dir.join("evidence").join("repo-summary.md"),
+        &summary_markdown,
+    )?;
+    if serial_worktree.is_some() {
+        write_str(
+            &worker_run_dir.join("evidence").join("repo-summary.md"),
+            &summary_markdown,
+        )?;
+    }
+
+    // ---- compile packet --------------------------------------------------
+    // Resolve output language from config (auto-detects Korean from the intent).
+    let lang_sample = intent
+        .as_ref()
+        .map(|i| {
+            if !i.raw_request.is_empty() {
+                i.raw_request.clone()
+            } else {
+                i.summary.clone()
+            }
+        })
+        .unwrap_or_else(|| task.title.clone());
+    let language = packet::resolve_language(&config.language, &lang_sample);
+    let images: Vec<String> = intent
+        .as_ref()
+        .map(|i| i.images.clone())
+        .unwrap_or_default();
+
+    let role_notes = packet::load_role_notes(&ws.root, packet::role_for(&task.kind));
+    let harness = packet::discover_harness(
+        &ws.root,
+        config.harness_discovery,
+        &packet::NativeHarnessSources::for_workers(&workers.workers),
+    );
+    let chained_from = opts.chain.as_ref().map(|c| c.prev_task_id.clone());
+    // A grant present now (consumed below at execute time) means the human has
+    // approved this run's gated action: tell the worker to finish it, not re-ask.
+    let approved = task.approval_required() && crate::approvals::is_granted(ws, &task.id);
+    let packet_text = packet::compile(&PacketInputs {
+        worker_id: &worker_id,
+        task: &task,
+        intent: intent.as_ref(),
+        repo: &summary,
+        run_dir_rel: &run_dir_rel,
+        conversation: &conversation,
+        continuation: continuation.as_deref(),
+        chained_from: chained_from.as_deref(),
+        language: &language,
+        images: &images,
+        role_notes: &role_notes,
+        harness: &harness,
+        approved,
+        pre_push_checks: &config.git_finish.pre_push_checks,
+    });
+    write_str(&workers::packet_path(&run_dir), &packet_text)?;
+
+    // ---- run record ------------------------------------------------------
+    let record = RunRecord {
+        schema_version: 1,
+        adoption: adoption_policy_for(ws),
+        run_id: run_id.clone(),
+        task_id: task.id.clone(),
+        intent_id: queue.intent_id.clone(),
+        worker: worker_id.clone(),
+        model: resolved_selection
+            .as_ref()
+            .map(|selection| selection.model.clone())
+            .unwrap_or_default(),
+        fallback_enabled: resolved_selection
+            .as_ref()
+            .is_some_and(|selection| selection.fallback_enabled),
+        routing_provenance: resolved_selection
+            .as_ref()
+            .map(|selection| selection.routing_provenance.clone()),
+        state: if opts.execute { "running" } else { "prepared" }.to_string(),
+        started_at: Local::now().to_rfc3339(),
+        completed_at: None,
+        worktree: serial_worktree
+            .as_ref()
+            .map(|owned| owned.path.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+        serial_isolated: serial_worktree.is_some(),
+        baseline_oid: serial_worktree
+            .as_ref()
+            .map(|owned| owned.baseline_oid.clone())
+            .unwrap_or_default(),
+        worktree_branch: serial_worktree
+            .as_ref()
+            .map(|owned| owned.branch.clone())
+            .unwrap_or_default(),
+        integration_oid: String::new(),
+        integration_base_oid: String::new(),
+        integration_worker_oid: String::new(),
+        integration_provenance: if serial_worktree.is_some() {
+            IntegrationProvenance::SerialCoreStaged
+        } else {
+            IntegrationProvenance::Unknown
+        },
+        integration_cleanup_complete: false,
+        owned_oids: Vec::new(),
+        output_contract_incident: None,
+        result_recovered_from_stdout: None,
+    };
+    state::save_yaml_atomic(&run_dir.join("run.yaml"), &record)?;
+    if serial_worktree.is_some() {
+        state::save_yaml_atomic(&worker_run_dir.join("run.yaml"), &record)?;
+        write_str(&workers::packet_path(worker_run_dir), &packet_text)?;
+    }
+
+    // ---- zero-key env note ----------------------------------------------
+    let billing_present = guard::present_billing_env(&billing.blocked_worker_env_names);
+    if !billing_present.is_empty() {
+        lines.push(format!(
+            "billing env present in parent ({}); will be scrubbed before worker runs",
+            billing_present.len()
+        ));
+    }
+
+    if !opts.execute {
+        lines.push(String::new());
+        match &resolved {
+            Ok(r) => lines.push(format!("will use {} ({})", r.worker_id, r.reason)),
+            Err(e) => lines.push(format!("no invocable worker: {e}")),
+        }
+        lines.push("re-run with --execute to invoke the worker.".to_string());
+        return Ok(RunReport {
+            run_id,
+            task_id: task.id,
+            worker_id,
+            run_dir,
+            prepared: true,
+            executed: false,
+            lines,
+            result_state: None,
+            session: None,
+            chained: false,
+        });
+    }
+
+    if let Err(error) = crate::git_finish::preflight_target_before_spawn(
+        ws,
+        &run_dir,
+        &run_id,
+        &task.id,
+        &config.git_finish,
+    ) {
+        seal_run_record(
+            &run_dir,
+            &run_id,
+            &task,
+            &queue.intent_id,
+            &worker_id,
+            TaskState::Blocked,
+            None,
+        );
+        return Err(error);
+    }
+
+    // ---- execute ---------------------------------------------------------
+    if task.approval_required() {
+        if crate::approvals::is_granted(ws, &task.id) {
+            crate::approvals::consume(ws, &task.id)?; // single-use
+            lines.push(format!("approval consumed for {}", task.id));
+        } else {
+            return Err(anyhow!(
+                "task {} requires approval. Run `yardlet approve {}` first, then \
+                 `yardlet run --task {} --execute`.",
+                task.id,
+                task.id,
+                task.id
+            ));
+        }
+    }
+    let resolved = resolved?; // hard stop if no ready worker
+    let mut active_worker_id = worker_id.clone();
+    let mut active_selection = resolved.selection();
+    let mut active_reason = resolved.reason;
+    let mut active_bin = resolved.bin;
+    let profile = find_worker(&workers.workers, &active_worker_id)?;
+    // A per-task model/effort overrides the worker profile only when explicit;
+    // "auto"/empty keeps the profile's pin (so the planner's `model: auto` does
+    // not clobber a worker-level model pin). The in-flight task thus captures
+    // its own effective profile.
+    let mut eff_profile = workers::effective_profile(profile, &task.model, &task.effort);
+    // Per-run --full-access OR the workspace's default_access=full.
+    let full_access = opts.full_access || config.default_access.eq_ignore_ascii_case("full");
+    let mut env = guard::sanitized_worker_env_for(&billing, &eff_profile.invocation.pass_env)
+        .map_err(|e| anyhow!(e))?;
+    let mut timeout = wall_clock_timeout(profile.limits.max_wall_minutes);
+    lines.push(format!("worker: {active_worker_id} ({active_reason})"));
+
+    // H3: workspace-owned pre-run gates bind every worker. A non-zero hook
+    // blocks the run before any worker spawns (detect-secrets, lint, "don't
+    // run while CI is red"). The task fails with the hook's reason so the
+    // auto-drain stops on it rather than looping; fix the cause and re-run.
+    let pre = crate::hooks::run_phase(
+        ws,
+        crate::hooks::Phase::Pre,
+        &task.id,
+        &run_dir,
+        &active_worker_id,
+    );
+    if !pre.ok() {
+        for f in &pre.failures {
+            lines.push(format!("pre-run hook blocked the run: {}", f.summary()));
+        }
+        let from = queue.tasks[idx].state;
+        queue.tasks[idx].state = TaskState::Failed;
+        ws.save_queue_locked(&planning_lock, &queue)?;
+        let _ = state::append_transition(
+            ws,
+            state::transition(
+                &task.id,
+                from,
+                TaskState::Failed,
+                TransitionCause::RunOutcome,
+                "pre-run hook blocked the run",
+                TransitionActor::System,
+            ),
+        );
+        cleanup_cancelled_serial_worktree(ws, serial_worktree.as_ref());
+        return Ok(RunReport {
+            run_id: run_id.clone(),
+            task_id: task.id.clone(),
+            worker_id: active_worker_id.clone(),
+            run_dir: run_dir.clone(),
+            prepared: true,
+            executed: false,
+            lines,
+            result_state: Some(TaskState::Failed),
+            session: None,
+            chained: false,
+        });
+    }
+    if serial_worktree.is_some() {
+        attest_worker_cwd(&run_dir, worker_cwd, true)?;
+    }
+
+    // mark running
+    let from = queue.tasks[idx].state;
+    queue.tasks[idx].state = TaskState::Running;
+    ws.save_queue_locked(&planning_lock, &queue)?;
+    drop(planning_lock);
+    let _ = state::append_transition(
+        ws,
+        state::transition(
+            &task.id,
+            from,
+            TaskState::Running,
+            TransitionCause::RunOutcome,
+            "worker run started",
+            TransitionActor::System,
+        ),
+    );
+
+    // Chaining (P1): when run_auto offers the previous task's live session and
+    // routing kept the same worker, continue IN that session — the worker
+    // keeps its hot context instead of re-learning the repo from zero.
+    let chained = opts
+        .chain
+        .as_ref()
+        .is_some_and(|c| c.worker_id == active_worker_id);
+    if chained {
+        lines.push(format!(
+            "chaining into {}'s session (task {} of a hot chain)",
+            active_worker_id,
+            opts.chain.as_ref().map(|c| c.length + 1).unwrap_or(1)
+        ));
+    }
+
+    // Session id for resume-on-transient: claude lets us set one up front; codex
+    // generates its own, captured from that child's JSONL stdout.
+    let mut effective_chained = chained;
+    let mut session_id: Option<String> = if chained {
+        opts.chain.as_ref().map(|c| c.session.clone())
+    } else if active_worker_id == "claude-code" {
+        Some(gen_session_uuid(&run_id))
+    } else {
+        None
+    };
+    let channel_context = channel_run_context(ws, &queue.intent_id, &task.id);
+    if let Some(attempt) = &prepared_answer_attempt {
+        if attempt.continuation == ContinuationMode::NativeResume {
+            session_id = attempt.worker_session_ref.clone();
+            effective_chained = true;
+        } else {
+            effective_chained = false;
+        }
+    }
+    // Snapshot the workspace before the worker runs so the evaluator can diff
+    // against ACTUAL on-disk changes, not the worker's self-report. Git
+    // workspaces use `git status`; non-git workspaces use a bounded folder scan.
+    // The current run dir is excluded so Yardlet's own result/handoff artifacts
+    // are not attributed as worker deliverables.
+    let run_excludes = vec![run_dir.clone()];
+    let baseline_fp = evaluator::run_fingerprints(&ws.root, &run_excludes);
+    let run_started = std::time::Instant::now();
+    let mut attempt_ordinal = 1_u32;
+    let first_attempt_id = prepared_answer_attempt
+        .as_ref()
+        .map(|attempt| attempt.attempt_id.clone())
+        .unwrap_or_else(|| attempt_id_for_ordinal(&run_id, attempt_ordinal));
+    let first_continuation = prepared_answer_attempt
+        .as_ref()
+        .map(|attempt| attempt.continuation)
+        .unwrap_or_else(|| {
+            if chained {
+                ContinuationMode::NativeResume
+            } else {
+                ContinuationMode::Fresh
+            }
+        });
+    let (mut current_attempt, mut current_capture) = begin_worker_attempt(
+        ws,
+        None,
+        &channel_context,
+        &run_dir,
+        &first_attempt_id,
+        &active_worker_id,
+        session_id.clone(),
+        first_continuation,
+        None,
+    )?;
+    let first_output_log_start = output_log_len(&run_dir.join("worker-output.log"));
+    let mut outcome = match workers::spawn_resolved_attempt_with_sink(
+        &eff_profile,
+        &active_selection,
+        &active_bin,
+        &packet_text,
+        worker_run_dir,
+        worker_cwd,
+        &env,
+        &current_capture,
+        Some(live_worker_event_sink(
+            ws,
+            &channel_context,
+            &current_attempt,
+        )),
+        timeout,
+        full_access,
+        &images,
+        session_id.as_deref(),
+        effective_chained,
+        &sandbox_writable_roots(&task, &ws.root),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            finish_worker_attempt_error(ws, &channel_context, &current_attempt, &error)?;
+            return Err(error);
+        }
+    };
+    // A stop joins the convention the TUI's Esc already uses. The marker is what
+    // the rest of this function reads: it stops the resume loop, it stops typed
+    // output-contract recovery and failover from starting a REPLACEMENT worker,
+    // and it makes the attempt's outcome `cancelled` rather than a success
+    // finalized from whatever the interrupted worker had written (issue #107).
+    //
+    // Written durably before any of those decisions, so a crash in this window
+    // leaves the same answer on disk that this process would have given.
+    if outcome.stopped || crate::signals::stop_requested() {
+        outcome.stopped = true;
+        crate::state::write_str_atomic(&run_dir.join("cancelled"), "stopped\n")?;
+    }
+    // From this point the worktree may contain completed or partially completed
+    // worker work. Any import/finalization error must retain it for recovery;
+    // the guard is only for failures before a worker actually ran.
+    serial_cleanup.disarm();
+    import_worker_run_artifacts(worker_run_dir, &run_dir)?;
+    finish_worker_attempt(
+        ws,
+        None,
+        &channel_context,
+        &run_dir,
+        &current_attempt,
+        &current_capture,
+        &outcome,
+    )?;
+    let mut output_contract_incident = retain_output_contract_classification(
+        &run_dir,
+        classify_output_contract_attempt(
+            &eff_profile,
+            &run_dir,
+            &current_attempt.attempt_id,
+            first_output_log_start,
+        ),
+        &mut lines,
+    )?;
+    if active_worker_id == "codex" && session_id.is_none() {
+        session_id = outcome.session_id.clone();
+        if session_id.is_none() {
+            lines.push(
+                "codex session id missing from child stdout; retry and hot-chain disabled"
+                    .to_string(),
+            );
+        }
+    }
+    // Resume on a transient failure (e.g. a dropped connection) instead of redoing
+    // the task from scratch — unless the user stopped it (Esc writes a marker).
+    let cancelled_marker = run_dir.join("cancelled");
+    let max_retries = eff_profile.limits.max_retries as u32;
+    let mut resumes = 0u32;
+    while session_id.is_some()
+        && !cancelled_marker.exists()
+        && output_contract_incident.is_none()
+        && is_transient_failure(&outcome, &run_dir)
+        && resumes < max_retries
+    {
+        resumes += 1;
+        lines.push(format!(
+            "transient failure; resuming session ({resumes}/{max_retries})"
+        ));
+        let cont = "The previous run was interrupted by a connection error before it finished. \
+                    Continue from where you left off, complete the task, and write the result file \
+                    exactly as specified in the original task packet.";
+        if serial_worktree.is_some() {
+            attest_worker_cwd(&run_dir, worker_cwd, true)?;
+        }
+        attempt_ordinal += 1;
+        let attempt_id = attempt_id_for_ordinal(&run_id, attempt_ordinal);
+        let begun = begin_worker_attempt(
+            ws,
+            None,
+            &channel_context,
+            &run_dir,
+            &attempt_id,
+            &active_worker_id,
+            session_id.clone(),
+            ContinuationMode::NativeResume,
+            None,
+        )?;
+        current_attempt = begun.0;
+        current_capture = begun.1;
+        let resume_output_log_start = output_log_len(&run_dir.join("worker-output.log"));
+        outcome = match workers::spawn_resolved_attempt_with_sink(
+            &eff_profile,
+            &active_selection,
+            &active_bin,
+            cont,
+            worker_run_dir,
+            worker_cwd,
+            &env,
+            &current_capture,
+            Some(live_worker_event_sink(
+                ws,
+                &channel_context,
+                &current_attempt,
+            )),
+            timeout,
+            full_access,
+            &images,
+            session_id.as_deref(),
+            true,
+            &sandbox_writable_roots(&task, &ws.root),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_worker_attempt_error(ws, &channel_context, &current_attempt, &error)?;
+                return Err(error);
+            }
+        };
+        import_worker_run_artifacts(worker_run_dir, &run_dir)?;
+        finish_worker_attempt(
+            ws,
+            None,
+            &channel_context,
+            &run_dir,
+            &current_attempt,
+            &current_capture,
+            &outcome,
+        )?;
+        output_contract_incident = retain_output_contract_classification(
+            &run_dir,
+            classify_output_contract_attempt(
+                &eff_profile,
+                &run_dir,
+                &current_attempt.attempt_id,
+                resume_output_log_start,
+            ),
+            &mut lines,
+        )?;
+    }
+
+    // User stopped it (Esc): requeue rather than evaluate as a real failure.
+    if cancelled_marker.exists() {
+        let _ = std::fs::remove_file(&cancelled_marker);
+        // Re-read the latest queue before saving: the worker may have written a
+        // follow-up task before the cancel was observed (no stale clobber).
+        save_task_state_on_latest_queue(
+            ws,
+            &mut queue,
+            &task.id,
+            TaskState::Queued,
+            TransitionCause::RunOutcome,
+            "stopped by user; task requeued",
+            TransitionActor::System,
+        )?;
+        lines.push(format!("stopped by user; {} requeued", task.id));
+        cleanup_cancelled_serial_worktree(ws, serial_worktree.as_ref());
+        return Ok(RunReport {
+            run_id: run_id.clone(),
+            task_id: task.id.clone(),
+            worker_id: active_worker_id.clone(),
+            run_dir: run_dir.clone(),
+            prepared: true,
+            executed: true,
+            lines,
+            result_state: Some(TaskState::Queued),
+            session: session_id.clone(),
+            chained: effective_chained,
+        });
+    }
+
+    // A stop cancels recovery too: this spawns a fresh attempt on a typed
+    // refusal, which is right when the worker is unwell and wrong when the
+    // operator has asked Yardlet to stop (issue #107).
+    //
+    // Keyed on the OUTCOME, not on the `cancelled` marker. `yardlet redirect`
+    // writes that same marker to stop a run, so reading it here made a redirect
+    // look like a process stop and changed the path it takes — the full suite
+    // caught it as `redirect_ignores_decoy_pid_and_signals_verified_worker`
+    // failing under load while main passed. The marker means "this run was
+    // stopped, do not resume it", which redirect also wants; it does not mean
+    // "this process is shutting down", which is what these two branches need.
+    if outcome.stopped {
+        output_contract_incident = None;
+    }
+    if let Some(mut incident) = output_contract_incident.take() {
+        // Consume the one-shot budget durably BEFORE spawning. If Yardlet dies
+        // in this crash window, orphan recovery reads this receipt and parks
+        // NeedsUser instead of starting another worker.
+        incident.recovery_consumed = true;
+        persist_output_contract_incident(&run_dir, &incident)?;
+        let (cause_label, recovery_instruction) = match incident.cause {
+            OutputContractCause::ProviderResponseRefused => (
+                "provider_response_refused",
+                packet::provider_refusal_recovery_instruction(),
+            ),
+            OutputContractCause::WorkerDeferredToBackgroundTask => (
+                "worker_deferred_to_background_task",
+                packet::background_deferral_recovery_instruction(),
+            ),
+        };
+        lines.push(format!(
+            "typed output-contract cause: {cause_label}; retrying {active_worker_id} once"
+        ));
+        let recovery_packet = packet::compile(&PacketInputs {
+            worker_id: &active_worker_id,
+            task: &task,
+            intent: intent.as_ref(),
+            repo: &summary,
+            run_dir_rel: &run_dir_rel,
+            conversation: &conversation,
+            continuation: Some(recovery_instruction),
+            chained_from: None,
+            language: &language,
+            images: &images,
+            role_notes: &role_notes,
+            harness: &harness,
+            approved,
+            pre_push_checks: &config.git_finish.pre_push_checks,
+        });
+        write_str(&workers::packet_path(&run_dir), &recovery_packet)?;
+        if worker_run_dir != run_dir.as_path() {
+            write_str(&workers::packet_path(worker_run_dir), &recovery_packet)?;
+        }
+        if serial_worktree.is_some() {
+            attest_worker_cwd(&run_dir, worker_cwd, true)?;
+        }
+        attempt_ordinal += 1;
+        let attempt_id = attempt_id_for_ordinal(&run_id, attempt_ordinal);
+        session_id = if active_worker_id == "claude-code" {
+            Some(gen_session_uuid(&format!(
+                "{run_id}-output-contract-recovery"
+            )))
+        } else {
+            None
+        };
+        effective_chained = false;
+        let begun = begin_worker_attempt(
+            ws,
+            None,
+            &channel_context,
+            &run_dir,
+            &attempt_id,
+            &active_worker_id,
+            session_id.clone(),
+            ContinuationMode::Retry,
+            None,
+        )?;
+        current_attempt = begun.0;
+        current_capture = begun.1;
+        outcome = match workers::spawn_resolved_attempt_with_sink(
+            &eff_profile,
+            &active_selection,
+            &active_bin,
+            &recovery_packet,
+            worker_run_dir,
+            worker_cwd,
+            &env,
+            &current_capture,
+            Some(live_worker_event_sink(
+                ws,
+                &channel_context,
+                &current_attempt,
+            )),
+            timeout,
+            full_access,
+            &images,
+            session_id.as_deref(),
+            false,
+            &sandbox_writable_roots(&task, &ws.root),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_worker_attempt_error(ws, &channel_context, &current_attempt, &error)?;
+                return Err(error);
+            }
+        };
+        import_worker_run_artifacts(worker_run_dir, &run_dir)?;
+        finish_worker_attempt(
+            ws,
+            None,
+            &channel_context,
+            &run_dir,
+            &current_attempt,
+            &current_capture,
+            &outcome,
+        )?;
+        if !run_dir.join("result.json").is_file() {
+            incident.terminal_attempt_id = Some(current_attempt.attempt_id.clone());
+        }
+        persist_output_contract_incident(&run_dir, &incident)?;
+        output_contract_incident = Some(incident);
+    }
+
+    let mut failover_note: Option<String> = None;
+    // A stopped run must not fail over. "No result.json" is normally evidence the
+    // worker is unwell and another should try, but here the missing result is
+    // what the operator asked for, and spawning a replacement is the one thing a
+    // stop is meant to prevent (issue #107).
+    if !outcome.stopped
+        && !run_dir.join("result.json").exists()
+        && output_contract_incident.is_none()
+    {
+        match routing::resolve_failover_worker_for_task(
+            &workers,
+            &billing,
+            &ws.requested_access(),
+            &active_worker_id,
+            &failover_task,
+        ) {
+            Ok(alt) => {
+                let from = active_worker_id.clone();
+                let to = alt.worker_id.clone();
+                let note = format!(
+                    "worker failover: {from} -> {to}; {from} exited without result.json \
+                     after {resumes}/{max_retries} resume attempt(s)"
+                );
+                lines.push(note.clone());
+                record_failover(&run_dir, &from, &to, &note);
+
+                active_worker_id = to;
+                active_selection = alt.selection();
+                active_reason = format!("failover from {from} ({})", alt.reason);
+                active_bin = alt.bin;
+                let profile = find_worker(&workers.workers, &active_worker_id)?;
+                eff_profile = workers::effective_profile(
+                    profile,
+                    &failover_task.model,
+                    &failover_task.effort,
+                );
+                update_run_selection(&run_dir, &active_selection)?;
+                if worker_run_dir != run_dir.as_path() {
+                    update_run_selection(worker_run_dir, &active_selection)?;
+                }
+                env = guard::sanitized_worker_env_for(&billing, &eff_profile.invocation.pass_env)
+                    .map_err(|e| anyhow!(e))?;
+                timeout = wall_clock_timeout(profile.limits.max_wall_minutes);
+                effective_chained = false;
+                session_id = if active_worker_id == "claude-code" {
+                    Some(gen_session_uuid(&format!("{run_id}-{active_worker_id}")))
+                } else {
+                    None
+                };
+                let failover_packet = packet::compile(&PacketInputs {
+                    worker_id: &active_worker_id,
+                    task: &task,
+                    intent: intent.as_ref(),
+                    repo: &summary,
+                    run_dir_rel: &run_dir_rel,
+                    conversation: &conversation,
+                    continuation: Some(
+                        "Output-contract feedback: the previous worker exited without writing \
+                         result.json. Complete the task, write every required artifact, and make \
+                         sure result.json matches the packet schema exactly.",
+                    ),
+                    chained_from: None,
+                    language: &language,
+                    images: &images,
+                    role_notes: &role_notes,
+                    harness: &harness,
+                    approved,
+                    pre_push_checks: &config.git_finish.pre_push_checks,
+                });
+                write_str(&workers::packet_path(&run_dir), &failover_packet)?;
+                if serial_worktree.is_some() {
+                    attest_worker_cwd(&run_dir, worker_cwd, true)?;
+                }
+                attempt_ordinal += 1;
+                let attempt_id = attempt_id_for_ordinal(&run_id, attempt_ordinal);
+                let begun = begin_worker_attempt(
+                    ws,
+                    None,
+                    &channel_context,
+                    &run_dir,
+                    &attempt_id,
+                    &active_worker_id,
+                    session_id.clone(),
+                    ContinuationMode::Fallback,
+                    None,
+                )?;
+                current_attempt = begun.0;
+                current_capture = begun.1;
+                outcome = match workers::spawn_resolved_attempt_with_sink(
+                    &eff_profile,
+                    &active_selection,
+                    &active_bin,
+                    &failover_packet,
+                    worker_run_dir,
+                    worker_cwd,
+                    &env,
+                    &current_capture,
+                    Some(live_worker_event_sink(
+                        ws,
+                        &channel_context,
+                        &current_attempt,
+                    )),
+                    timeout,
+                    full_access,
+                    &images,
+                    session_id.as_deref(),
+                    false,
+                    &sandbox_writable_roots(&task, &ws.root),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        finish_worker_attempt_error(
+                            ws,
+                            &channel_context,
+                            &current_attempt,
+                            &error,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                import_worker_run_artifacts(worker_run_dir, &run_dir)?;
+                finish_worker_attempt(
+                    ws,
+                    None,
+                    &channel_context,
+                    &run_dir,
+                    &current_attempt,
+                    &current_capture,
+                    &outcome,
+                )?;
+                if active_worker_id == "codex" && session_id.is_none() {
+                    session_id = outcome.session_id.clone();
+                    if session_id.is_none() {
+                        lines.push(
+                            "codex session id missing from child stdout; retry and hot-chain disabled"
+                                .to_string(),
+                        );
+                    }
+                }
+                failover_note = Some(note);
+            }
+            Err(e) => {
+                let note = format!(
+                    "worker failover unavailable after {} exited without result.json: {e}",
+                    active_worker_id
+                );
+                lines.push(note.clone());
+                failover_note = Some(note);
+            }
+        }
+    }
+
+    if cancelled_marker.exists() {
+        let _ = std::fs::remove_file(&cancelled_marker);
+        save_task_state_on_latest_queue(
+            ws,
+            &mut queue,
+            &task.id,
+            TaskState::Queued,
+            TransitionCause::RunOutcome,
+            "stopped by user after failover; task requeued",
+            TransitionActor::System,
+        )?;
+        lines.push(format!("stopped by user; {} requeued", task.id));
+        cleanup_cancelled_serial_worktree(ws, serial_worktree.as_ref());
+        return Ok(RunReport {
+            run_id: run_id.clone(),
+            task_id: task.id.clone(),
+            worker_id: active_worker_id.clone(),
+            run_dir: run_dir.clone(),
+            prepared: true,
+            executed: true,
+            lines,
+            result_state: Some(TaskState::Queued),
+            session: session_id.clone(),
+            chained: effective_chained,
+        });
+    }
+    let wall_seconds = run_started.elapsed().as_secs();
+    lines.push(format!(
+        "worker outcome: {} (exit_ok={}, timed_out={})",
+        outcome.note, outcome.exit_ok, outcome.timed_out
+    ));
+
+    // ---- evaluate + compact ---------------------------------------------
+    // Worker-attributed changes: diff the file fingerprints before and after
+    // the run, so a path the worker re-modified while it was already dirty is
+    // still attributed (plain path-set subtraction would miss it). `None` means
+    // evidence capture itself failed, in which case the evaluator fails closed
+    // rather than trusting the worker's self-report; an overlay-provenance
+    // failure additionally leaves its path-specific reason in the run lines.
+    let mut overlay_failure = None;
+    let serial_evidence = serial_worktree.as_ref().and_then(|owned| {
+        serial_worktree_evidence(ws, &owned.path, &run_dir, &mut overlay_failure)
+    });
+    if let Some(reason) = overlay_failure.as_ref() {
+        lines.push(format!(
+            "change evidence unavailable after worker run: {reason}"
+        ));
+    }
+    let evidence: Option<Vec<String>> = if serial_worktree.is_some() {
+        serial_evidence
+            .as_ref()
+            .map(|evidence| evidence.paths.clone())
+    } else {
+        match (
+            &baseline_fp,
+            evaluator::run_fingerprints(&ws.root, &run_excludes),
+        ) {
+            (Ok(base), Ok(after)) => Some(evaluator::worker_touched(base, &after)),
+            (Err(e), _) => {
+                lines.push(format!(
+                    "change evidence unavailable before worker run: {e}"
+                ));
+                None
+            }
+            (_, Err(e)) => {
+                lines.push(format!("change evidence unavailable after worker run: {e}"));
+                None
+            }
+        }
+    };
+    let user_override = opts.worker_override.as_ref().map(|o| {
+        let from = if task.preferred_worker.is_empty() {
+            "(default)".to_string()
+        } else {
+            task.preferred_worker.clone()
+        };
+        format!("{from}->{o}")
+    });
+    let intent_summary = intent.as_ref().map(|i| i.summary.as_str()).unwrap_or("");
+    let report = finalize_run(FinalizeInput {
+        ws,
+        run_dir: &run_dir,
+        run_id: &run_id,
+        task: &task,
+        evidence,
+        worker_id: &active_worker_id,
+        reason: &active_reason,
+        wall_seconds,
+        user_override,
+        intent_summary,
+        billing: &billing,
+        queue: &mut queue,
+        flags: FinalizeFlags::serial(),
+        merge: serial_worktree.as_ref().map(|owned| MergeBack {
+            wt_path: &owned.path,
+            branch: &owned.branch,
+            baseline_oid: &owned.baseline_oid,
+            expected_tip_oid: serial_evidence
+                .as_ref()
+                .map(|evidence| evidence.merge_target_oid.as_str()),
+            core_input_overlays: serial_evidence
+                .as_ref()
+                .map(|evidence| evidence.core_input_overlays.as_slice())
+                .unwrap_or(&[]),
+            dependency_input_overlays: serial_evidence
+                .as_ref()
+                .map(|evidence| evidence.dependency_input_overlays.as_slice())
+                .unwrap_or(&[]),
+            provenance: IntegrationProvenance::SerialCoreStaged,
+            auto_commit: config.auto_commit,
+        }),
+    })?;
+    let next_state = report.next_state;
+    lines.extend(report.lines);
+    if let Some(note) = &failover_note {
+        append_failover_note(&run_dir, note)?;
+    }
+
+    serial_cleanup.disarm();
+    Ok(RunReport {
+        run_id,
+        task_id: task.id,
+        worker_id: active_worker_id,
+        run_dir,
+        prepared: true,
+        executed: true,
+        lines,
+        result_state: Some(next_state),
+        session: session_id,
+        chained: effective_chained,
+    })
+}
+
+/// Did the worker touch any path OUTSIDE Yardlet's own `.agents/` state? Drives
+/// the serial auto-commit guidance: only worth telling an opted-in user their
+/// changes were left to commit when the run actually produced deliverable
+/// (non-`.agents/`) edits. `None` evidence (no git signal) counts as no change.
+/// A leading `./` is normalized so `./.agents/x` is still recognized as state.
+/// The worker's wall-clock budget.
+///
+/// A debug-build process fixture may shorten it: the shortest expressible
+/// `max_wall_minutes` is a minute, which is too slow to regression-test the
+/// timeout path in CI. Same gate as the startup recovery delay, so a release
+/// binary cannot be talked into a shorter budget.
+fn wall_clock_timeout(max_wall_minutes: u32) -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var("YARDLET_PROCESS_FIXTURE").as_deref() == Ok("1") {
+            if let Some(ms) = std::env::var("YARDLET_FIXTURE_WALL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+            {
+                return Duration::from_millis(ms.min(60_000));
+            }
+        }
+    }
+    Duration::from_secs(max_wall_minutes as u64 * 60)
+}
+
+fn worker_changed_integratable_path(evidence: Option<&[String]>) -> bool {
+    evidence
+        .map(|e| e.iter().any(|p| evaluator::is_integratable_path(p)))
+        .unwrap_or(false)
+}
+
+/// Where a worker-declared absolute path can be resolved from.
+///
+/// The worktree is FIRST and is not optional: an isolated serial run's cwd IS
+/// the worktree, so a path the worker forms from its own cwd resolves against
+/// the owning root as `.agents/worktrees/<run>/…`, which the harness allowlist
+/// rejects — silently dropping a real deliverable. Making the field mandatory
+/// keeps that mistake unrepresentable.
+struct DeclaredPathRoots<'a> {
+    worktree: &'a std::path::Path,
+    workspace: &'a std::path::Path,
+}
+
+/// What a worker-declared path is, once Yardlet tries to place it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredPath {
+    /// Placed in the repository. Judged by the normal integration rules.
+    Repository(String),
+    /// Outside every root Yardlet owns — an absolute path elsewhere, or a
+    /// relative one that climbs out. Not a repository deliverable, so it
+    /// cannot contradict an honest no-change outcome, but it is still
+    /// reported: silently forgetting a declared output is the failure this
+    /// whole guard exists to prevent.
+    Unplaceable(String),
+    /// Empty, or a root directory itself. Nothing to attribute either way.
+    Nothing,
+}
+
+/// Classify one worker-declared path.
+///
+/// `changes` is free-form worker text and the packet itself hands out ABSOLUTE
+/// paths (an isolated serial run receives its run directory as one), so a
+/// declared path arrives in either form. That matters because
+/// `is_integratable_path` tests the `.agents/` prefix lexically: an absolute
+/// `/ws/.agents/runs/<id>/report.md` sails past it and would be read as a lost
+/// repository deliverable (issue #55).
+///
+/// Each root is tried in canonical and literal form, because macOS resolves the
+/// temp roots these run under through `/private`. A result that still climbs out
+/// of the repository is `Unplaceable`, so `/ws/../elsewhere/x` and
+/// `/elsewhere/x` cannot reach opposite verdicts.
+fn classify_declared_path(raw: &str, roots: &DeclaredPathRoots<'_>) -> DeclaredPath {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return DeclaredPath::Nothing;
+    }
+    let path = std::path::Path::new(trimmed);
+    let relative = if path.is_absolute() {
+        // Resolve `.`/`..` BEFORE stripping. A `..` that crosses a root
+        // boundary — `<worktree>/../../../docs/x.md` names a real file in the
+        // owning root — otherwise defeats every `strip_prefix` and the path
+        // looks unplaceable.
+        let path = &lexically_normalized(path);
+        let mut candidates = Vec::new();
+        for root in [roots.worktree, roots.workspace] {
+            if let Ok(canonical) = root.canonicalize() {
+                candidates.push(canonical);
+            }
+            candidates.push(root.to_path_buf());
+        }
+        match candidates
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok())
+            .and_then(|relative| relative.to_str())
+        {
+            // A root itself is a directory, not a deliverable.
+            Some("") => return DeclaredPath::Nothing,
+            Some(relative) => relative.to_string(),
+            // Report the normalized spelling so two spellings of the same
+            // outside path dedupe and cancel against each other.
+            None => return DeclaredPath::Unplaceable(path.display().to_string()),
+        }
+    } else {
+        trimmed.to_string()
+    };
+    let relative = relative.trim_start_matches("./").trim_end_matches('/');
+    match resolve_repository_relative(relative) {
+        Resolved::Inside(path) => DeclaredPath::Repository(path),
+        Resolved::Root => DeclaredPath::Nothing,
+        Resolved::Escapes => DeclaredPath::Unplaceable(trimmed.to_string()),
+    }
+}
+
+/// Resolve `.` and `..` in an absolute path lexically, without touching the
+/// filesystem. `..` at the root stays at the root, as the kernel does.
+fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Where a repository-relative path lands once `.` and `..` are resolved
+/// LEXICALLY (no filesystem access — the path may name something that no longer
+/// exists, or never did).
+enum Resolved {
+    Inside(String),
+    /// Resolves to the repository root itself: a directory, not a deliverable.
+    Root,
+    /// Climbs out of the repository however it was spelled.
+    Escapes,
+}
+
+/// Resolve `.` and `..` inside a repository-relative path.
+///
+/// Rejecting any path that merely CONTAINS `..` is too blunt: `src/../tests/x.rs`
+/// names a file that is squarely inside the repository, and treating it as
+/// unplaceable stops it gating a no-change outcome — silently re-opening
+/// issue #55 for that spelling, while telling the operator the path is
+/// "outside this workspace".
+fn resolve_repository_relative(relative: &str) -> Resolved {
+    use std::path::Component;
+
+    let mut parts: Vec<&str> = Vec::new();
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => parts.push(part),
+                None => return Resolved::Escapes,
+            },
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Resolved::Escapes;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Resolved::Escapes,
+        }
+    }
+    if parts.is_empty() {
+        return Resolved::Root;
+    }
+    Resolved::Inside(parts.join("/"))
+}
+
+/// Declared outputs Yardlet could not place in the repository.
+///
+/// These never contradict a no-change outcome: a path outside every root
+/// Yardlet owns — absolute, or relative and climbing out — is not a repository
+/// deliverable, and flipping a correct run to Partial over a worker's scratch
+/// file would recreate the very false positive this guard was corrected for.
+/// They are surfaced instead.
+fn unplaceable_declared_outputs(
+    result: Option<&RunResult>,
+    roots: &DeclaredPathRoots<'_>,
+) -> Vec<String> {
+    let Some(result) = result else {
+        return Vec::new();
+    };
+    let unplaceable_only = |path: &String| match classify_declared_path(path, roots) {
+        DeclaredPath::Unplaceable(path) => Some(path),
+        _ => None,
+    };
+    // A path the worker also declared deleted was not left behind, so reporting
+    // it would be noise in exactly the scratch-file case this branch exists for.
+    let deleted = result
+        .changes
+        .files_deleted
+        .iter()
+        .filter_map(unplaceable_only)
+        .collect::<HashSet<_>>();
+    let mut unplaceable = result
+        .changes
+        .files_created
+        .iter()
+        .chain(&result.changes.files_modified)
+        .filter_map(unplaceable_only)
+        .filter(|path| !deleted.contains(path))
+        .collect::<Vec<_>>();
+    unplaceable.sort();
+    unplaceable.dedup();
+    unplaceable
+}
+
+/// Repository outputs the worker DECLARED in result.json, normalized and
+/// reduced to the paths a no-change integration would silently drop.
+///
+/// Receipted core and dependency input overlays are core-delivered validation
+/// inputs, not worker outputs, so naming one is not a missing deliverable, and
+/// neither is a path the worker also declared deleted. The run's OWN artifacts
+/// fall out on their own: normalized they live under `.agents/runs/`, which the
+/// integration allowlist already rejects — which is exactly why normalizing
+/// against the right root matters, since every non-implementation task is
+/// REQUIRED to write `report.md` there and forbidden to touch code.
+///
+/// A path Yardlet cannot place is NOT here — see [`unplaceable_declared_outputs`],
+/// which reports it without letting it flip a correct run.
+fn declared_integratable_outputs(
+    result: Option<&RunResult>,
+    roots: &DeclaredPathRoots<'_>,
+    core_input_overlays: &[state::SerialInputOverlay],
+    dependency_input_overlays: &[state::DependencyInputOverlay],
+) -> Vec<String> {
+    let Some(result) = result else {
+        return Vec::new();
+    };
+    let repository = |path: &String| match classify_declared_path(path, roots) {
+        DeclaredPath::Repository(path) => Some(path),
+        _ => None,
+    };
+    let deleted = result
+        .changes
+        .files_deleted
+        .iter()
+        .filter_map(repository)
+        .collect::<HashSet<_>>();
+    let mut declared = result
+        .changes
+        .files_created
+        .iter()
+        .chain(&result.changes.files_modified)
+        .filter_map(repository)
+        .filter(|path| evaluator::is_integratable_path(path))
+        .filter(|path| !deleted.contains(path))
+        .filter(|path| {
+            !core_input_overlays
+                .iter()
+                .any(|overlay| overlay.path == *path)
+        })
+        .filter(|path| {
+            !dependency_input_overlays
+                .iter()
+                .any(|overlay| overlay.path == *path)
+        })
+        .collect::<Vec<_>>();
+    declared.sort();
+    declared.dedup();
+    declared
+}
+
+/// Why a finished run must NOT be recorded as "no changes to integrate"
+/// (issue #55).
+///
+/// Integration and evaluation have to agree on ONE change-evidence source. A
+/// no-change outcome means the run-owned worktree contributed no commit and no
+/// staged content, so either of these makes `not_needed/no_changes` a lie:
+///
+/// - the run's own change evidence still lists an integratable worker change,
+///   which staging would have committed; or
+/// - result.json declares integratable outputs, which the worktree therefore
+///   never held — the deliverable was written somewhere Yardlet does not
+///   integrate (typically the owning root) and would be reported Done while
+///   sitting uncommitted.
+///
+/// Returning a typed reason lets finalization fail closed to Partial and keep
+/// the worktree instead of shipping a green report over lost work.
+///
+/// Only the `Integration::NoChanges` caller can actually see the first case:
+/// the auto_commit-off caller reaches this only when its own evidence check
+/// already found nothing integratable. Both call it anyway so neither has to
+/// re-derive the rule, but the evidence arm is dead at that second site.
+fn no_change_contradiction(
+    result: Option<&RunResult>,
+    evidence: Option<&[String]>,
+    roots: &DeclaredPathRoots<'_>,
+    core_input_overlays: &[state::SerialInputOverlay],
+    dependency_input_overlays: &[state::DependencyInputOverlay],
+) -> Option<(&'static str, Vec<String>)> {
+    if worker_changed_integratable_path(evidence) {
+        let mut paths = evidence
+            .unwrap_or_default()
+            .iter()
+            .filter(|path| evaluator::is_integratable_path(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        return Some(("no_change_contradicts_change_evidence", paths));
+    }
+    let declared = declared_integratable_outputs(
+        result,
+        roots,
+        core_input_overlays,
+        dependency_input_overlays,
+    );
+    if !declared.is_empty() {
+        return Some(("no_change_contradicts_declared_outputs", declared));
+    }
+    None
+}
+
+/// A task's writable scope overlapping evidence that is pinned by digest.
+///
+/// Both overlay kinds exist to make an input reproducible: the core seed for a
+/// serial run, and an upstream task's output for a downstream one. A scope that
+/// covers a pinned path hands the task permission to break the guarantee it was
+/// given, and the breakage surfaces late — the task passes, integrates, and a
+/// later review finds the digest no longer reproduces (issue #15).
+///
+/// Reported as a refusal rather than a silent narrowing: the plan said this task
+/// may edit that file and something upstream said it may not change, and only a
+/// human can decide which was meant. The message names both sides so the fix —
+/// reroute the change to an evidence-disjoint file, or schedule a successor that
+/// re-pins it — is obvious from the error.
+fn scope_conflicts_with_pinned_evidence(
+    task: &crate::schemas::Task,
+    core: &[state::SerialInputOverlay],
+    dependencies: &[state::DependencyInputOverlay],
+) -> Option<String> {
+    let pinned: Vec<(&str, String)> = core
+        .iter()
+        .map(|overlay| (overlay.path.as_str(), "the run's core seed".to_string()))
+        .chain(dependencies.iter().map(|overlay| {
+            (
+                overlay.path.as_str(),
+                format!("dependency {}", overlay.dependency_task_id),
+            )
+        }))
+        .collect();
+    for (path, source) in pinned {
+        if task
+            .allowed_scope
+            .iter()
+            .any(|entry| crate::parallel::scope_covers(entry, path))
+        {
+            return Some(format!(
+                "task {} is allowed to write `{path}`, which {source} pins by content digest. \
+                 Editing it would invalidate evidence this run was given as reproducible, and \
+                 that only surfaces after the task has passed and integrated. Route the change \
+                 to a file the evidence does not bind, or schedule a successor that re-pins it.",
+                task.id
+            ));
+        }
+    }
+    None
+}
+
+/// A scope path reduced to comparable form: `.` and `..` resolved lexically,
+/// empty segments dropped, case folded.
+///
+/// Lexical rather than `canonicalize`, because a declared scope may name a
+/// directory that does not exist yet and canonicalization fails on those. Case
+/// is folded because the filesystems this runs on are routinely
+/// case-insensitive, so two spellings reach the same inode.
+fn normalize_scope_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/").to_lowercase()
+}
+
+/// Workspace directories the task's confirmed contract says it may write, which
+/// the sandbox would otherwise refuse.
+///
+/// A worker runs under `workspace-write`, and that sandbox treats the hidden
+/// `.agents/` tree as read-only. So a task whose `allowed_scope` grants it a
+/// skill package could not write there: the worker reported `needs_user` and
+/// asked the operator to authorize what the confirmed contract had already
+/// granted (issue #19).
+///
+/// Only `.agents/` entries are lifted. Everything else in a scope is ordinary
+/// workspace content the sandbox already allows, and widening beyond what the
+/// sandbox actually blocks would hand out permission nobody needed.
+///
+/// A glob is truncated to the directory that contains it, because `--add-dir`
+/// takes roots rather than patterns. That is wider than the declared scope for
+/// something like `.agents/skills/x/**` excluding `archive/v1/**` — the sandbox
+/// cannot express that split. The narrower contract is still enforced, by the
+/// evaluator's forbidden-path check after the fact, which is the same
+/// belt-and-braces shape the danger-list already uses: the sandbox bounds what
+/// is reachable, the evaluator judges what was touched.
+pub(crate) fn sandbox_writable_roots(
+    task: &crate::schemas::Task,
+    ws_root: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = task
+        .allowed_scope
+        .iter()
+        .filter_map(|entry| {
+            let entry = entry.trim().trim_start_matches("./");
+            if !entry.starts_with(".agents/") {
+                return None;
+            }
+            let directory = entry
+                .split('*')
+                .next()
+                .unwrap_or(entry)
+                .trim_end_matches('/');
+            // A file entry contributes the directory holding it.
+            // Core-only subtrees are never liftable, whatever a scope says. The
+            // stop record decides whether an interrupted run may run again, so a
+            // worker that could write it could requeue its own passing task — an
+            // independent review did exactly that through a worker-proposed
+            // follow-up's allowed_scope (issues #19 and #110).
+            const CORE_ONLY: [&str; 5] = [
+                ".agents/stopped-runs",
+                ".agents/runtime-task-receipts",
+                ".agents/checkpoints",
+                ".agents/telemetry",
+                // Run directories decide each other's fate: a worker handed the
+                // whole tree wrote `cancelled` into a SIBLING run and had it
+                // stopped and requeued. The run's OWN directory is still granted
+                // explicitly at spawn; what is refused is claiming the tree
+                // through scope.
+                ".agents/runs",
+            ];
+            // Compared on normalized components, not the raw string. `..` and a
+            // differing case both name the same directory on the filesystems
+            // this runs on, and a prefix test on the literal text let both past.
+            let normalized = normalize_scope_path(directory);
+            if CORE_ONLY.iter().any(|core| {
+                let core = normalize_scope_path(core);
+                normalized == core || normalized.starts_with(&format!("{core}/"))
+            }) {
+                return None;
+            }
+            let directory = if directory.ends_with(".md") || directory.ends_with(".yaml") {
+                std::path::Path::new(directory).parent()?.to_str()?
+            } else {
+                directory
+            };
+            (!directory.is_empty() && directory != ".agents").then(|| ws_root.join(directory))
+        })
+        .filter(|path| path.exists())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Declared outputs that exist on disk but did NOT reach the integration commit.
+///
+/// #55 closed the all-or-nothing case: integration finding nothing to commit
+/// while the run still claims output. This is the partial one (#91) — some of
+/// the declared outputs were integrated and the rest were left behind, which
+/// `Integration::Merged` accepted because change evidence was non-empty.
+///
+/// The distinction that makes this safe to gate on is between three cases, not
+/// two:
+///
+/// - declared, on disk, in the commit — the normal case;
+/// - declared, on disk, NOT in the commit — the defect. The work exists and was
+///   not delivered, so Done would be false;
+/// - declared, NOT on disk at all — the worker named a path it never wrote.
+///   That is a mis-declaration, a different fault, and not this guard's to
+///   punish. Excluding it is why gating here does not turn a worker's typo into
+///   a failed run.
+fn unintegrated_declared_outputs(
+    ws_root: &std::path::Path,
+    committed: &[String],
+    result: Option<&RunResult>,
+    roots: &DeclaredPathRoots<'_>,
+    core_input_overlays: &[state::SerialInputOverlay],
+    dependency_input_overlays: &[state::DependencyInputOverlay],
+) -> Vec<String> {
+    let declared = declared_integratable_outputs(
+        result,
+        roots,
+        core_input_overlays,
+        dependency_input_overlays,
+    );
+    let committed: std::collections::BTreeSet<&str> =
+        committed.iter().map(String::as_str).collect();
+    let mut missing: Vec<String> = declared
+        .into_iter()
+        .filter(|path| {
+            // In the commit itself, or under a directory the commit carries.
+            let prefix = format!("{path}/");
+            !committed.contains(path.as_str()) && !committed.iter().any(|c| c.starts_with(&prefix))
+        })
+        // On disk: a path that was never written is a mis-declaration, not an
+        // undelivered deliverable.
+        .filter(|path| ws_root.join(path).exists())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// The repository paths an integration commit actually carries.
+fn committed_paths_for(ws_root: &std::path::Path, oid: &str) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(ws_root)
+        .args(["show", "--name-only", "--format=", "-m", oid])
+        .env("LC_ALL", "C")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Operator-facing explanation for a partially integrated run.
+fn partial_integration_note(paths: &[String], wt: &std::path::Path) -> String {
+    format!(
+        "\n## Partial integration refused\n\nThe integration commit carries some of this run's \
+         declared outputs but not all of them. These exist in the workspace and are NOT in the \
+         commit:\n\n{}\n\nRecording Done here would report the task finished while part of its \
+         deliverable stayed out of Git — the same harm as issue #55, narrowed to the case where \
+         SOME of the work landed. The run is Partial and the worktree is kept at `{}`. Check \
+         whether the output was written outside the run-owned worktree, then integrate it and \
+         `yardlet resolve` the task.\n",
+        paths
+            .iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        wt.display()
+    )
+}
+
+/// Operator-facing explanation for a refused no-change integration.
+fn no_change_contradiction_note(reason: &str, paths: &[String], wt: &std::path::Path) -> String {
+    let source = if reason == "no_change_contradicts_change_evidence" {
+        "this run's change evidence"
+    } else {
+        "the worker's result.json"
+    };
+    format!(
+        "\n## No-change integration refused\n\nIntegration found nothing to commit for this run, \
+         but {source} lists repository output(s):\n\n{}\n\nRecording \"no changes\" here would \
+         report the task Done while its deliverable stayed out of Git, so the run is Partial and \
+         the worktree is kept at `{}`. Check whether the output was written outside the run-owned \
+         worktree; if so, move it in and re-run, or commit it deliberately.\n",
+        paths
+            .iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        wt.display()
+    )
+}
+
+/// Surface-neutral auto-drain guidance.
+///
+/// `run_auto` streams these lines to whatever surface drives it — the TUI live
+/// view or the CLI — so they must NOT embed `yardlet ...` command literals. Each
+/// surface names its own affordance: the TUI shows key hints (`a` to answer, `p`
+/// to approve) via `ui/i18n.rs`, and cli.rs command handlers print the imperative
+/// `yardlet ...` form. A stop message that hardcoded one surface's command would
+/// read wrong on the other, so the engine stays neutral and just says WHAT to do.
+pub(crate) mod gate_msg {
+    use crate::ui::i18n::{self, Lang, RunProgress};
+
+    /// A task paused for the user's answer.
+    pub fn needs_user(lang: Lang, id: &str) -> String {
+        i18n::run_progress(lang, RunProgress::NeedsUser(id))
+    }
+    /// A task is blocked and needs a human to resolve it.
+    pub fn blocked(lang: Lang, id: &str) -> String {
+        i18n::run_progress(lang, RunProgress::Blocked(id))
+    }
+    /// The queue drained with some tasks set aside (deferred).
+    pub fn drained_with_deferred(lang: Lang, ids: &[&str]) -> String {
+        i18n::run_progress(lang, RunProgress::DrainedWithDeferred(ids))
+    }
+    /// The queue fully drained, nothing left.
+    pub fn drained_complete(lang: Lang) -> String {
+        i18n::run_progress(lang, RunProgress::DrainedComplete)
+    }
+}
+
+/// Autonomous mode: drain the queue, stopping only at genuine human gates.
+///
+/// Runs eligible queued tasks one after another — or, when parallelism is
+/// enabled (config `max_parallel` or the `--parallel` flag) and several
+/// independent tasks are ready in a clean git workspace, in concurrent
+/// worktree batches. Done (or partial->re-queued) advances; Blocked /
+/// NeedsUser / Failed stop the loop and hand back to the user (those need a
+/// human). The persisted feedback ledger prevents looping on a task that keeps
+/// coming back partial, including across restarts. `bypass` drops the worker sandbox for the whole run
+/// (workers still self-gate dangerous actions per the packet).
+#[allow(clippy::too_many_arguments)]
+/// A held decision is local to its dependency branch. Auto-drain may keep
+/// selecting other ready work; only a hard block or an actually running task
+/// ends the current drain loop.
+fn continues_auto_drain(state: TaskState) -> bool {
+    !matches!(state, TaskState::Blocked | TaskState::Running)
+}
+
+pub fn run_auto<F: FnMut(&str)>(
+    ws: &Workspace,
+    bypass: bool,
+    pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    parallel: Option<usize>,
+    accept_ambiguity: bool,
+    mut on_event: F,
+) -> Result<Vec<String>> {
+    // Installed at the entry point, not at each caller: `yardlet goal` reaches
+    // `run_auto` without going through `cmd_run`, and an independent review found
+    // exactly that path still orphaning its worker. Every route that can start a
+    // worker passes through here or `run_next` (issue #107).
+    crate::signals::install_stop_handler();
+    use std::collections::HashMap;
+    let max_parallel = parallel
+        .or_else(|| ws.load_config().ok().map(|c| c.max_parallel))
+        .unwrap_or(1)
+        .max(1);
+    let event_lang = run_event_lang(ws);
+    let mut parallel_warned = false;
+    let mut out = Vec::new();
+    let mut emit = |s: String| {
+        on_event(&s);
+        out.push(s);
+    };
+    let mut waits: HashMap<String, u32> = HashMap::new();
+    // P1: the previous Done task's live session, offered to a dependent
+    // successor on the same worker. Cut on anything but a clean Done.
+    let mut chain: Option<ChainHandle> = None;
+    // Recover orphans (interrupted runs left "running") and any unconsumed
+    // planning result from an interrupted session before draining.
+    crate::planning::validate_active_activation(ws)?;
+    if let Some(m) = crate::planner::recover_unconsumed_plan(ws)? {
+        emit(m);
+    }
+    for m in recover_orphans(ws) {
+        emit(m);
+    }
+
+    // Ambiguity gate: don't drain a plan that says it is still guessing.
+    if !accept_ambiguity {
+        let gate_on = ws.load_config().map(|c| c.ambiguity_gate).unwrap_or(true);
+        if let Ok(Some(i)) = ws.load_intent() {
+            if crate::planner::intent_gated(&i, gate_on) {
+                emit(i18n::run_progress(
+                    event_lang,
+                    i18n::RunProgress::Ambiguity {
+                        turn: i.interview_turns,
+                        cap: crate::planner::INTERVIEW_CAP,
+                    },
+                ));
+                for q in i.open_questions.iter().take(5) {
+                    emit(format!("  ? {q}"));
+                }
+                return Ok(out);
+            }
+        }
+    }
+
+    loop {
+        // An interrupt ends the drain, it does not just end the current task.
+        // Without this the loop reads the stopped task as Failed, calls that
+        // transient, and starts the next worker — after the operator asked
+        // Yardlet to stop (issue #107).
+        if crate::signals::stop_requested() {
+            emit("stopped at your request; the queue is unchanged".to_string());
+            break;
+        }
+        // Graceful pause: stop between tasks (the current task, if any, has
+        // already finished here). Resume by running auto again.
+        if pause
+            .as_ref()
+            .map(|p| p.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            emit(i18n::run_progress(event_lang, i18n::RunProgress::Paused));
+            break;
+        }
+        let queue = ws.load_queue()?;
+        // A worker adopted from a previous session is still on a task: wait
+        // for it instead of starting overlapping work in the same workspace.
+        // recover_orphans evaluates it the moment its result appears.
+        if let Some(t) = queue.tasks.iter().find(|t| t.state == TaskState::Running) {
+            let task_id = t.id.clone();
+            for m in recover_orphans(ws) {
+                if !m.starts_with("adopted:") {
+                    emit(m);
+                }
+            }
+            let still_running = ws
+                .load_queue()?
+                .tasks
+                .iter()
+                .any(|x| x.state == TaskState::Running);
+            if still_running {
+                let n = waits.entry(task_id.clone()).or_default();
+                *n += 1;
+                if *n == 1 {
+                    emit(i18n::run_progress(
+                        event_lang,
+                        i18n::RunProgress::WaitingForWorker(&task_id),
+                    ));
+                }
+                if *n > 360 {
+                    emit(i18n::run_progress(
+                        event_lang,
+                        i18n::RunProgress::WorkerLongRunning(&task_id),
+                    ));
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            continue;
+        }
+        // NeedsUser/Blocked tasks do NOT halt the drain. They are not Queued, so
+        // select_next skips them, and any task depending on one stays gated by
+        // deps_met. Independent ready work keeps flowing; only when nothing else
+        // is runnable does the select_next `None` branch below report them.
+        // A merge-conflict Partial needs a human; a self-reported Partial is
+        // auto-continued from its checkpoint (retry path below, attempts-capped).
+        if let Some(t) = queue.tasks.iter().find(|t| t.state == TaskState::Partial) {
+            if let Some(reason) = latest_partial_reason(ws, &t.id) {
+                emit(i18n::run_progress(
+                    event_lang,
+                    i18n::RunProgress::PartialNeedsYou {
+                        id: &t.id,
+                        kind: reason.kind,
+                        marker: &reason.marker,
+                        detail: reason.detail.as_deref(),
+                    },
+                ));
+                break;
+            }
+        }
+        // A Failed task may be transient (e.g. a dropped connection) and a
+        // Partial one continues from its checkpoint: retry them first, bounded
+        // by the task's persisted feedback cap, instead of halting the drain.
+        let retry_target = queue
+            .tasks
+            .iter()
+            .find(|t| matches!(t.state, TaskState::Failed | TaskState::Partial))
+            .map(|t| t.id.clone());
+        // With parallelism on, a clean git tree, and 2+ independent ready
+        // tasks: run them as a concurrent worktree batch instead. (A Failed
+        // task still gets its sequential retry first.)
+        if retry_target.is_none() && max_parallel > 1 {
+            let assessment = crate::parallel::assess_parallelism(&queue, max_parallel);
+            let ready = crate::parallel::ready_independent(&queue, max_parallel);
+            if ready.len() >= 2 {
+                match crate::parallel::git_preflight(&ws.root) {
+                    Ok(()) => {
+                        chain = None; // parallel fan-out: fresh contexts
+                        crate::parallel::run_batch(ws, &ready, bypass, |s| {
+                            emit(s.to_string());
+                        })?;
+                        continue;
+                    }
+                    Err(why) => {
+                        if !parallel_warned {
+                            emit(i18n::run_progress(
+                                event_lang,
+                                i18n::RunProgress::ParallelOff(&why),
+                            ));
+                            parallel_warned = true;
+                        }
+                    }
+                }
+            } else if !parallel_warned && !assessment.reasons.is_empty() {
+                let summary = assessment.summary();
+                emit(i18n::run_progress(
+                    event_lang,
+                    i18n::RunProgress::ParallelSequential(&summary),
+                ));
+                parallel_warned = true;
+            }
+        }
+        // Pick the work: retry the failed task first, else the next queued one.
+        let task_id = match &retry_target {
+            Some(id) => id.clone(),
+            None => {
+                let vocab = ws
+                    .load_workers()
+                    .map(|w| routing::declared_capabilities(&w))
+                    .unwrap_or_default();
+                match select_next_ready(&queue, &vocab, |id| crate::approvals::is_granted(ws, id))?
+                {
+                    Some(idx) => queue.tasks[idx].id.clone(),
+                    None => {
+                        // Nothing runnable. Report why, in priority of action: tasks
+                        // that need a human (NeedsUser/Blocked) first, then
+                        // queued-but-gated (approval or deps), else a drained queue.
+                        let needs_you: Vec<&str> = queue
+                            .tasks
+                            .iter()
+                            .filter(|t| {
+                                matches!(t.state, TaskState::NeedsUser | TaskState::Blocked)
+                            })
+                            .map(|t| t.id.as_str())
+                            .collect();
+                        let deferred_tasks: Vec<&str> = queue
+                            .tasks
+                            .iter()
+                            .filter(|t| t.state == TaskState::Deferred)
+                            .map(|t| t.id.as_str())
+                            .collect();
+                        // Tasks that will never reach Done on their own: terminally
+                        // stuck states, then (transitively) any Queued task gated
+                        // behind one — so a whole stalled chain is caught, not just
+                        // the direct dependent.
+                        let mut dead: std::collections::HashSet<&str> = queue
+                            .tasks
+                            .iter()
+                            .filter(|t| {
+                                matches!(
+                                    t.state,
+                                    TaskState::Failed
+                                        | TaskState::Deferred
+                                        | TaskState::NeedsUser
+                                        | TaskState::Blocked
+                                )
+                            })
+                            .map(|t| t.id.as_str())
+                            .collect();
+                        loop {
+                            let mut grew = false;
+                            for t in &queue.tasks {
+                                if t.state == TaskState::Queued
+                                    && !dead.contains(t.id.as_str())
+                                    && t.depends_on.iter().any(|d| dead.contains(d.as_str()))
+                                {
+                                    dead.insert(t.id.as_str());
+                                    grew = true;
+                                }
+                            }
+                            if !grew {
+                                break;
+                            }
+                        }
+                        // Split Queued tasks: stuck (gated behind a dep that won't
+                        // complete) vs benignly waiting on a runnable dep / approval.
+                        let mut stuck: Vec<String> = Vec::new();
+                        let mut waiting: Vec<&str> = Vec::new();
+                        for t in queue.tasks.iter().filter(|t| t.state == TaskState::Queued) {
+                            match t.depends_on.iter().find(|d| dead.contains(d.as_str())) {
+                                Some(d) => stuck.push(format!("{} (behind {})", t.id, d)),
+                                None => waiting.push(t.id.as_str()),
+                            }
+                        }
+                        if !needs_you.is_empty() {
+                            let ids = needs_you.join(", ");
+                            emit(i18n::run_progress(
+                                event_lang,
+                                i18n::RunProgress::NeedsUserMany(&ids),
+                            ));
+                        } else if !stuck.is_empty() {
+                            let tasks = stuck.join("; ");
+                            emit(i18n::run_progress(
+                                event_lang,
+                                i18n::RunProgress::Stuck(&tasks),
+                            ));
+                        } else if !waiting.is_empty() {
+                            let ids = waiting.join(", ");
+                            emit(i18n::run_progress(
+                                event_lang,
+                                i18n::RunProgress::WaitingGated(&ids),
+                            ));
+                        } else if !deferred_tasks.is_empty() {
+                            emit(gate_msg::drained_with_deferred(event_lang, &deferred_tasks));
+                        } else {
+                            emit(gate_msg::drained_complete(event_lang));
+                        }
+                        break;
+                    }
+                }
+            }
+        };
+        if retry_target.is_some()
+            && queue
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .is_some_and(|t| t.approval_required())
+            && !crate::approvals::is_granted(ws, &task_id)
+        {
+            let mut fallback = queue.clone();
+            save_task_state_on_latest_queue(
+                ws,
+                &mut fallback,
+                &task_id,
+                TaskState::NeedsUser,
+                TransitionCause::RunOutcome,
+                "approval required before retry; task paused for user",
+                TransitionActor::System,
+            )?;
+            chain = None;
+            emit(i18n::run_progress(
+                event_lang,
+                i18n::RunProgress::ApprovalRetrySkipped(&task_id),
+            ));
+            continue;
+        }
+        // Offer the previous session only to a DEPENDENT successor (shared
+        // context is the point) and under the rot cap; retries start cold.
+        let offer = chain
+            .as_ref()
+            .filter(|c| {
+                retry_target.is_none()
+                    && c.length < CHAIN_CAP
+                    && queue
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == task_id)
+                        .is_some_and(|t| t.depends_on.contains(&c.prev_task_id))
+            })
+            .cloned();
+        emit(i18n::run_progress(
+            event_lang,
+            i18n::RunProgress::Running(&task_id),
+        ));
+        let report = run_next(
+            ws,
+            &RunOptions {
+                execute: true,
+                worker_override: None,
+                target: retry_target.clone(),
+                answer: None,
+                full_access: bypass,
+                accept_ambiguity: false,
+                chain: offer.clone(),
+            },
+        )?;
+        let state = report.result_state.unwrap_or(TaskState::Failed);
+        emit(task_state_progress_line(event_lang, &report.task_id, state));
+        chain = if state == TaskState::Done {
+            report.session.as_ref().map(|sess| ChainHandle {
+                prev_task_id: report.task_id.clone(),
+                worker_id: report.worker_id.clone(),
+                session: sess.clone(),
+                length: if report.chained {
+                    offer.map(|o| o.length + 1).unwrap_or(1)
+                } else {
+                    1
+                },
+            })
+        } else {
+            None // a messy ending poisons the context; next run starts clean
+        };
+
+        match state {
+            // Deferred never arises from a run (it is a manual decision), but if
+            // it did it is resolved-not-pending, so move on like Done/Queued.
+            TaskState::Done | TaskState::Queued | TaskState::Deferred => continue,
+            TaskState::Blocked => {
+                emit(gate_msg::blocked(event_lang, &report.task_id));
+                break;
+            }
+            TaskState::NeedsUser => {
+                emit(gate_msg::needs_user(event_lang, &report.task_id));
+                if continues_auto_drain(state) {
+                    continue;
+                }
+                break;
+            }
+            TaskState::Partial => {
+                // Loop back: the conflict check halts, a self-report continues
+                // from its checkpoint, and the feedback ledger bounds it all.
+                emit(i18n::run_progress(
+                    event_lang,
+                    i18n::RunProgress::PartialContinue(&report.task_id),
+                ));
+                continue;
+            }
+            TaskState::Failed => {
+                // Likely transient (e.g. a dropped connection); loop to retry it,
+                // bounded by the persisted feedback cap.
+                emit(i18n::run_progress(
+                    event_lang,
+                    i18n::RunProgress::FailedRetry(&report.task_id),
+                ));
+                continue;
+            }
+            TaskState::Running => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Pick the highest-priority eligible queued task index. Test-only convenience
+/// wrapper over `select_next_ready` (no capability vocab, nothing approved);
+/// production always routes through `select_next_ready` with the real inputs.
+#[cfg(test)]
+pub fn select_next(queue: &crate::schemas::WorkQueue, _opts: &RunOptions) -> Result<Option<usize>> {
+    select_next_ready(queue, &std::collections::BTreeSet::new(), |_| false)
+}
+
+pub fn select_next_ready(
+    queue: &crate::schemas::WorkQueue,
+    cap_vocab: &std::collections::BTreeSet<String>,
+    approved: impl Fn(&str) -> bool,
+) -> Result<Option<usize>> {
+    let pol = &queue.selection_policy;
+    let eligible = |t: &crate::schemas::Task| {
+        queue.is_runnable_now(t, approved(&t.id), cap_vocab)
+            && !(pol.skip_if_blocked && t.state == TaskState::Blocked)
+            && !(pol.skip_if_approval_required && t.approval_required() && !approved(&t.id))
+    };
+    // A final verifier must observe all runnable work that can change the
+    // workspace or propose an implementation follow-up. Keep this as a soft
+    // scheduling barrier: once other work is no longer runnable (failed,
+    // deferred, blocked, or gated), the review remains selectable and cannot
+    // deadlock behind a hard dependency.
+    let work_ready = queue.tasks.iter().any(|t| {
+        eligible(t) && !matches!(crate::packet::role_for(&t.kind), "reviewer" | "security")
+    });
+    let mut best: Option<usize> = None;
+    for (i, t) in queue.tasks.iter().enumerate() {
+        let remediation_pending =
+            matches!(crate::packet::role_for(&t.kind), "reviewer" | "security")
+                && queue.has_active_remediation_for(&t.id);
+        if !eligible(t)
+            || remediation_pending
+            || (work_ready && matches!(crate::packet::role_for(&t.kind), "reviewer" | "security"))
+        {
+            continue;
+        }
+        match best {
+            None => best = Some(i),
+            Some(b) => {
+                if t.priority < queue.tasks[b].priority {
+                    best = Some(i);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn migrate_stale_gate_to_decision(
+    ws: &Workspace,
+    lock: &PlanningLock,
+    queue: &mut WorkQueue,
+    task: &crate::schemas::Task,
+    unsatisfiable: &[String],
+) -> Result<()> {
+    let mut latest = ws.load_queue().unwrap_or_else(|_| queue.clone());
+    if let Some(t) = latest.tasks.iter_mut().find(|t| t.id == task.id) {
+        let from = t.state;
+        t.state = TaskState::NeedsUser;
+        t.required_capabilities.clear();
+        let detail = format!(
+            "migrated stale capability gate to a human decision question: {}",
+            unsatisfiable.join(", ")
+        );
+        t.worker_rationale = Some(match t.worker_rationale.take() {
+            Some(r) if !r.trim().is_empty() => format!("{r}\n{detail}"),
+            _ => detail.clone(),
+        });
+        let question = format!(
+            "This task needs your decision before Yardlet can run it: {}. Reply with the decision or instructions to proceed.",
+            t.title
+        );
+        let task_id = t.id.clone();
+        let to = t.state;
+        ws.save_queue_locked(lock, &latest)?;
+        state::append_conversation_turn(
+            ws,
+            &latest.intent_id,
+            &task_id,
+            ConversationTurn {
+                role: TurnRole::Worker,
+                text: question,
+                run_id: String::new(),
+                ts: Local::now().to_rfc3339(),
+            },
+        )?;
+        state::append_transition(
+            ws,
+            state::transition(
+                &task_id,
+                from,
+                to,
+                TransitionCause::StaleMigration,
+                &detail,
+                TransitionActor::System,
+            ),
+        )?;
+        *queue = latest;
+    }
+    Ok(())
+}
+
+/// The newest run directory recorded for a task id, as (run_id, dir). Compare
+/// the typed start time and filesystem timestamp rather than the directory name:
+/// claim suffixes such as `-10` do not sort correctly against `-9`.
+pub(crate) fn latest_run_for(ws: &Workspace, task_id: &str) -> Option<(String, PathBuf)> {
+    latest_run_for_matching_intent(ws, task_id, None)
+}
+
+pub(crate) fn latest_run_for_intent(
+    ws: &Workspace,
+    task_id: &str,
+    intent_id: &str,
+) -> Option<(String, PathBuf)> {
+    latest_run_for_matching_intent(ws, task_id, Some(intent_id))
+}
+
+fn latest_run_for_matching_intent(
+    ws: &Workspace,
+    task_id: &str,
+    intent_id: Option<&str>,
+) -> Option<(String, PathBuf)> {
+    let mut best: Option<(String, std::time::SystemTime, String, PathBuf)> = None;
+    for entry in std::fs::read_dir(ws.runs_dir()).ok()?.flatten() {
+        let dir = entry.path();
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            continue;
+        };
+        if !name.starts_with("run-") {
+            continue;
+        }
+        let Ok(record) = state::load_yaml::<RunRecord>(&dir.join("run.yaml")) else {
+            continue;
+        };
+        if record.task_id != task_id
+            || intent_id.is_some_and(|expected| record.intent_id != expected)
+        {
+            continue;
+        }
+        let modified = std::fs::metadata(dir.join("run.yaml"))
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let replace = best
+            .as_ref()
+            .map(|(started, prior_modified, prior_name, _)| {
+                (record.started_at.as_str(), modified, name.as_str())
+                    > (started.as_str(), *prior_modified, prior_name.as_str())
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((record.started_at, modified, name, dir));
+        }
+    }
+    best.map(|(_, _, name, dir)| (name, dir))
+}
+
+/// A UUID-format string (8-4-4-4-12 hex) from a seed + pid, used to set a claude
+/// session id up front so a transient failure can resume the same conversation.
+pub(crate) fn gen_session_uuid(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h1);
+    std::process::id().hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (a, seed).hash(&mut h2);
+    let b = h2.finish();
+    let hex = format!("{a:016x}{b:016x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// A transient (likely network/infra) failure: the worker did not exit cleanly,
+/// left no result, and was not stopped by us — worth resuming rather than redoing.
+fn is_transient_failure(outcome: &workers::WorkerOutcome, run_dir: &std::path::Path) -> bool {
+    // A run the operator stopped is not transient infrastructure trouble, and
+    // resuming it automatically would undo the stop they asked for.
+    !outcome.exit_ok
+        && !outcome.timed_out
+        && !outcome.stopped
+        && !run_dir.join("result.json").exists()
+}
+
+/// Validation commands configured on a task: `validation: { commands: [..] }`
+/// or a bare sequence. Yardlet runs these itself (a worker's self-reported
+/// validation is advisory, not the gate).
+fn validation_commands(task: &crate::schemas::Task) -> Vec<String> {
+    if !task.has_validation() {
+        return Vec::new();
+    }
+    let v = task
+        .validation
+        .as_ref()
+        .expect("has_validation guarantees validation is present");
+    let seq = v
+        .get("commands")
+        .and_then(|c| c.as_sequence())
+        .or_else(|| v.as_sequence());
+    seq.map(|s| {
+        s.iter()
+            .filter_map(|x| x.as_str().map(|t| t.to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Whether the task marks validation as required. A required task with no
+/// commands to run is treated as a failed gate.
+fn validation_required(task: &crate::schemas::Task) -> bool {
+    task.validation
+        .as_ref()
+        .and_then(|v| v.get("required"))
+        .and_then(|r| r.as_bool())
+        .unwrap_or(false)
+}
+
+/// Does deterministic validation apply to this task? Configured validation
+/// (e.g. `cargo test`) gates CODE: it is the acceptance of an implementation
+/// task. A doc/research/review/safety task delivers findings as prose, so an
+/// unrelated whole-app command is NOT its acceptance and must never flip it to
+/// Failed (goal-1 c). Only builder-role (implementation) tasks are validated;
+/// the split reuses the same role mapping the packet builder uses so a task's
+/// kind decides validation and packet shape consistently.
+fn validation_applies(task: &crate::schemas::Task) -> bool {
+    crate::packet::role_for(&task.kind) == "builder"
+}
+
+/// Run `cmds` in `cwd` via `sh -c`, write the deterministic outcome to
+/// `run_dir/validation.json`, and return `(any_ran, all_passed)`. Yardlet (not
+/// the worker) decides whether validation passed.
+/// How long a single validation command may run before Yardlet kills it. A
+/// stuck command must not hang the orchestrator after the worker has finished.
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Kill a timed-out validation command and its whole process group (so children
+/// spawned by `npm test` / `cargo test` etc. do not survive the timeout), then
+/// reap it. On unix the child leads its own group (process_group(0)), so
+/// signalling the negative pid reaches the group; the direct kill is a backstop.
+fn kill_validation_child(child: &mut std::process::Child) {
+    // Same syscall the worker teardown uses. This used to shell out to `kill`
+    // with a negative pid, which Linux's `kill` reads as another option after a
+    // signal flag rather than a target — so on Linux the group was never
+    // actually signalled and a timed-out `npm test` kept its children, the one
+    // thing this function exists to prevent.
+    crate::workers::terminate_worker_tree(child.id(), crate::workers::Signal::Kill);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run the task's validation commands as a deterministic gate. These commands
+/// are planner-authored, so Yardlet runs them itself (not the worker) with a
+/// billing-scrubbed core environment (no provider keys, no worker `pass_env`),
+/// captures each command's output to the run dir, and kills any command that
+/// exceeds VALIDATION_TIMEOUT. Returns (ran_any, all_passed); a timeout counts
+/// as a failure. Note: the kill targets the `sh` process, not its whole process
+/// tree, so a command that backgrounds a grandchild may leave it running.
+fn run_validation_commands(
+    cmds: &[String],
+    cwd: &std::path::Path,
+    run_dir: &std::path::Path,
+    billing: &crate::schemas::BillingPolicy,
+) -> (bool, bool) {
+    use std::process::{Command, Stdio};
+    let env = guard::scrub_env(std::env::vars(), &billing.blocked_worker_env_names);
+    let mut results = Vec::new();
+    let mut all_passed = true;
+    for (i, c) in cmds.iter().enumerate() {
+        let log_rel = format!("validation-{i}.log");
+        let log = std::fs::File::create(run_dir.join(&log_rel)).ok();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(c)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null());
+        // Put the command in its own process group so a timeout can kill the
+        // whole tree (children of `sh` too), not just the shell.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        if let Some(f) = &log {
+            if let (Ok(o), Ok(e)) = (f.try_clone(), f.try_clone()) {
+                cmd.stdout(Stdio::from(o)).stderr(Stdio::from(e));
+            }
+        }
+        let started = Instant::now();
+        let (passed, code, timed_out) = match cmd.spawn() {
+            Ok(mut child) => loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break (status.success(), status.code(), false),
+                    Ok(None) => {
+                        if started.elapsed() > VALIDATION_TIMEOUT {
+                            kill_validation_child(&mut child);
+                            break (false, None, true);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => break (false, None, false),
+                }
+            },
+            Err(_) => (false, None, false),
+        };
+        if !passed {
+            all_passed = false;
+        }
+        results.push(serde_json::json!({
+            "command": c,
+            "passed": passed,
+            "exit_code": code,
+            "timed_out": timed_out,
+            "log": log_rel,
+        }));
+    }
+    let report = serde_json::json!({
+        "ran": !cmds.is_empty(),
+        "all_passed": all_passed,
+        "note": "planner-authored commands, run by Yardlet with a billing-scrubbed env; \
+                 not sandboxed like a worker",
+        "commands": results,
+    });
+    let _ = write_str(
+        &run_dir.join("validation.json"),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+    );
+    (!cmds.is_empty(), all_passed)
+}
+
+/// The worktree a run executed in, when it was a parallel worktree run.
+pub(crate) fn run_worktree(run_dir: &std::path::Path) -> Option<PathBuf> {
+    let yaml = std::fs::read_to_string(run_dir.join("run.yaml")).ok()?;
+    let v = yaml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("worktree:"))
+        .map(|v| v.trim().trim_matches('"').to_string())?;
+    (v != "." && !v.is_empty()).then(|| PathBuf::from(v))
+}
+
+/// The worker a run used, read from its run.yaml so a recovered run's salvaged
+/// telemetry stays attributable to the worker that produced it. Uses the typed
+/// `RunRecord` load (every field defaults) rather than a hand-rolled line scan.
+fn run_worker(run_dir: &std::path::Path) -> Option<String> {
+    state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .map(|r| r.worker)
+        .filter(|s| !s.is_empty())
+}
+
+/// The pid of a run's worker, if that process is still alive. The pid file is
+/// written at spawn and removed when the worker exits cleanly under a live
+/// Yardlet; an orphaned worker (Yardlet quit mid-run) keeps running with the file
+/// in place.
+pub(crate) fn live_worker_pid(run_dir: &std::path::Path) -> Option<u32> {
+    // Planning runs predate task-run provenance and have no run.yaml. Preserve
+    // their existing liveness projection only for the distinct `plan-*`
+    // namespace; canonical task runs below must prove exact process identity.
+    let path_run_id = run_dir.file_name()?.to_str()?;
+    if path_run_id.starts_with("plan-") && !run_dir.join("run.yaml").exists() {
+        let pid: u32 = std::fs::read_to_string(run_dir.join("worker.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        return std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success()
+            .then_some(pid);
+    }
+    let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).ok()?;
+    if record.run_id != path_run_id
+        || record.task_id.trim().is_empty()
+        || record.completed_at.is_some()
+        || !matches!(record.state.as_str(), "prepared" | "running" | "")
+    {
+        return None;
+    }
+    let provenance = workers::load_worker_process_provenance(run_dir).ok()?;
+    if provenance.schema_version != 1
+        || provenance.run_id != record.run_id
+        || provenance.worker_id != record.worker
+        || provenance.pid == 0
+        || provenance.completed_at.is_some()
+        || provenance.state != "running"
+    {
+        return None;
+    }
+    let observed_start = workers::process_start_marker(provenance.pid)?;
+    (observed_start == provenance.process_start_marker).then_some(provenance.pid)
+}
+
+/// Read-only status diagnostic for a canonical Running task. `None` means the
+/// latest current-intent run is finalized or its exact worker identity is
+/// still live. Any returned reason requires explicit recovery, but this helper
+/// never mutates queue or run state.
+pub(crate) fn stale_running_reason(
+    run_dir: &std::path::Path,
+    expected_task_id: &str,
+    expected_intent_id: &str,
+) -> Option<String> {
+    let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).ok()?;
+    let path_run_id = run_dir.file_name()?.to_str()?;
+    if record.run_id != path_run_id
+        || record.task_id != expected_task_id
+        || record.intent_id != expected_intent_id
+    {
+        return Some("latest run identity does not match the canonical Running task".to_string());
+    }
+    if record.completed_at.is_some()
+        || !matches!(record.state.as_str(), "prepared" | "running" | "")
+    {
+        return None;
+    }
+    if live_worker_pid(run_dir).is_some() {
+        return None;
+    }
+    let reason = match workers::load_worker_process_provenance(run_dir) {
+        Ok(provenance)
+            if provenance.run_id == record.run_id
+                && provenance.worker_id == record.worker
+                && provenance.pid != 0 =>
+        {
+            "recorded worker is dead or its process identity no longer matches"
+        }
+        Ok(provenance)
+            if provenance.run_id == record.run_id
+                && provenance.worker_id == record.worker
+                && provenance.pid == 0
+                && provenance.state == "prepared"
+                && provenance.completed_at.is_none() =>
+        {
+            // Dispatch writes this prepared/pid=0 record just before spawning
+            // the worker, so a status taken inside that window is not stale.
+            if within_dispatch_prepare_grace(&record.started_at) {
+                return None;
+            }
+            "worker was never spawned; run stalled in dispatch preparation"
+        }
+        Ok(_) => "worker process provenance does not match the active run",
+        Err(_) => {
+            // Dispatch writes run.yaml before any provenance file exists; a
+            // status taken inside that pre-spawn window is not stale. A file
+            // that exists but fails to parse is damage, not the pre-window,
+            // so only a genuinely absent file defers.
+            if !run_dir
+                .join(workers::WORKER_PROCESS_PROVENANCE_FILE)
+                .exists()
+                && within_dispatch_prepare_grace(&record.started_at)
+            {
+                return None;
+            }
+            "worker process provenance is missing or invalid"
+        }
+    };
+    Some(reason.to_string())
+}
+
+/// How long after `started_at` a run whose provenance still reads prepared/pid=0
+/// (or whose provenance file has not been written yet) is treated as a live
+/// dispatch still spawning its worker rather than a stalled run.
+const DISPATCH_PREPARE_GRACE_SECS: i64 = 120;
+
+/// True while a run is close enough to its recorded start that the prepared
+/// provenance window is plausibly still in flight. An unparseable timestamp
+/// fails closed (no deferral), and the bound is absolute so a corrupt
+/// far-future `started_at` cannot suppress the diagnosis forever.
+fn within_dispatch_prepare_grace(started_at: &str) -> bool {
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(started_at.trim()) else {
+        return false;
+    };
+    Local::now()
+        .signed_duration_since(started)
+        .num_seconds()
+        .abs()
+        <= DISPATCH_PREPARE_GRACE_SECS
+}
+
+pub(crate) fn verified_worker_pid_for_redirect(
+    run_dir: &std::path::Path,
+    expected_task_id: &str,
+    expected_attempt_id: &str,
+    expected_worker_id: &str,
+) -> Result<u32> {
+    let record: RunRecord =
+        state::load_yaml(&run_dir.join("run.yaml")).context("loading redirect run identity")?;
+    let path_run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("redirect run directory has no valid identity"))?;
+    if record.run_id != path_run_id
+        || record.task_id != expected_task_id
+        || record.completed_at.is_some()
+        || record.state != "running"
+    {
+        bail!("redirect run identity/provenance mismatch; refusing to signal a process");
+    }
+
+    let provenance = workers::load_worker_process_provenance(run_dir)
+        .context("worker process provenance is missing or invalid; refusing redirect signal")?;
+    if provenance.schema_version != 1
+        || provenance.run_id != record.run_id
+        || provenance.attempt_id != expected_attempt_id
+        || provenance.worker_id != expected_worker_id
+        || provenance.pid == 0
+    {
+        bail!(
+            "worker process provenance does not match the active attempt; refusing redirect signal"
+        );
+    }
+    let observed_start = workers::process_start_marker(provenance.pid)
+        .ok_or_else(|| anyhow!("verified worker process is no longer alive"))?;
+    if observed_start != provenance.process_start_marker {
+        bail!("worker process identity changed since spawn; refusing redirect signal");
+    }
+    Ok(provenance.pid)
+}
+
+/// A run Yardlet never finalized: its `worker.pid` is still on disk (a finalized
+/// run removes it the moment it sees the worker exit), the process is now gone,
+/// and it left a `result.json`. Such a run was orphaned by a dying orchestrator
+/// *after* the worker finished but *before* evaluation — its completed work is
+/// stranded. Distinct from a legitimately-failed run, which was evaluated and
+/// so has no pid file left.
+fn is_orphaned_unfinalized(run_dir: &std::path::Path) -> bool {
+    run_dir.join("worker.pid").exists()
+        && live_worker_pid(run_dir).is_none()
+        && run_dir.join("result.json").exists()
+}
+
+/// A run that was prepared/started but never finalized and is no longer alive:
+/// its run.yaml still reads `prepared`/`running` (never sealed), no worker
+/// process is alive, and it left NO result.json. Distinct from
+/// `is_orphaned_unfinalized`, which HAS a result to salvage. Such a run strands
+/// its task when the task's own state (e.g. `NeedsUser` after a `yardlet answer`
+/// run died before finalize) does not itself flag the task for recovery.
+fn is_abandoned_run(run_dir: &std::path::Path) -> bool {
+    let Ok(rec) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+        return false;
+    };
+    rec.completed_at.is_none()
+        && matches!(rec.state.as_str(), "prepared" | "running" | "")
+        && live_worker_pid(run_dir).is_none()
+        && !run_dir.join("result.json").exists()
+}
+
+#[derive(Debug)]
+struct PendingGitFinish {
+    run_id: String,
+    task_id: String,
+    run_dir: PathBuf,
+    target: (String, String),
+    integration_order: usize,
+    started_at: String,
+}
+
+/// Find every integration whose Git-finish or run projection still needs
+/// recovery for the live intent, then order each remote target by the
+/// workspace's first-parent integration history. This deliberately scans runs
+/// rather than tasks: multiple non-Done runs may own distinct accumulated
+/// commits even when they share a task id.
+fn pending_git_finishes(ws: &Workspace, queue: &WorkQueue) -> Vec<PendingGitFinish> {
+    let config_policy = ws.load_config().ok().map(|config| config.git_finish);
+    let latest_done_runs = queue
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Done)
+        .filter_map(|task| {
+            latest_run_for(ws, &task.id).map(|(_, run_dir)| (task.id.clone(), run_dir))
+        })
+        .collect::<HashMap<_, _>>();
+    let positions = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["rev-list", "--first-parent", "--reverse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .enumerate()
+                .map(|(index, oid)| (oid.trim().to_string(), index))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut pending = Vec::new();
+    let Ok(entries) = std::fs::read_dir(ws.runs_dir()) else {
+        return pending;
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        let Ok(run) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+            continue;
+        };
+        let Some(task_state) = queue
+            .tasks
+            .iter()
+            .find(|task| task.id == run.task_id)
+            .map(|task| task.state)
+        else {
+            continue;
+        };
+        if run.intent_id != queue.intent_id || !run_dir.join("result.json").exists() {
+            continue;
+        }
+        let finish = ws.load_git_finish_record(&run_dir).ok();
+        // The live queue is authoritative for task completion, so Done tasks
+        // skip historical and unverified runs. The one exception is their
+        // latest run after a verified external finish when the run projection
+        // is still stale. Recovery may re-seal that run without pushing again.
+        let repairs_done_projection = task_state == TaskState::Done
+            && latest_done_runs
+                .get(&run.task_id)
+                .is_some_and(|latest| latest == &run_dir)
+            && finish
+                .as_ref()
+                .is_some_and(|record| record.status.verified_complete())
+            && (run.state != "done" || run.completed_at.is_none());
+        if task_state == TaskState::Done && !repairs_done_projection {
+            continue;
+        }
+        let (auto_push, remote, target_ref, expected_oid) = match finish.as_ref() {
+            Some(record) => (
+                record.policy.auto_push,
+                record.policy.remote.clone(),
+                record.policy.target_ref.clone(),
+                record.expected_oid.clone().unwrap_or_default(),
+            ),
+            None => {
+                let Some(policy) = config_policy.as_ref() else {
+                    continue;
+                };
+                (
+                    policy.auto_push,
+                    policy.remote.clone(),
+                    policy.target_ref.clone(),
+                    run.integration_oid.clone(),
+                )
+            }
+        };
+        if !auto_push || expected_oid.is_empty() {
+            continue;
+        }
+        pending.push(PendingGitFinish {
+            run_id: run.run_id,
+            task_id: run.task_id,
+            run_dir,
+            target: (remote, target_ref),
+            integration_order: positions.get(&expected_oid).copied().unwrap_or(usize::MAX),
+            started_at: run.started_at,
+        });
+    }
+    pending.sort_by(|a, b| {
+        a.target
+            .cmp(&b.target)
+            .then(a.integration_order.cmp(&b.integration_order))
+            .then(a.started_at.cmp(&b.started_at))
+            .then(a.run_id.cmp(&b.run_id))
+    });
+    pending
+}
+
+fn recover_pending_git_finishes(
+    ws: &Workspace,
+    queue: &mut WorkQueue,
+    billing: &crate::schemas::BillingPolicy,
+    event_lang: Lang,
+    msgs: &mut Vec<String>,
+    finished: &mut Vec<String>,
+) -> HashSet<String> {
+    let candidates = pending_git_finishes(ws, queue);
+    let mut attempted = HashSet::new();
+    let mut halted_targets = BTreeMap::<(String, String), String>::new();
+    for candidate in candidates {
+        if halted_targets.contains_key(&candidate.target) {
+            continue;
+        }
+        let Some(task) = queue
+            .tasks
+            .iter()
+            .find(|task| task.id == candidate.task_id)
+            .cloned()
+        else {
+            continue;
+        };
+        attempted.insert(candidate.run_id.clone());
+        let evidence = evaluator::changed_paths(&ws.root).map(|paths| {
+            paths
+                .into_iter()
+                .filter(|path| !evaluator::is_canonical_state_path(path))
+                .collect()
+        });
+        let worker = run_worker(&candidate.run_dir).unwrap_or_default();
+        let flags = if task.state == TaskState::Done {
+            FinalizeFlags::done_projection_recovery()
+        } else {
+            FinalizeFlags::recovery()
+        };
+        match finalize_run(FinalizeInput {
+            ws,
+            run_dir: &candidate.run_dir,
+            run_id: &candidate.run_id,
+            task: &task,
+            evidence,
+            worker_id: &worker,
+            reason: "git_finish_recovery",
+            wall_seconds: 0,
+            user_override: None,
+            intent_summary: "",
+            billing,
+            queue,
+            flags,
+            merge: None,
+        }) {
+            Ok(report) if report.next_state == TaskState::Done => {
+                for line in report.lines {
+                    if line.starts_with(&format!("{}: ", candidate.task_id))
+                        || line.starts_with("git finish:")
+                    {
+                        msgs.push(format!("{}: {line}", candidate.task_id));
+                    }
+                }
+                finished.push(task_state_progress_line(
+                    event_lang,
+                    &candidate.task_id,
+                    report.next_state,
+                ));
+            }
+            Ok(report) => {
+                halted_targets.insert(candidate.target, candidate.run_id);
+                msgs.push(format!(
+                    "{}: Git finish recovery stopped at {}",
+                    candidate.task_id,
+                    run_outcome_label(report.next_state)
+                ));
+            }
+            Err(error) => {
+                halted_targets.insert(candidate.target, candidate.run_id);
+                msgs.push(format!(
+                    "{}: Git finish recovery error: {error}",
+                    candidate.task_id
+                ));
+            }
+        }
+    }
+    attempted
+}
+
+fn import_completed_serial_staging(ws: &Workspace) {
+    let Ok(entries) = std::fs::read_dir(ws.runs_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if live_worker_pid(&run_dir).is_some() {
+            continue;
+        }
+        let Ok(record) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
+            continue;
+        };
+        if !record.serial_isolated || record.worktree.is_empty() || record.worktree == "." {
+            continue;
+        }
+        let staged = PathBuf::from(&record.worktree)
+            .join(crate::state::STATE_DIR)
+            .join("runs")
+            .join(&record.run_id);
+        if staged.join("result.json").is_file() {
+            let _ = import_worker_run_artifacts(&staged, &run_dir);
+        }
+    }
+}
+
+fn registered_recovery_worktree_matches(
+    ws: &Workspace,
+    worktree: &std::path::Path,
+    branch: &str,
+    run_id: &str,
+    task_id: &str,
+    allow_serial_transaction: bool,
+) -> bool {
+    let expected = ws.agents_dir().join("worktrees").join(run_id);
+    let expected_branch = format!("yard/{}/{}", task_id.to_lowercase(), run_id);
+    if worktree != expected || branch != expected_branch {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(worktree) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Some(actual) = std::fs::canonicalize(worktree).ok() else {
+        return false;
+    };
+    let Some(owned_root) = std::fs::canonicalize(ws.agents_dir().join("worktrees")).ok() else {
+        return false;
+    };
+    if actual != owned_root.join(run_id) {
+        return false;
+    }
+    let Ok(listed) = git_stdout(&ws.root, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    // Git reports canonical worktree paths (for example `/private/var` on
+    // macOS even when the caller used `/var`), so compare against the already
+    // validated canonical owned path rather than its lexical spelling.
+    let expected_path = actual.display().to_string();
+    let expected_ref = format!("refs/heads/{branch}");
+    let expected_transaction_ref = format!("refs/heads/yardlet-txn/{branch}");
+    listed.split("\n\n").any(|entry| {
+        let mut path_matches = false;
+        let mut branch_matches = false;
+        for line in entry.lines() {
+            path_matches |= line
+                .strip_prefix("worktree ")
+                .is_some_and(|path| path == expected_path);
+            branch_matches |= line.strip_prefix("branch ").is_some_and(|reference| {
+                reference == expected_ref
+                    || (allow_serial_transaction && reference == expected_transaction_ref)
+            });
+        }
+        path_matches && branch_matches
+    })
+}
+
+fn recovery_integration_provenance(
+    ws: &Workspace,
+    record: Option<&RunRecord>,
+    run_id: &str,
+    task_id: &str,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> IntegrationProvenance {
+    // Presence, across BOTH the pending and reconciled locations: a settled
+    // receipt now lives in the archive, so a raw pending-path check would
+    // express "this run already recorded a no-op" against half the store
+    // (issue #43). Presence rather than parseability, because a corrupt receipt
+    // is precisely the case that must still force Unknown.
+    if ws.has_no_change_receipt(run_id) {
+        return IntegrationProvenance::Unknown;
+    }
+    let Some(record) = record else {
+        return IntegrationProvenance::Unknown;
+    };
+    if record.run_id != run_id
+        || record.task_id != task_id
+        || record.worktree != worktree.display().to_string()
+        || (!record.worktree_branch.is_empty() && record.worktree_branch != branch)
+    {
+        return IntegrationProvenance::Unknown;
+    }
+    let receipt = ws.load_serial_integration_receipt(run_id).ok();
+    match (
+        record.serial_isolated,
+        record.integration_provenance,
+        receipt,
+    ) {
+        (true, IntegrationProvenance::SerialCoreStaged, Some(receipt))
+            if receipt.schema_version == 1
+                && receipt.run_id == run_id
+                && receipt.task_id == task_id
+                && receipt.worktree == worktree.display().to_string()
+                && receipt.branch == branch
+                && receipt.baseline_oid == record.baseline_oid
+                && worktree.file_name().and_then(|name| name.to_str()) == Some(run_id)
+                && registered_recovery_worktree_matches(
+                    ws, worktree, branch, run_id, task_id, true,
+                ) =>
+        {
+            IntegrationProvenance::SerialCoreStaged
+        }
+        (
+            false,
+            IntegrationProvenance::ParallelWorkerDirect | IntegrationProvenance::Unknown,
+            None,
+        ) if registered_recovery_worktree_matches(ws, worktree, branch, run_id, task_id, false) => {
+            IntegrationProvenance::ParallelWorkerDirect
+        }
+        _ => IntegrationProvenance::Unknown,
+    }
+}
+
+fn validate_receipted_serial_input_overlay_parity(
+    ws: &Workspace,
+    worktree: &std::path::Path,
+    overlays: &[state::SerialInputOverlay],
+    dependency_overlays: &[state::DependencyInputOverlay],
+) -> Result<()> {
+    if let Some(reason) = serial_input_overlay_parity_failure(&ws.root, overlays) {
+        bail!(reason);
+    }
+    if worktree.exists() {
+        if let Some(reason) = serial_input_overlay_parity_failure(worktree, overlays) {
+            bail!(reason);
+        }
+        if let Some(reason) = dependency_input_overlay_parity_failure(worktree, dependency_overlays)
+        {
+            bail!(reason);
+        }
+    }
+    Ok(())
+}
+
+fn validate_integrated_cleanup_identity(
+    ws: &Workspace,
+    receipt: &state::IntegratedCleanupReceipt,
+) -> Result<(PathBuf, String, IntegrationProvenance)> {
+    if receipt.schema_version != 1
+        || receipt.run_id.is_empty()
+        || receipt.task_id.is_empty()
+        || receipt.intent_id.is_empty()
+        || receipt.worker.is_empty()
+        || receipt.integration_oid.is_empty()
+        || receipt.integration_base_oid.is_empty()
+        || receipt.integration_worker_oid.is_empty()
+        || receipt.branch != format!("yard/{}/{}", receipt.task_id.to_lowercase(), receipt.run_id)
+        || receipt.owned_oids.last() != Some(&receipt.integration_oid)
+        || receipt.provenance == IntegrationProvenance::Unknown
+    {
+        return Err(anyhow!("incomplete integrated-run ownership record"));
+    }
+    let worktree = PathBuf::from(&receipt.worktree);
+    if !worktree.starts_with(ws.agents_dir().join("worktrees"))
+        || worktree.file_name().and_then(|name| name.to_str()) != Some(receipt.run_id.as_str())
+    {
+        return Err(anyhow!(
+            "integrated worktree path is outside the owned run path"
+        ));
+    }
+    let parents = git_stdout(
+        &ws.root,
+        &["show", "-s", "--format=%P", &receipt.integration_oid],
+    )?;
+    let parents = parents.split_whitespace().collect::<Vec<_>>();
+    if parents.len() != 2
+        || parents[0] != receipt.integration_base_oid
+        || parents[1] != receipt.integration_worker_oid
+        || !receipt.owned_oids.contains(&receipt.integration_worker_oid)
+    {
+        return Err(anyhow!(
+            "integration commit parent projection does not match the run record"
+        ));
+    }
+    git_stdout(
+        &ws.root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &receipt.integration_oid,
+            "HEAD",
+        ],
+    )?;
+    if receipt.provenance == IntegrationProvenance::SerialCoreStaged {
+        let serial = ws.load_serial_integration_receipt(&receipt.run_id)?;
+        if serial.schema_version != 1
+            || serial.run_id != receipt.run_id
+            || serial.task_id != receipt.task_id
+            || serial.worktree != receipt.worktree
+            || serial.branch != receipt.branch
+            || serial.baseline_oid != receipt.baseline_oid
+            || receipt
+                .core_input_overlays
+                .iter()
+                .any(|overlay| !serial.core_input_overlays.contains(overlay))
+            || receipt
+                .dependency_input_overlays
+                .iter()
+                .any(|overlay| !serial.dependency_input_overlays.contains(overlay))
+        {
+            return Err(anyhow!("serial and integrated core receipts disagree"));
+        }
+        validate_receipted_serial_input_overlay_parity(
+            ws,
+            &worktree,
+            &receipt.core_input_overlays,
+            &receipt.dependency_input_overlays,
+        )?;
+    }
+    Ok((
+        worktree,
+        receipt.integration_worker_oid.clone(),
+        receipt.provenance,
+    ))
+}
+
+fn recovery_git_finish_ownership(
+    ws: &Workspace,
+    run_id: &str,
+    task_id: &str,
+) -> Option<crate::git_finish::GitFinishOwnership> {
+    let receipt = ws.load_integrated_cleanup_receipt(run_id).ok()?;
+    if receipt.run_id != run_id || receipt.task_id != task_id {
+        return None;
+    }
+    validate_integrated_cleanup_identity(ws, &receipt).ok()?;
+    Some(crate::git_finish::GitFinishOwnership {
+        baseline_oid: receipt.integration_base_oid,
+        expected_oid: receipt.integration_oid,
+        owned_oids: receipt.owned_oids,
+    })
+}
+
+fn validate_no_change_receipt(ws: &Workspace, receipt: &state::NoChangeReceipt) -> Result<PathBuf> {
+    if receipt.schema_version != 1
+        || receipt.run_id.is_empty()
+        || receipt.task_id.is_empty()
+        || receipt.intent_id.is_empty()
+        || receipt.worker.is_empty()
+        || receipt.baseline_oid.is_empty()
+        || receipt.worker_oid != receipt.baseline_oid
+        || receipt.branch != format!("yard/{}/{}", receipt.task_id.to_lowercase(), receipt.run_id)
+        || receipt.provenance == IntegrationProvenance::Unknown
+    {
+        return Err(anyhow!("incomplete no-change core receipt"));
+    }
+    let worktree = PathBuf::from(&receipt.worktree);
+    if worktree != ws.agents_dir().join("worktrees").join(&receipt.run_id) {
+        return Err(anyhow!("no-change worktree is outside the owned run path"));
+    }
+    git_stdout(
+        &ws.root,
+        &["merge-base", "--is-ancestor", &receipt.worker_oid, "HEAD"],
+    )?;
+    if receipt.provenance == IntegrationProvenance::SerialCoreStaged {
+        let serial = ws.load_serial_integration_receipt(&receipt.run_id)?;
+        if serial.schema_version != 1
+            || serial.run_id != receipt.run_id
+            || serial.task_id != receipt.task_id
+            || serial.worktree != receipt.worktree
+            || serial.branch != receipt.branch
+            || serial.baseline_oid != receipt.baseline_oid
+            || receipt
+                .core_input_overlays
+                .iter()
+                .any(|overlay| !serial.core_input_overlays.contains(overlay))
+            || receipt
+                .dependency_input_overlays
+                .iter()
+                .any(|overlay| !serial.dependency_input_overlays.contains(overlay))
+        {
+            return Err(anyhow!("serial and no-change core receipts disagree"));
+        }
+        validate_receipted_serial_input_overlay_parity(
+            ws,
+            &worktree,
+            &receipt.core_input_overlays,
+            &receipt.dependency_input_overlays,
+        )?;
+    }
+    Ok(worktree)
+}
+
+fn recovery_no_change_complete(ws: &Workspace, run_id: &str, task_id: &str) -> bool {
+    let Ok(receipt) = ws.load_no_change_receipt(run_id) else {
+        return false;
+    };
+    if receipt.run_id != run_id || receipt.task_id != task_id {
+        return false;
+    }
+    let Ok(worktree) = validate_no_change_receipt(ws, &receipt) else {
+        return false;
+    };
+    crate::parallel::cleanup_integrated_worktree(
+        &ws.root,
+        &worktree,
+        &receipt.branch,
+        &receipt.worker_oid,
+        receipt.provenance,
+    )
+    .complete
+}
+
+fn reconcile_no_change_outcomes(ws: &Workspace, msgs: &mut Vec<String>) {
+    let receipts = match ws.load_no_change_receipts() {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            msgs.push(format!("retained incomplete no-change receipts: {error}"));
+            return;
+        }
+    };
+    for receipt in receipts {
+        let run_dir = ws.runs_dir().join(&receipt.run_id);
+        let worktree = match validate_no_change_receipt(ws, &receipt) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                msgs.push(format!(
+                    "{}: retained incomplete no-change cleanup: {error}",
+                    receipt.task_id
+                ));
+                continue;
+            }
+        };
+        // The run directory is worker-writable. Rebuild its identity from the
+        // core receipt before `latest_run_for` scans it below; otherwise a
+        // malformed or retargeted projection can make a completed no-op look
+        // abandoned and cause the worker to run again.
+        if let Err(error) = persist_no_change_projection(&run_dir, &receipt, false) {
+            msgs.push(format!(
+                "{}: could not repair no-change run projection: {error}",
+                receipt.task_id
+            ));
+            continue;
+        }
+        let cleanup = crate::parallel::cleanup_integrated_worktree(
+            &ws.root,
+            &worktree,
+            &receipt.branch,
+            &receipt.worker_oid,
+            receipt.provenance,
+        );
+        for warning in cleanup.warnings {
+            msgs.push(format!("{}: {warning}", receipt.task_id));
+        }
+        if let Err(error) = persist_no_change_projection(&run_dir, &receipt, cleanup.complete) {
+            msgs.push(format!(
+                "{}: could not persist no-change cleanup projection: {error}",
+                receipt.task_id
+            ));
+            continue;
+        }
+        if !cleanup.complete {
+            continue;
+        }
+        match crate::git_finish::finish_no_change_run(
+            ws,
+            &run_dir,
+            &receipt.run_id,
+            &receipt.task_id,
+            TaskState::Done,
+        ) {
+            // Cleanup is done and delivery reached a verified end state, so
+            // this receipt has no work left for any later startup to find
+            // (issue #43). An unverified finish stays in the pending set.
+            Ok(record) if record.status.verified_complete() => {
+                if let Err(error) = ws.archive_no_change_receipt(&receipt.run_id) {
+                    msgs.push(format!(
+                        "{}: could not archive a settled no-change receipt: {error}",
+                        receipt.task_id
+                    ));
+                }
+            }
+            Ok(record) => msgs.push(format!(
+                "{}: no-change Git finish remains {}",
+                receipt.task_id,
+                record.status.as_str()
+            )),
+            Err(error) => msgs.push(format!(
+                "{}: could not persist no-change Git finish: {error}",
+                receipt.task_id
+            )),
+        }
+    }
+}
+
+fn reconcile_integrated_cleanups(ws: &Workspace, msgs: &mut Vec<String>) {
+    let receipts = match ws.load_integrated_cleanup_receipts() {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            msgs.push(format!("retained incomplete Git cleanup receipts: {error}"));
+            return;
+        }
+    };
+    for receipt in receipts {
+        let run_dir = ws.runs_dir().join(&receipt.run_id);
+        let was_complete = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+            .ok()
+            .is_some_and(|record| {
+                record.run_id == receipt.run_id
+                    && record.task_id == receipt.task_id
+                    && record.integration_oid == receipt.integration_oid
+                    && record.integration_worker_oid == receipt.integration_worker_oid
+                    && record.integration_cleanup_complete
+            });
+        let (worktree, worker_oid, provenance) =
+            match validate_integrated_cleanup_identity(ws, &receipt) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    msgs.push(format!(
+                        "{}: retained incomplete Git cleanup: {error}",
+                        receipt.task_id
+                    ));
+                    continue;
+                }
+            };
+        let cleanup = crate::parallel::cleanup_integrated_worktree(
+            &ws.root,
+            &worktree,
+            &receipt.branch,
+            &worker_oid,
+            provenance,
+        );
+        for warning in cleanup.warnings {
+            msgs.push(format!("{}: {warning}", receipt.task_id));
+        }
+        // Keep the receipt in the scanned set when its projection could not be
+        // written: retiring it here would leave run.yaml permanently stale with
+        // no retry path, which is exactly what staying pending used to fix. The
+        // no-change sibling above skips the same way.
+        if let Err(error) =
+            persist_integrated_cleanup_projection(&run_dir, &receipt, cleanup.complete)
+        {
+            msgs.push(format!(
+                "{}: could not persist Git cleanup projection: {error}",
+                receipt.task_id
+            ));
+            continue;
+        }
+        if cleanup.complete {
+            if !was_complete {
+                msgs.push(format!(
+                    "{}: reconciled integrated worktree cleanup",
+                    receipt.task_id
+                ));
+            }
+            // Nothing about this receipt can change again, so retire it from
+            // the set every later startup replays (issue #43). Failing to
+            // archive only costs the old repeated work, so it is not fatal.
+            if let Err(error) = ws.archive_integrated_cleanup_receipt(&receipt.run_id) {
+                msgs.push(format!(
+                    "{}: could not archive a reconciled Git cleanup receipt: {error}",
+                    receipt.task_id
+                ));
+            }
+        }
+    }
+}
+
+/// Recover tasks left "running" by an interrupted/quit session: if the task's
+/// latest run produced a result, evaluate it (keep the finished work); if its
+/// worker is still alive (quitting Yardlet does not kill workers), ADOPT it —
+/// keep the task Running and let a later pass evaluate the result, instead of
+/// starting a duplicate worker on the same task. Only a dead worker with no
+/// result is requeued. A parallel worktree run that finished Done is also
+/// merged back — without this its changes would be stranded in the worktree
+/// while the task reads Done. It also SALVAGES a task wrongly stuck `Failed`
+/// when the orchestrator died after the worker finished but before evaluating
+/// it (an unfinalized orphan run — `worker.pid` still on disk): the stranded
+/// result is re-evaluated rather than the whole task re-run from scratch (a
+/// genuinely-bad result stays failed). Returns messages describing what
+/// changed. Safe to call on startup and periodically.
+pub(crate) fn recover_orphans(ws: &Workspace) -> Vec<String> {
+    if let Err(error) = crate::planning::validate_active_activation(ws) {
+        return vec![format!("recovery rejected: {error}")];
+    }
+    let mut msgs = Vec::new();
+    let Ok(mut q) = ws.load_queue() else {
+        return msgs;
+    };
+    // A worker writes into its isolated staging run dir. If the orchestrator
+    // crashed before importing those files, recover them before classifying the
+    // run as abandoned, otherwise a completed worker would be invoked twice.
+    import_completed_serial_staging(ws);
+    // Integration ownership is persisted before cleanup. Reconcile it even if
+    // the worktree path already vanished in the crash window before ref deletion.
+    reconcile_no_change_outcomes(ws, &mut msgs);
+    reconcile_integrated_cleanups(ws, &mut msgs);
+    let event_lang = run_event_lang(ws);
+    let billing = ws.load_billing().unwrap_or_default();
+    let mut requeued = Vec::new();
+    let mut finished = Vec::new();
+    let git_finish_attempted =
+        recover_pending_git_finishes(ws, &mut q, &billing, event_lang, &mut msgs, &mut finished);
+    // Snapshot (id, state): the finalize branch borrows the queue mutably
+    // through finalize_run, so we cannot hold an iter_mut over it here. Each
+    // task's recover decision keys off its state at recovery start.
+    let candidates: Vec<(String, TaskState)> =
+        q.tasks.iter().map(|t| (t.id.clone(), t.state)).collect();
+    for (id, state) in candidates {
+        let latest = latest_run_for(ws, &id);
+        let recover_this = match state {
+            TaskState::Running => true,
+            // Salvage a task wrongly stuck terminal because the orchestrator
+            // died before evaluating a finished orphan run (worker.pid still on
+            // disk, process gone, result written). Re-route it through the
+            // evaluator — a genuinely-bad result stays failed; completed work
+            // is no longer stranded by a full re-run.
+            TaskState::Failed => latest
+                .as_ref()
+                .map(|(_, rd)| is_orphaned_unfinalized(rd))
+                .unwrap_or(false),
+            // A task stranded by an ABANDONED run: an answer/run spawned an
+            // execution that died before finalize without persisting a Running
+            // state (e.g. the worker never produced anything), so the task keeps
+            // its pre-run NeedsUser state while its run.yaml is stuck `running`
+            // with no result. The arms above key off task state and miss it;
+            // catch it by the abandoned run record and requeue it to re-run.
+            TaskState::NeedsUser => latest
+                .as_ref()
+                .map(|(_, rd)| is_abandoned_run(rd))
+                .unwrap_or(false),
+            TaskState::Partial => latest
+                .as_ref()
+                .filter(|(run_id, _)| !git_finish_attempted.contains(run_id))
+                .map(|(_, run_dir)| git_finish_recovery_needed(ws, run_dir))
+                .unwrap_or(false),
+            TaskState::Done => latest
+                .as_ref()
+                .map(|(_, run_dir)| git_finish_projection_recovery_needed(ws, run_dir))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !recover_this {
+            continue;
+        }
+        match latest {
+            Some((run_id, run_dir)) if run_dir.join("result.json").exists() => {
+                // Evidence for an orphan: its worktree (isolated, so git status
+                // is exactly the worker's diff) when present, else the workspace's
+                // own git status (an orphan froze the tree at the crash, so its
+                // status is real evidence, not the worker's self-report). `None`
+                // only when neither is a git repo, in which case the evaluator
+                // fails closed.
+                let wt = run_worktree(&run_dir).filter(|w| w.exists());
+                let run_record = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")).ok();
+                // A stranded parallel run mirrors the batch finalize: the
+                // parallel-integration receipt captured before worker spawn
+                // separates dispatcher-owned input overlays from worker
+                // evidence, and a seeded copy without a matching receipt
+                // digest has no provenance, so evidence fails closed (issue
+                // #32). Serial and legacy runs keep the seed-diff path.
+                let parallel_direct = run_record.as_ref().is_some_and(|record| {
+                    !record.serial_isolated
+                        && record.integration_provenance
+                            == IntegrationProvenance::ParallelWorkerDirect
+                });
+                let mut parallel_core_input_overlays: Vec<state::SerialInputOverlay> = Vec::new();
+                let mut parallel_dependency_input_overlays: Vec<state::DependencyInputOverlay> =
+                    Vec::new();
+                let mut overlay_failure = None;
+                let serial_evidence = wt
+                    .as_ref()
+                    .filter(|_| !parallel_direct)
+                    .and_then(|w| serial_worktree_evidence(ws, w, &run_dir, &mut overlay_failure));
+                if let Some(reason) = overlay_failure.as_ref() {
+                    msgs.push(format!(
+                        "{id}: change evidence unavailable during recovery: {reason}"
+                    ));
+                }
+                let evidence = match wt.as_ref() {
+                    Some(w) if parallel_direct => {
+                        match crate::parallel::parallel_worker_evidence(&ws.root, w, &run_dir) {
+                            Ok(worker_evidence) => {
+                                parallel_core_input_overlays = worker_evidence.core_input_overlays;
+                                parallel_dependency_input_overlays =
+                                    worker_evidence.dependency_input_overlays;
+                                Some(worker_evidence.paths)
+                            }
+                            Err(error) => {
+                                msgs.push(format!(
+                                    "{id}: change evidence unavailable after harness seed \
+                                     comparison: {error}"
+                                ));
+                                None
+                            }
+                        }
+                    }
+                    Some(_) => serial_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.paths.clone()),
+                    // No worktree: the workspace git status is the evidence,
+                    // but it also carries Yardlet's OWN canonical-state
+                    // writes (it wrote the queue when it marked this task
+                    // Running). With no pre-run baseline those cannot be
+                    // attributed to the worker, so drop them rather than
+                    // false-fail the canonical-state gate on Yardlet's own
+                    // writes.
+                    None => evaluator::changed_paths(&ws.root).map(|paths| {
+                        paths
+                            .into_iter()
+                            .filter(|p| !evaluator::is_canonical_state_path(p))
+                            .collect()
+                    }),
+                };
+                // Mark this orphan run finalized so a later pass won't
+                // re-evaluate it (a persistent failure must not loop).
+                let _ = std::fs::remove_file(run_dir.join("worker.pid"));
+                let Some(task) = q.tasks.iter().find(|t| t.id == id).cloned() else {
+                    continue;
+                };
+                // Finalize through the shared pipeline: evaluate the stranded
+                // result, merge a Done worktree back (conflict -> Partial,
+                // worktree kept), and commit the state. Recovery flags keep it
+                // to just that — no re-emitted artifacts/telemetry/hooks.
+                let branch = run_record
+                    .as_ref()
+                    .map(|record| record.worktree_branch.clone())
+                    .filter(|branch| !branch.is_empty())
+                    .unwrap_or_else(|| format!("yard/{}", id.to_lowercase()));
+                let baseline_oid = run_record
+                    .as_ref()
+                    .map(|record| record.baseline_oid.clone())
+                    .unwrap_or_default();
+                let integration_enabled = !run_record
+                    .as_ref()
+                    .is_some_and(|record| record.serial_isolated)
+                    || ws.load_config().is_ok_and(|config| config.auto_commit);
+                let merge = wt.as_ref().map(|w| MergeBack {
+                    wt_path: w.as_path(),
+                    branch: branch.as_str(),
+                    baseline_oid: baseline_oid.as_str(),
+                    expected_tip_oid: serial_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.merge_target_oid.as_str()),
+                    core_input_overlays: if parallel_direct {
+                        parallel_core_input_overlays.as_slice()
+                    } else {
+                        serial_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.core_input_overlays.as_slice())
+                            .unwrap_or(&[])
+                    },
+                    dependency_input_overlays: if parallel_direct {
+                        parallel_dependency_input_overlays.as_slice()
+                    } else {
+                        serial_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.dependency_input_overlays.as_slice())
+                            .unwrap_or(&[])
+                    },
+                    provenance: recovery_integration_provenance(
+                        ws,
+                        run_record.as_ref(),
+                        &run_id,
+                        &id,
+                        w,
+                        &branch,
+                    ),
+                    auto_commit: integration_enabled,
+                });
+                // Attribute the salvaged telemetry to the worker that actually
+                // ran it (recorded in run.yaml), not an empty string.
+                let recovered_worker = run_worker(&run_dir).unwrap_or_default();
+                match finalize_run(FinalizeInput {
+                    ws,
+                    run_dir: &run_dir,
+                    run_id: &run_id,
+                    task: &task,
+                    evidence,
+                    worker_id: &recovered_worker,
+                    reason: "recovery",
+                    wall_seconds: 0,
+                    user_override: None,
+                    intent_summary: "",
+                    billing: &billing,
+                    queue: &mut q,
+                    flags: FinalizeFlags::recovery(),
+                    merge,
+                }) {
+                    Ok(report) => {
+                        // Surface only the task-prefixed merge lines; the generic
+                        // eval/ingest lines would clutter the recovery summary.
+                        for line in report.lines {
+                            if line.starts_with(&format!("{id}: ")) {
+                                msgs.push(line);
+                            }
+                        }
+                        finished.push(task_state_progress_line(event_lang, &id, report.next_state));
+                    }
+                    Err(e) => msgs.push(format!("{id}: recovery finalize error: {e}")),
+                }
+            }
+            run => {
+                // Worker still alive: adopt it — its original session keeps
+                // working; the result lands in the run dir and the next
+                // recovery pass evaluates it.
+                if let Some((_, run_dir)) = &run {
+                    if let Some(pid) = live_worker_pid(run_dir) {
+                        msgs.push(format!(
+                            "adopted: {id} still running from a previous session (pid {pid})"
+                        ));
+                        continue;
+                    }
+                }
+                let consumed_incident = run.as_ref().and_then(|(_, run_dir)| {
+                    load_output_contract_incident(run_dir)
+                        .filter(|incident| incident.recovery_consumed)
+                });
+                if let (Some((run_id, run_dir)), Some(incident)) = (run.as_ref(), consumed_incident)
+                {
+                    // The one-shot recovery budget was consumed before the
+                    // orchestrator died. Never requeue this resultless orphan:
+                    // doing so would create an unbounded third worker attempt.
+                    if let Some(wt) = run_worktree(run_dir).filter(|w| w.exists()) {
+                        let branch = format!("yard/{}", id.to_lowercase());
+                        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+                    }
+                    let detail =
+                        "provider_response_refused recovery was already consumed; orphan parked NeedsUser";
+                    let _ = save_task_state_on_latest_queue(
+                        ws,
+                        &mut q,
+                        &id,
+                        TaskState::NeedsUser,
+                        TransitionCause::Recover,
+                        detail,
+                        TransitionActor::System,
+                    );
+                    if let Some(task) = q.tasks.iter().find(|task| task.id == id).cloned() {
+                        let worker =
+                            run_worker(run_dir).unwrap_or_else(|| incident.worker_id.clone());
+                        seal_run_record(
+                            run_dir,
+                            run_id,
+                            &task,
+                            &q.intent_id,
+                            &worker,
+                            TaskState::NeedsUser,
+                            None,
+                        );
+                    }
+                    let question = "provider_response_refused가 감지된 뒤 동일 worker의 1회 output-contract 복구가 소비된 상태에서 실행이 중단되었습니다. worker/provider 응답을 확인한 뒤 이 작업을 어떻게 진행할지 알려주세요.";
+                    let context = channel_run_context(ws, &q.intent_id, &id);
+                    if let Err(error) = persist_needs_user_question(
+                        ws,
+                        None,
+                        &context,
+                        run_dir,
+                        question,
+                        EventActorKind::System,
+                    ) {
+                        msgs.push(format!(
+                            "{id}: could not persist recovery question: {error}"
+                        ));
+                    }
+                    let _ = append_output_contract_incident_note(run_dir, &incident);
+                    let _ = std::fs::remove_file(run_dir.join("worker.pid"));
+                    finished.push(task_state_progress_line(
+                        event_lang,
+                        &id,
+                        TaskState::NeedsUser,
+                    ));
+                    continue;
+                }
+                // Dead with no result: redo from scratch; drop the worktree and
+                // SEAL the stranded run record (it was left stuck `running`) so a
+                // later recovery pass does not re-detect it as an abandoned run.
+                if let Some((run_id, run_dir)) = run {
+                    if let Some(wt) = run_worktree(&run_dir).filter(|w| w.exists()) {
+                        let branch = format!("yard/{}", id.to_lowercase());
+                        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+                    }
+                    if let Some(t) = q.tasks.iter().find(|t| t.id == id).cloned() {
+                        let worker = run_worker(&run_dir).unwrap_or_default();
+                        seal_run_record(
+                            &run_dir,
+                            &run_id,
+                            &t,
+                            &q.intent_id,
+                            &worker,
+                            TaskState::Failed,
+                            None,
+                        );
+                    }
+                    let _ = std::fs::remove_file(run_dir.join("worker.pid"));
+                }
+                // Re-read and mutate under the permanent workspace lock. A
+                // concurrent add or planning confirm can never be overwritten by
+                // this recovery pass's start-of-loop snapshot.
+                let _ = save_task_state_on_latest_queue(
+                    ws,
+                    &mut q,
+                    &id,
+                    TaskState::Queued,
+                    TransitionCause::Recover,
+                    "dead orphan worker had no result; task requeued",
+                    TransitionActor::System,
+                );
+                requeued.push(id.clone());
+            }
+        }
+    }
+    if !finished.is_empty() || !requeued.is_empty() {
+        if !finished.is_empty() {
+            msgs.push(format!(
+                "recovered completed run(s): {}",
+                finished.join(", ")
+            ));
+        }
+        if !requeued.is_empty() {
+            msgs.push(format!(
+                "requeued interrupted task(s): {}",
+                requeued.join(", ")
+            ));
+        }
+    }
+    msgs
+}
+
+fn git_finish_recovery_needed(ws: &Workspace, run_dir: &std::path::Path) -> bool {
+    if let Ok(record) = ws.load_git_finish_record(run_dir) {
+        return record.policy.auto_push
+            && (record.status.recoverable()
+                || record.status == crate::git_finish::GitFinishStatus::NotNeeded);
+    }
+    state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .is_some_and(|record| !record.integration_oid.is_empty())
+}
+
+fn git_finish_projection_recovery_needed(ws: &Workspace, run_dir: &std::path::Path) -> bool {
+    let unsealed = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .is_some_and(|record| record.completed_at.is_none());
+    unsealed
+        && ws
+            .load_git_finish_record(run_dir)
+            .ok()
+            .is_some_and(|record| record.policy.auto_push && record.status.verified_complete())
+}
+
+pub(crate) fn find_worker<'a>(workers: &'a [WorkerProfile], id: &str) -> Result<&'a WorkerProfile> {
+    workers
+        .iter()
+        .find(|w| w.id == id)
+        .ok_or_else(|| anyhow!("worker '{id}' is not defined in .agents/workers.yaml"))
+}
+
+pub(crate) fn save_task_state_on_latest_queue(
+    ws: &Workspace,
+    fallback_queue: &mut WorkQueue,
+    task_id: &str,
+    state: TaskState,
+    cause: TransitionCause,
+    detail: &str,
+    actor: TransitionActor,
+) -> Result<()> {
+    let lock = ws.acquire_planning_lock()?;
+    save_task_state_on_latest_queue_locked(
+        ws,
+        &lock,
+        fallback_queue,
+        task_id,
+        state,
+        cause,
+        detail,
+        actor,
+    )
+}
+
+// Mirrors the unlocked wrapper while accepting its already-held transaction
+// guard. Keeping the transition fields explicit avoids constructing a second
+// transaction input that could accidentally be reused outside this lock.
+#[allow(clippy::too_many_arguments)]
+fn save_task_state_on_latest_queue_locked(
+    ws: &Workspace,
+    lock: &PlanningLock,
+    fallback_queue: &mut WorkQueue,
+    task_id: &str,
+    state: TaskState,
+    cause: TransitionCause,
+    detail: &str,
+    actor: TransitionActor,
+) -> Result<()> {
+    finalize_on_latest_queue_locked(
+        ws,
+        lock,
+        fallback_queue,
+        task_id,
+        state,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        cause,
+        detail,
+        actor,
+    )
+    .map(|_| ())
+}
+
+/// Re-point a finished review at the queue (1c review auto-remediation): set its
+/// state and, for a soft re-verify (`fix_ids` non-empty, re-queued `Queued`),
+/// re-sequence it to run just AFTER the remediation fixes by PRIORITY — never a
+/// hard `depends_on` edge. A hard edge deadlocks: `deps_met` only clears on Done,
+/// so a fix that fails / is deferred / is title-deduped would strand the review
+/// forever. With soft ordering the fixes run first by priority; if one never
+/// reaches Done it simply leaves the Queued set and the review re-verifies anyway,
+/// and the task's persisted feedback cap bounds the fix+re-verify loop ("try hard,
+/// then ask"). Re-reads the latest queue first so a concurrent change is not
+/// clobbered.
+/// Of the just-ingested follow-up ids, those that are schedulable remediation:
+/// `Queued` and dependency-satisfied. Approval is intentionally not part of
+/// this filter. An approval-gated fix must remain linked to the review so the
+/// review cannot re-run against unchanged code while approval is pending. An
+/// off-vocabulary fix parked `Blocked`, a `Deferred` one, or a `Queued` fix with
+/// unmet dependencies is excluded. When this is empty the review surfaces to
+/// the user instead.
+fn schedulable_remediation_ids(queue: &WorkQueue, ingested: &[String]) -> Vec<String> {
+    ingested
+        .iter()
+        .filter(|id| {
+            queue
+                .tasks
+                .iter()
+                .any(|t| &t.id == *id && t.state == TaskState::Queued && queue.deps_met(t))
+        })
+        .cloned()
+        .collect()
+}
+
+fn dedup_review_follow_ups(follow_ups: &mut Vec<crate::schemas::FollowUpTask>, queue: &WorkQueue) {
+    follow_ups.retain(|fu| {
+        !queue
+            .tasks
+            .iter()
+            .any(|t| t.title.trim().eq_ignore_ascii_case(fu.title.trim()))
+    });
+}
+
+pub(crate) fn requeue_review(
+    ws: &Workspace,
+    fallback_queue: &mut WorkQueue,
+    review_id: &str,
+    state: TaskState,
+    fix_ids: &[String],
+) -> Result<()> {
+    let lock = ws.acquire_planning_lock()?;
+    requeue_review_locked(ws, &lock, fallback_queue, review_id, state, fix_ids)
+}
+
+fn requeue_review_locked(
+    ws: &Workspace,
+    lock: &PlanningLock,
+    fallback_queue: &mut WorkQueue,
+    review_id: &str,
+    state: TaskState,
+    fix_ids: &[String],
+) -> Result<()> {
+    let mut latest = ws.load_queue().unwrap_or_else(|_| fallback_queue.clone());
+    let mut pending_transition = None;
+    if state == TaskState::Queued && !fix_ids.is_empty() {
+        // Lowest priority among the other queued tasks: pull the fixes just below
+        // it (run first) and slot the review between the fixes and the rest, so
+        // the selector runs every fix before re-verifying. Equal-priority fixes
+        // tie-break by queue order, preserving the reviewer's proposal order.
+        let front = latest
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Queued && t.id != review_id)
+            .map(|t| t.priority)
+            .min()
+            .unwrap_or(0);
+        for t in latest.tasks.iter_mut() {
+            if fix_ids.iter().any(|f| f == &t.id) {
+                t.priority = front - 20;
+                t.add_remediation_for(review_id);
+            }
+        }
+        if let Some(t) = latest.tasks.iter_mut().find(|t| t.id == review_id) {
+            let from = t.state;
+            t.state = state;
+            if state != TaskState::NeedsUser {
+                t.set_needs_user_origin(None);
+            }
+            t.priority = front - 10;
+            if from != state {
+                pending_transition = Some(state::transition(
+                    review_id,
+                    from,
+                    state,
+                    TransitionCause::RunOutcome,
+                    "review failed; requeued behind runnable remediation",
+                    TransitionActor::System,
+                ));
+            }
+        }
+    } else if let Some(t) = latest.tasks.iter_mut().find(|t| t.id == review_id) {
+        let from = t.state;
+        t.state = state;
+        if state != TaskState::NeedsUser {
+            t.set_needs_user_origin(None);
+        }
+        if from != state {
+            pending_transition = Some(state::transition(
+                review_id,
+                from,
+                state,
+                TransitionCause::RunOutcome,
+                "review failed with no runnable fix; paused for user",
+                TransitionActor::System,
+            ));
+        }
+    }
+    ws.save_queue_locked(lock, &latest)?;
+    if let Some(transition) = pending_transition {
+        state::append_transition(ws, transition)?;
+    }
+    *fallback_queue = latest;
+    Ok(())
+}
+
+/// Re-read the latest on-disk queue, set the finished task's state, ingest any
+/// worker-proposed follow-up tasks, and save once. Re-reading first means a
+/// change made since the run started is not clobbered by a stale start-of-run
+/// copy; folding the state update and follow-up ingestion into one write keeps
+/// Yardlet the sole queue writer (propose -> ingest). Returns the ids of the
+/// follow-up tasks ingested.
+// The single canonical "settle a task on the latest queue" path: it needs the
+// full run context (identity, scope, follow-ups, worker vocab) plus the typed
+// transition record (cause/detail/actor). Bundling would just scatter one
+// cohesive call, so keep the args explicit.
+#[allow(clippy::too_many_arguments)]
+fn finalize_on_latest_queue_locked(
+    ws: &Workspace,
+    lock: &PlanningLock,
+    fallback_queue: &mut WorkQueue,
+    task_id: &str,
+    state: TaskState,
+    intent_allowed_scope: &[String],
+    follow_ups: &[crate::schemas::FollowUpTask],
+    governing: Option<&crate::schemas::ResolvedWorkerSelection>,
+    workers: Option<&WorkersFile>,
+    needs_user_origin: Option<crate::schemas::NeedsUserOrigin>,
+    cause: TransitionCause,
+    detail: &str,
+    actor: TransitionActor,
+) -> Result<Vec<String>> {
+    // Ground any just-ingested follow-up's capabilities against the real
+    // workers before saving: a follow-up requiring a capability no worker has is
+    // parked Blocked at ingest, not crashed into when the drain later picks it.
+    let reconcile = |q: &mut WorkQueue, ingested: &[String]| {
+        if let Some(w) = workers {
+            let _ = crate::planner::reconcile_queue_capabilities_for_ids(q, w, ingested);
+        }
+    };
+    let mut latest = ws.load_queue().unwrap_or_else(|_| fallback_queue.clone());
+    if let Some(t) = latest.tasks.iter_mut().find(|t| t.id == task_id) {
+        let from = t.state;
+        t.state = state;
+        // The typed marker mirrors the CURRENT hold only: set on a NeedsUser
+        // settle, cleared on any other transition so a later, unrelated pause
+        // is never misread as feedback-exhausted.
+        t.set_needs_user_origin(if state == TaskState::NeedsUser {
+            needs_user_origin
+        } else {
+            None
+        });
+        if let Some(selection) = governing {
+            apply_selection_to_task(t, selection);
+        }
+        let ingested = if let Some(governing) = governing {
+            match crate::planner::ingest_follow_ups_with_governing(
+                &mut latest,
+                intent_allowed_scope,
+                follow_ups,
+                Some(ws),
+                governing,
+            ) {
+                Ok(ingested) => ingested,
+                Err(error) => {
+                    // Governing ingestion is atomic, so a rejected follow-up
+                    // left `latest` with only the run outcome applied. Preserve
+                    // that durable outcome and its transition before surfacing
+                    // the fail-closed lineage error.
+                    ws.save_queue_locked(lock, &latest)?;
+                    if from != state {
+                        state::append_transition(
+                            ws,
+                            state::transition(task_id, from, state, cause, detail, actor.clone()),
+                        )?;
+                    }
+                    *fallback_queue = latest;
+                    return Err(error);
+                }
+            }
+        } else {
+            crate::planner::ingest_follow_ups(
+                &mut latest,
+                intent_allowed_scope,
+                follow_ups,
+                Some(ws),
+            )
+        };
+        reconcile(&mut latest, &ingested);
+        ws.save_queue_locked(lock, &latest)?;
+        crate::planner::persist_ingested_decision_questions(ws, &latest, &ingested)?;
+        if from != state {
+            state::append_transition(
+                ws,
+                state::transition(task_id, from, state, cause, detail, actor.clone()),
+            )?;
+        }
+        append_ingested_decision_transitions(ws, &latest, &ingested)?;
+        *fallback_queue = latest;
+        return Ok(ingested);
+    }
+
+    if latest.tasks.is_empty() && latest.intent_id.is_empty() {
+        let mut bootstrapped = fallback_queue.clone();
+        let task = bootstrapped
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| anyhow!("task {task_id} is missing from fallback queue"))?;
+        let from = task.state;
+        task.state = state;
+        if let Some(selection) = governing {
+            apply_selection_to_task(task, selection);
+        }
+        let ingested = if let Some(governing) = governing {
+            match crate::planner::ingest_follow_ups_with_governing(
+                &mut bootstrapped,
+                intent_allowed_scope,
+                follow_ups,
+                Some(ws),
+                governing,
+            ) {
+                Ok(ingested) => ingested,
+                Err(error) => {
+                    // Match the normal latest-queue path: reject the follow-up
+                    // without losing the governing task's evaluated outcome.
+                    ws.save_queue_locked(lock, &bootstrapped)?;
+                    if from != state {
+                        state::append_transition(
+                            ws,
+                            state::transition(task_id, from, state, cause, detail, actor),
+                        )?;
+                    }
+                    *fallback_queue = bootstrapped;
+                    return Err(error);
+                }
+            }
+        } else {
+            crate::planner::ingest_follow_ups(
+                &mut bootstrapped,
+                intent_allowed_scope,
+                follow_ups,
+                Some(ws),
+            )
+        };
+        reconcile(&mut bootstrapped, &ingested);
+        ws.save_queue_locked(lock, &bootstrapped)?;
+        crate::planner::persist_ingested_decision_questions(ws, &bootstrapped, &ingested)?;
+        if from != state {
+            state::append_transition(
+                ws,
+                state::transition(task_id, from, state, cause, detail, actor),
+            )?;
+        }
+        append_ingested_decision_transitions(ws, &bootstrapped, &ingested)?;
+        *fallback_queue = bootstrapped;
+        return Ok(ingested);
+    }
+    anyhow::bail!(
+        "queue_transaction_conflict: task {task_id} vanished from the latest queue during finalization"
+    )
+}
+
+fn append_ingested_decision_transitions(
+    ws: &Workspace,
+    queue: &WorkQueue,
+    ingested: &[String],
+) -> Result<()> {
+    for id in ingested {
+        if let Some(task) = queue
+            .tasks
+            .iter()
+            .find(|t| &t.id == id && t.state == TaskState::NeedsUser)
+        {
+            state::append_transition(
+                ws,
+                state::transition(
+                    &task.id,
+                    TaskState::Queued,
+                    TaskState::NeedsUser,
+                    TransitionCause::DecisionSeed,
+                    "seeded worker-proposed human decision as a NeedsUser question",
+                    TransitionActor::System,
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Per-path divergences in the finalization pipeline. The serial path runs
+/// every step; parallel skips the in-place-only gates (hooks/validation/
+/// conversation/learned); recovery skips artifacts/telemetry too. Slice 1
+/// wires the serial path only — the flags exist so a later slice can flip
+/// them for parallel/recovery without re-deriving the pipeline.
+pub(crate) struct FinalizeFlags {
+    pub post_hooks: bool,
+    pub validation: bool,
+    pub conversation: bool,
+    pub learned: bool,
+    pub artifacts: bool,
+    pub telemetry: bool,
+    /// Reconcile a previously integrated run whose exact OID may sit behind
+    /// later integrations. The run's durable ownership proof remains immutable.
+    pub git_finish_recovery: bool,
+    /// Repair only the stale run projection of a queue task that is already
+    /// Done with a verified Git-finish record. Re-evaluation may add diagnostics,
+    /// but it cannot regress the canonical queue state or verified finish fact.
+    pub repairs_done_projection: bool,
+    /// Ingest worker-proposed follow-ups AND run review auto-remediation (both
+    /// rewrite queue topology from the worker's proposals). Off for recovery,
+    /// which must only finalize the stranded run, not mutate the queue graph.
+    pub follow_ups: bool,
+}
+
+impl FinalizeFlags {
+    /// The serial path runs the full finalization pipeline.
+    pub fn serial() -> Self {
+        Self {
+            post_hooks: true,
+            validation: true,
+            conversation: true,
+            learned: true,
+            artifacts: true,
+            telemetry: true,
+            git_finish_recovery: false,
+            repairs_done_projection: false,
+            follow_ups: true,
+        }
+    }
+
+    /// The parallel path runs validation in the isolated worktree before merge,
+    /// preserving the same fatal gate and channel events as serial execution.
+    /// Post-run hooks remain deferred because they may rely on workspace-local
+    /// dependencies. Conversation/learned are skipped (batches only pick Queued
+    /// tasks). Artifacts, telemetry, and follow-up ingestion land.
+    pub fn parallel() -> Self {
+        Self {
+            post_hooks: false,
+            validation: true,
+            conversation: false,
+            learned: false,
+            artifacts: true,
+            telemetry: true,
+            git_finish_recovery: false,
+            repairs_done_projection: false,
+            follow_ups: true,
+        }
+    }
+
+    /// Recovery salvages an interrupted run: re-evaluate its stranded result,
+    /// merge a Done worktree back, and commit the state. Artifacts/hooks/
+    /// validation stay off, and follow-up ingestion + review auto-remediation are
+    /// OFF too — recovery must NOT mutate the queue graph (re-queue a review, add
+    /// dependency edges, ingest new tasks) during a crash-recovery pass; it only
+    /// finalizes the one stranded run. Telemetry IS emitted (labeled `reason:
+    /// recovery`, attributed to the run.yaml worker) so the trust report does not
+    /// undercount salvaged tasks.
+    pub fn recovery() -> Self {
+        Self {
+            post_hooks: false,
+            validation: false,
+            conversation: false,
+            learned: false,
+            artifacts: false,
+            telemetry: true,
+            git_finish_recovery: true,
+            repairs_done_projection: false,
+            follow_ups: false,
+        }
+    }
+
+    pub fn done_projection_recovery() -> Self {
+        Self {
+            repairs_done_projection: true,
+            ..Self::recovery()
+        }
+    }
+}
+
+/// A worker's isolated worktree to merge back into the main workspace when its
+/// run lands Done. Set by isolated serial, parallel, and recovery paths.
+pub(crate) struct MergeBack<'a> {
+    pub wt_path: &'a std::path::Path,
+    pub branch: &'a str,
+    pub baseline_oid: &'a str,
+    /// Exact run-owned branch tip whose committed diff was evaluated. When
+    /// present, integration fails closed if the branch moved after evidence
+    /// collection. Parallel and legacy runs without this binding pass None.
+    pub expected_tip_oid: Option<&'a str>,
+    /// Dispatcher-owned tracked inputs that were present in this serial
+    /// worktree during validation. They are neither worker evidence nor
+    /// integration candidates while their exact digest still matches.
+    pub core_input_overlays: &'a [state::SerialInputOverlay],
+    /// Resolved dependency outputs the core materialized before worker spawn.
+    /// While their exact digest still matches they are upstream-authored
+    /// validation inputs, not worker evidence (issue #21).
+    pub dependency_input_overlays: &'a [state::DependencyInputOverlay],
+    /// Selects the integration protocol. Serial core-staged runs may use their
+    /// trusted transaction record; parallel worker-direct runs never load it.
+    pub provenance: IntegrationProvenance,
+    /// Serial runs obey the default-off auto_commit gate. Parallel batches
+    /// already require integration and therefore pass true.
+    pub auto_commit: bool,
+}
+
+/// Everything one finished worker run needs to turn its raw output into
+/// committed state. `evidence` is computed by the caller because the serial
+/// (fingerprint-diff) and parallel (worktree status) paths derive it
+/// differently; finalize_run evaluates from it.
+pub(crate) struct FinalizeInput<'a> {
+    pub ws: &'a Workspace,
+    pub run_dir: &'a std::path::Path,
+    pub run_id: &'a str,
+    pub task: &'a crate::schemas::Task,
+    pub evidence: Option<Vec<String>>,
+    pub worker_id: &'a str,
+    pub reason: &'a str,
+    pub wall_seconds: u64,
+    pub user_override: Option<String>,
+    pub intent_summary: &'a str,
+    pub billing: &'a crate::schemas::BillingPolicy,
+    pub queue: &'a mut WorkQueue,
+    pub flags: FinalizeFlags,
+    /// When the run lands Done, merge this worktree back (parallel/recovery). A
+    /// conflict downgrades the task to Partial and keeps the worktree.
+    pub merge: Option<MergeBack<'a>>,
+}
+
+pub(crate) struct FinalizeReport {
+    pub next_state: TaskState,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FeedbackRecord {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub task_id: String,
+    pub intent_id: String,
+    pub cycle: u32,
+    pub max_cycles: u32,
+    pub retryable: bool,
+    pub failures: Vec<String>,
+    pub unmet_acceptance: Vec<String>,
+    pub terminal_reason: String,
+    #[serde(default)]
+    pub question_for_user: Option<String>,
+}
+
+fn prior_feedback_cycles(
+    ws: &Workspace,
+    task_id: &str,
+    intent_id: &str,
+    current_run_id: &str,
+) -> u32 {
+    let Ok(entries) = std::fs::read_dir(ws.runs_dir()) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let name = dir.file_name()?.to_str()?;
+            if name == current_run_id {
+                return None;
+            }
+            let raw = std::fs::read_to_string(dir.join("feedback.json")).ok()?;
+            serde_json::from_str::<FeedbackRecord>(&raw).ok()
+        })
+        .filter(|f| f.task_id == task_id && f.intent_id == intent_id && f.retryable)
+        .map(|f| f.cycle)
+        .max()
+        .unwrap_or(0)
+}
+
+fn validation_failure_details(run_dir: &std::path::Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(run_dir.join("validation.json")) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|cmd| !cmd.get("passed").and_then(|v| v.as_bool()).unwrap_or(false))
+        .map(|cmd| {
+            let log = cmd.get("log").and_then(|v| v.as_str()).unwrap_or("");
+            let mut detail = format!(
+                "validation command `{}` failed (exit_code={}, timed_out={}, log={})",
+                cmd.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                cmd.get("exit_code")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "null".to_string()),
+                cmd.get("timed_out")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                log
+            );
+            if let Ok(output) = std::fs::read_to_string(run_dir.join(log)) {
+                let output = output.trim();
+                if !output.is_empty() {
+                    let mut excerpt = output.to_string();
+                    if excerpt.len() > 2048 {
+                        let mut end = 2048;
+                        while !excerpt.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        excerpt.truncate(end);
+                    }
+                    detail.push_str(&format!("; output: {excerpt}"));
+                }
+            }
+            detail
+        })
+        .collect()
+}
+
+pub(crate) fn feedback_for_run(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    run_id: &str,
+    intent_id: &str,
+    task: &crate::schemas::Task,
+    eval: &evaluator::Evaluation,
+    result: Option<&RunResult>,
+) -> Option<FeedbackRecord> {
+    if !matches!(eval.next_task_state, TaskState::Failed | TaskState::Partial) {
+        return None;
+    }
+
+    let failed_checks: Vec<&evaluator::Check> = eval
+        .checks
+        .iter()
+        .filter(|c| c.fatal && !c.passed)
+        .collect();
+    let retryable_check = |name: &str| {
+        matches!(
+            name,
+            "result_file_present"
+                | "result_schema_valid"
+                | "handoff_present"
+                | "ids_match"
+                | "validation"
+                | "reported_validation"
+                | "review_verdict_present"
+                | "review_criteria_pass"
+        )
+    };
+    let retryable = task.injects_failed_checks()
+        && (eval.next_task_state == TaskState::Partial
+            || (!failed_checks.is_empty()
+                && failed_checks.iter().all(|c| retryable_check(&c.name))));
+
+    let mut failures: Vec<String> = failed_checks
+        .iter()
+        .map(|c| format!("{}: {}", c.name, c.note))
+        .collect();
+    failures.extend(validation_failure_details(run_dir));
+    if failures.is_empty() {
+        failures.push(
+            result
+                .map(|r| format!("worker ended {}: {}", r.status, r.compact_summary.trim()))
+                .unwrap_or_else(|| "worker did not complete the output contract".to_string()),
+        );
+    }
+    failures.sort();
+    failures.dedup();
+
+    let mut unmet_acceptance = Vec::new();
+    if let Some(r) = result {
+        for verdict in r.verdict.iter().filter(|v| !v.pass) {
+            let mut text = format!("{}: {}", verdict.criterion_id, verdict.evidence.trim());
+            if let Some(index) = verdict
+                .criterion_id
+                .strip_prefix("AC-")
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1))
+            {
+                if let Some(statement) = task.acceptance.get(index).and_then(|v| v.as_str()) {
+                    text.push_str(&format!(" | acceptance: {statement}"));
+                }
+            }
+            unmet_acceptance.push(text);
+        }
+    }
+    if unmet_acceptance.is_empty()
+        && failed_checks.iter().any(|c| {
+            matches!(
+                c.name.as_str(),
+                "review_verdict_present" | "review_criteria_pass"
+            )
+        })
+    {
+        unmet_acceptance.extend(
+            task.acceptance
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+    }
+    if let Some(condition) = task
+        .goal
+        .as_ref()
+        .map(|g| g.condition.trim())
+        .filter(|s| !s.is_empty())
+    {
+        unmet_acceptance.push(format!("goal condition: {condition}"));
+    }
+    unmet_acceptance.sort();
+    unmet_acceptance.dedup();
+
+    let prior = prior_feedback_cycles(ws, &task.id, intent_id, run_id);
+    let cycle = prior.saturating_add(1);
+    let max_cycles = task.max_feedback_cycles();
+    let terminal_reason = if !retryable {
+        "failure is not safe for automatic retry".to_string()
+    } else if cycle > max_cycles {
+        format!("feedback retry cap exceeded ({max_cycles})")
+    } else {
+        String::new()
+    };
+    let mut feedback = FeedbackRecord {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        task_id: task.id.clone(),
+        intent_id: intent_id.to_string(),
+        cycle,
+        max_cycles,
+        retryable,
+        failures,
+        unmet_acceptance,
+        terminal_reason,
+        question_for_user: None,
+    };
+    if !feedback.retryable || feedback.cycle > feedback.max_cycles {
+        feedback.question_for_user = Some(feedback_question(task, &feedback));
+    }
+    Some(feedback)
+}
+
+pub(crate) fn feedback_next_state(feedback: &FeedbackRecord) -> TaskState {
+    if feedback.retryable && feedback.cycle <= feedback.max_cycles {
+        TaskState::Partial
+    } else if feedback
+        .question_for_user
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|question| !question.is_empty())
+    {
+        TaskState::NeedsUser
+    } else {
+        TaskState::Failed
+    }
+}
+
+/// Typed origin for a task settling NeedsUser out of run finalization. A
+/// worker-authored question is a genuine conversation (`WorkerQuestion`,
+/// `yardlet answer`-only). A System question synthesized by the terminal
+/// goal-feedback loop marks the approach itself as failed
+/// (`GoalFeedbackExhausted`, same-intent replan eligible). Any other System
+/// pause (provider refusal, fallback question) stays untyped.
+pub(crate) fn needs_user_origin_for_finalize(
+    question_actor: EventActorKind,
+    feedback_terminal_needs_user: bool,
+) -> Option<crate::schemas::NeedsUserOrigin> {
+    match question_actor {
+        EventActorKind::Worker => Some(crate::schemas::NeedsUserOrigin::WorkerQuestion),
+        EventActorKind::System if feedback_terminal_needs_user => {
+            Some(crate::schemas::NeedsUserOrigin::GoalFeedbackExhausted)
+        }
+        _ => None,
+    }
+}
+
+fn feedback_question(task: &crate::schemas::Task, feedback: &FeedbackRecord) -> String {
+    let detail = feedback
+        .unmet_acceptance
+        .first()
+        .or_else(|| feedback.failures.first())
+        .map(|detail| detail.trim().chars().take(240).collect::<String>())
+        .filter(|detail| !detail.is_empty());
+    match detail {
+        Some(detail) => format!(
+            "`{}` 작업을 자동으로 완료하지 못했습니다. 확인이 필요한 근거는 `{detail}`입니다. 어떤 방식으로 진행할까요?",
+            task.id
+        ),
+        None => format!(
+            "`{}` 작업을 자동으로 완료하지 못했습니다. 어떤 방식으로 진행할까요?",
+            task.id
+        ),
+    }
+}
+
+/// Why a review run ended without a usable pass. These are different events for
+/// the operator: a failing verdict is review evidence to act on, while missing
+/// artifacts mean no verdict exists at all and the only next step is a re-run
+/// (issue #39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewFailureCause {
+    /// The review ran and judged at least one criterion as failing.
+    VerdictFailed,
+    /// The worker exited without writing (or writing a valid) result.json.
+    ArtifactsMissing,
+}
+
+fn review_failure_cause(eval: &evaluator::Evaluation) -> ReviewFailureCause {
+    let artifacts_missing = eval.checks.iter().any(|check| {
+        check.fatal
+            && !check.passed
+            && matches!(
+                check.name.as_str(),
+                "result_file_present" | "result_schema_valid"
+            )
+    });
+    if artifacts_missing {
+        ReviewFailureCause::ArtifactsMissing
+    } else {
+        ReviewFailureCause::VerdictFailed
+    }
+}
+
+fn review_without_remediation_question(
+    task: &crate::schemas::Task,
+    cause: ReviewFailureCause,
+    incident: Option<&OutputContractIncident>,
+) -> String {
+    match cause {
+        ReviewFailureCause::VerdictFailed => format!(
+            "`{}` 리뷰가 통과하지 못했고 실행 가능한 수정 작업이 없습니다. 수정 작업을 큐에 추가한 뒤 리뷰를 재실행하거나 현재 판정을 수동으로 확정해 주세요. 어느 조치로 이어갈까요?",
+            task.id
+        ),
+        ReviewFailureCause::ArtifactsMissing => {
+            let detail = match incident.map(|incident| incident.cause) {
+                Some(OutputContractCause::WorkerDeferredToBackgroundTask) => {
+                    " 워커가 백그라운드 작업을 남긴 채 턴을 끝낸 것이 원인입니다."
+                }
+                Some(OutputContractCause::ProviderResponseRefused) => {
+                    " provider가 응답을 거부한 것이 원인입니다."
+                }
+                None => "",
+            };
+            format!(
+                "`{}` 리뷰 워커가 결과 파일 없이 종료되어 판정 자체가 없습니다. 리뷰가 실패했다는 뜻이 아니므로 수정 작업을 추가하거나 판정을 확정하지 마시고, 리뷰를 다시 실행해 주세요.{detail} 어느 조치로 이어갈까요?",
+                task.id
+            )
+        }
+    }
+}
+
+fn review_evaluation_failed(is_review: bool, evaluated_state: TaskState) -> bool {
+    is_review && matches!(evaluated_state, TaskState::Failed | TaskState::Partial)
+}
+
+fn artifact_content_digest(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn artifact_media_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("json") => "application/json",
+        Some("yaml" | "yml") => "application/yaml",
+        Some("md") => "text/markdown",
+        _ => "application/octet-stream",
+    }
+}
+
+fn finalization_artifact_causation(events: &[ChannelEvent], attempt_id: &str) -> Option<String> {
+    for event_type in [
+        ChannelEventType::ValidationCompleted,
+        ChannelEventType::WorkerCompleted,
+        ChannelEventType::AttemptPrepared,
+    ] {
+        if let Some(event) = events.iter().rev().find(|event| {
+            event.attempt_id.as_deref() == Some(attempt_id) && event.event_type == event_type
+        }) {
+            return Some(event.event_id.clone());
+        }
+    }
+    None
+}
+
+fn record_artifact_created(
+    ws: &Workspace,
+    context: &ChannelRunContext,
+    attempt_id: &str,
+    path: &std::path::Path,
+    recorded_path: &str,
+    role: &str,
+    worker_authored: bool,
+) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading artifact for channel event {}", path.display()))?;
+    let content_digest = artifact_content_digest(&bytes);
+    let channel = ws.load_task_channel(&context.intent_id, &context.task_id)?;
+    let worker_id = channel
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == attempt_id)
+        .map(|attempt| attempt.worker_id.clone())
+        .ok_or_else(|| anyhow!("artifact producer attempt missing: {attempt_id}"))?;
+    let causation_id = finalization_artifact_causation(&channel.events, attempt_id)
+        .unwrap_or_else(|| attempt_id.to_string());
+    let artifact_role = match role {
+        "handoff" | "checkpoint" => crate::schemas::ArtifactRole::Handoff,
+        "evaluation" => crate::schemas::ArtifactRole::ValidationOutput,
+        _ => crate::schemas::ArtifactRole::File,
+    };
+    let proposal = crate::schemas::ArtifactProposal {
+        proposal_id: format!(
+            "core-{}",
+            artifact_content_digest(
+                format!("{attempt_id}\0{role}\0{recorded_path}\0{content_digest}").as_bytes(),
+            )
+            .trim_start_matches("fnv1a64:")
+        ),
+        task_id: context.task_id.clone(),
+        attempt_id: attempt_id.to_string(),
+        producer: crate::schemas::ResourceProducer { worker_id },
+        causation_id,
+        path: recorded_path.to_string(),
+        digest: content_digest,
+        media_type: artifact_media_type(path).to_string(),
+        role: artifact_role,
+        channel_role: role.to_string(),
+        worker_authored: Some(worker_authored),
+    };
+    ws.publish_artifact(
+        &context.session_id,
+        &context.intent_id,
+        &proposal,
+        &path.display().to_string(),
+    )?;
+    Ok(())
+}
+
+/// Heading of the core-appended failover section. Shared by the writer
+/// (`append_failover_note`) and the authorship classifier so they cannot
+/// drift apart.
+const WORKER_FAILOVER_HEADING: &str = "Worker failover";
+
+/// Was this `handoff.md` authored by the worker?
+///
+/// Existence alone is not proof: `append_failover_note` writes through
+/// `state::append_str`, which creates a missing file, so a handoff.md holding
+/// nothing but core-appended `## Worker failover` sections was created by the
+/// core failover path. Unreadable (non-UTF-8) content keeps the prior
+/// existence-based classification — authorship is only denied when every
+/// section is provably core-appended.
+fn handoff_is_worker_authored(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => !handoff_is_failover_note_only(&content),
+        Err(_) => true,
+    }
+}
+
+/// Does this handoff consist solely of `## Worker failover` sections?
+fn handoff_is_failover_note_only(content: &str) -> bool {
+    let mut in_failover_section = false;
+    let mut saw_failover_section = false;
+    for line in content.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            if heading.trim() != WORKER_FAILOVER_HEADING {
+                return false;
+            }
+            in_failover_section = true;
+            saw_failover_section = true;
+            continue;
+        }
+        if !in_failover_section && !line.trim().is_empty() {
+            return false;
+        }
+    }
+    saw_failover_section
+}
+
+/// Classify the finalization artifacts to record for `run_dir`.
+///
+/// Must run BEFORE `compact::write_evaluator_summary`: that writer creates
+/// `handoff.md` as an evaluator fallback only when the worker did not author
+/// one, so the real author is only readable from the pre-writer run directory.
+/// A handoff.md holding only the core failover note is classified core-authored
+/// even though the file exists — see `handoff_is_worker_authored`.
+pub(crate) fn plan_finalization_artifact_entries(
+    run_dir: &std::path::Path,
+) -> [(&'static str, &'static str, bool); 5] {
+    let handoff_worker_authored = handoff_is_worker_authored(&run_dir.join("handoff.md"));
+    [
+        ("result.json", "worker_result", true),
+        ("evaluation.json", "evaluation", false),
+        ("evaluator-summary.md", "evaluation", false),
+        ("checkpoint.md", "checkpoint", false),
+        ("handoff.md", "handoff", handoff_worker_authored),
+    ]
+}
+
+fn record_finalization_artifacts(
+    ws: &Workspace,
+    context: &ChannelRunContext,
+    run_dir: &std::path::Path,
+    worker_root: &std::path::Path,
+    result: Option<&RunResult>,
+    entries: [(&'static str, &'static str, bool); 5],
+) -> Result<()> {
+    let Some(attempt_id) = std::fs::read_to_string(run_dir.join("latest-attempt"))
+        .ok()
+        .map(|attempt| attempt.trim().to_string())
+        .filter(|attempt| !attempt.is_empty())
+    else {
+        return Ok(());
+    };
+    for (name, role, worker_authored) in entries {
+        let path = run_dir.join(name);
+        let recorded_path = path
+            .strip_prefix(&ws.root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        record_artifact_created(
+            ws,
+            context,
+            &attempt_id,
+            &path,
+            &recorded_path,
+            role,
+            worker_authored,
+        )?;
+    }
+
+    let Some(result) = result else {
+        ws.load_or_rebuild_task_channel(&context.intent_id, &context.task_id)?;
+        return Ok(());
+    };
+    if result.resource_provenance_errors(&attempt_id).is_empty() {
+        crate::resource::ingest_run_proposals(
+            ws,
+            &context.session_id,
+            &context.intent_id,
+            &context.task_id,
+            &attempt_id,
+            &ws.load_task_channel(&context.intent_id, &context.task_id)?
+                .attempts
+                .into_iter()
+                .find(|attempt| attempt.attempt_id == attempt_id)
+                .ok_or_else(|| anyhow!("resource producer attempt missing: {attempt_id}"))?
+                .worker_id,
+            worker_root,
+            result,
+        )?;
+    }
+    let Ok(canonical_root) = std::fs::canonicalize(worker_root) else {
+        return Ok(());
+    };
+    let mut declared = result
+        .changes
+        .files_created
+        .iter()
+        .chain(&result.changes.files_modified)
+        .collect::<Vec<_>>();
+    declared.sort();
+    declared.dedup();
+    for recorded_path in declared {
+        let relative = std::path::Path::new(recorded_path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            continue;
+        }
+        let path = worker_root.join(relative);
+        let Ok(canonical_path) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if canonical_path.strip_prefix(&canonical_root).is_err() || !canonical_path.is_file() {
+            continue;
+        }
+        record_artifact_created(
+            ws,
+            context,
+            &attempt_id,
+            &canonical_path,
+            recorded_path,
+            "worker_declared",
+            true,
+        )?;
+    }
+    ws.load_or_rebuild_task_channel(&context.intent_id, &context.task_id)?;
+    Ok(())
+}
+
+/// The single finalization pipeline shared by the run paths (Slice 1: serial
+/// only). Evaluate -> gates -> artifacts -> conversation -> learned -> queue
+/// state + follow-up ingestion -> telemetry. Behavior is identical to the
+/// inline serial code it replaces; only the structure changed.
+pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
+    let FinalizeInput {
+        ws,
+        run_dir,
+        run_id,
+        task,
+        evidence,
+        worker_id,
+        reason,
+        wall_seconds,
+        user_override,
+        intent_summary,
+        billing,
+        queue,
+        flags,
+        merge,
+    } = input;
+    // Serialize this run's finalization across processes (issue #69). Two
+    // finalizers of the SAME run must not interleave: the loser would evaluate
+    // and integrate against a worktree and branch the winner is merging and
+    // cleaning up underneath it. Held for the whole finalization, and released
+    // when this function returns or unwinds.
+    //
+    // Lock ORDER is run-lock then planning-lock, always. The planning lock is
+    // taken later in this function and every other holder releases it before
+    // reaching finalization, so the two can never be taken in the opposite
+    // order.
+    //
+    // Different runs still finalize concurrently, which parallel batches need.
+    let _finalize_lock = ws.acquire_run_finalize_lock(run_id)?;
+
+    let mut lines = Vec::new();
+    // Capture the intent this run belonged to BEFORE finalize_on_latest_queue
+    // reloads `queue` from disk (which would swap in a re-plan's intent_id):
+    // telemetry must attribute the run to the intent it actually ran under.
+    let intent_id = queue.intent_id.clone();
+
+    let mut eval = evaluator::evaluate(run_dir, run_id, task, evidence.as_deref());
+
+    // H3: workspace-owned post-run gates. A non-zero hook is a fatal check the
+    // task cannot be Done past (e.g. scanning the produced diff for secrets).
+    if flags.post_hooks {
+        let post =
+            crate::hooks::run_phase(ws, crate::hooks::Phase::Post, &task.id, run_dir, worker_id);
+        if !post.ok() {
+            for f in &post.failures {
+                lines.push(format!(
+                    "post-run hook failed (blocks Done): {}",
+                    f.summary()
+                ));
+                eval.checks
+                    .push(evaluator::fatal_failure("post-run hook", f.summary()));
+            }
+            if eval.next_task_state == TaskState::Done {
+                eval.next_task_state = TaskState::Failed;
+            }
+        }
+    }
+
+    // Deterministic validation: Yardlet core runs the task's configured
+    // validation commands itself. Any failure (or a `required` task with
+    // nothing to run) is fatal and blocks Done. Scoped to code tasks: a
+    // doc/non-code task is not failed by an unrelated whole-app command
+    // (goal-1 c) — see `validation_applies`.
+    if flags.validation && validation_applies(task) {
+        // A worktree run (parallel/recovery) validates its worktree — its edits
+        // live there until merged — so a failing task is caught BEFORE the merge
+        // and never reaches the workspace (it stays Partial, worktree kept). The
+        // serial path edits in place and validates the workspace itself.
+        let validation_cwd = merge
+            .as_ref()
+            .map(|m| m.wt_path)
+            .unwrap_or(ws.root.as_path());
+        let validation_cmds = validation_commands(task);
+        let validation_attempt = std::fs::read_to_string(run_dir.join("latest-attempt"))
+            .ok()
+            .map(|attempt| attempt.trim().to_string())
+            .filter(|attempt| !attempt.is_empty());
+        let validation_context = channel_run_context(ws, &intent_id, &task.id);
+        let validation_started = if let Some(attempt_id) = validation_attempt.as_deref() {
+            Some(record_channel_event(
+                ws,
+                None,
+                &validation_context,
+                ChannelEventType::ValidationStarted,
+                EventActor {
+                    kind: EventActorKind::System,
+                    id: String::new(),
+                },
+                Some(attempt_id),
+                None,
+                serde_json::json!({"commands": validation_cmds.clone()}),
+                None,
+            )?)
+        } else {
+            None
+        };
+        let (validation_ran, validation_passed) =
+            run_validation_commands(&validation_cmds, validation_cwd, run_dir, billing);
+        if let Some(attempt_id) = validation_attempt.as_deref() {
+            record_channel_event(
+                ws,
+                None,
+                &validation_context,
+                ChannelEventType::ValidationCompleted,
+                EventActor {
+                    kind: EventActorKind::System,
+                    id: String::new(),
+                },
+                Some(attempt_id),
+                validation_started.map(|event| event.event_id),
+                serde_json::json!({"ran": validation_ran, "passed": validation_passed}),
+                None,
+            )?;
+            ws.load_or_rebuild_task_channel(&validation_context.intent_id, &task.id)?;
+        }
+        if (validation_ran && !validation_passed) || (validation_required(task) && !validation_ran)
+        {
+            lines.push("validation failed (blocks Done)".to_string());
+            eval.checks.push(evaluator::fatal_failure(
+                "validation",
+                "configured validation did not pass",
+            ));
+            if eval.next_task_state == TaskState::Done {
+                eval.next_task_state = TaskState::Failed;
+            }
+        }
+    }
+
+    // Bind the exact dispatcher-owned input bytes used by validation to the
+    // tree that will survive finalization. A retained manual-integration
+    // worktree is its own destination; otherwise the owning root must still
+    // carry the same bytes because these inputs are intentionally excluded
+    // from the worker integration commit. Serial and parallel worktree runs
+    // share this gate; only their overlay receipt stores differ.
+    let mut input_overlay_parity_failure = None;
+    if eval.next_task_state == TaskState::Done {
+        if let Some(merge) = merge.as_ref().filter(|merge| {
+            matches!(
+                merge.provenance,
+                IntegrationProvenance::SerialCoreStaged
+                    | IntegrationProvenance::ParallelWorkerDirect
+            )
+        }) {
+            let has_worker_changes = evidence
+                .as_ref()
+                .is_some_and(|paths| worker_changed_integratable_path(Some(paths)));
+            let committed_change = merge
+                .expected_tip_oid
+                .filter(|oid| !oid.is_empty())
+                .is_some_and(|oid| oid != merge.baseline_oid);
+            let retained_without_integration =
+                !merge.auto_commit && (has_worker_changes || committed_change);
+            input_overlay_parity_failure =
+                serial_input_overlay_parity_failure(merge.wt_path, merge.core_input_overlays)
+                    .or_else(|| {
+                        dependency_input_overlay_parity_failure(
+                            merge.wt_path,
+                            merge.dependency_input_overlays,
+                        )
+                    });
+            if input_overlay_parity_failure.is_none() && !retained_without_integration {
+                input_overlay_parity_failure =
+                    serial_input_overlay_parity_failure(&ws.root, merge.core_input_overlays);
+            }
+            if let Some(reason) = input_overlay_parity_failure.as_ref() {
+                eval.checks.push(evaluator::fatal_failure(
+                    "serial_input_overlay_parity",
+                    reason,
+                ));
+                eval.next_task_state = TaskState::Failed;
+            }
+        }
+    }
+
+    if flags.artifacts {
+        state::write_str(
+            &run_dir.join("evaluation.json"),
+            &serde_json::to_string_pretty(&eval)?,
+        )?;
+    }
+
+    let result: Option<RunResult> = std::fs::read_to_string(run_dir.join("result.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    // Say it out loud in the run report: this result was read out of the
+    // worker's stdout, not out of the file the worker was asked to write.
+    if let Some(marker) = load_result_recovery_marker(run_dir) {
+        lines.push(format!(
+            "result_recovered_from_stdout: attempt {} wrote no result.json; recovered the last \
+             result object from its {} bytes {}..{} (declared output_format {})",
+            marker.attempt_id,
+            marker.stream,
+            marker.byte_start,
+            marker.byte_end,
+            marker.output_format
+        ));
+    }
+    let output_contract_incident = load_output_contract_incident(run_dir);
+    let output_contract_classification_skips =
+        state::load_yaml::<OutputContractClassificationSkips>(
+            &run_dir.join(PROVIDER_REFUSAL_CLASSIFICATION_SKIPS_FILE),
+        )
+        .map(|record| record.notices)
+        .unwrap_or_default();
+    let terminal_output_contract_incident =
+        output_contract_incident.as_ref().is_some_and(|incident| {
+            result.is_none() && incident.recovery_consumed && incident.terminal_attempt_id.is_some()
+        });
+    let mut question_to_persist = result
+        .as_ref()
+        .filter(|result| result.status == "needs_user")
+        .and_then(|result| result.question_for_user.as_deref())
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(|question| (question.to_string(), EventActorKind::Worker));
+
+    let feedback = (!terminal_output_contract_incident)
+        .then(|| {
+            feedback_for_run(
+                ws,
+                run_dir,
+                run_id,
+                &intent_id,
+                task,
+                &eval,
+                result.as_ref(),
+            )
+        })
+        .flatten();
+    let mut next_state = eval.next_task_state;
+    if let Some(f) = &feedback {
+        let _ = state::write_str(
+            &run_dir.join("feedback.json"),
+            &serde_json::to_string_pretty(f)?,
+        );
+        next_state = feedback_next_state(f);
+        if next_state == TaskState::Partial {
+            lines.push(format!(
+                "feedback cycle {}/{}: failed checks will be injected into the next attempt",
+                f.cycle, f.max_cycles
+            ));
+        } else if next_state == TaskState::NeedsUser {
+            if question_to_persist.is_none() {
+                question_to_persist = f
+                    .question_for_user
+                    .as_ref()
+                    .map(|question| (question.clone(), EventActorKind::System));
+            }
+            lines.push(format!("feedback stopped: {}", f.terminal_reason));
+        } else {
+            lines.push("feedback stopped without an actionable question".to_string());
+        }
+    }
+    if terminal_output_contract_incident {
+        next_state = TaskState::NeedsUser;
+        let cause = output_contract_incident
+            .as_ref()
+            .map(|incident| incident.cause);
+        let (cause_label, question) = match cause {
+            Some(OutputContractCause::WorkerDeferredToBackgroundTask) => (
+                "worker_deferred_to_background_task",
+                "worker가 백그라운드 작업을 남긴 채 턴을 끝내 result.json 없이 종료되었고, 전경 실행을 지시한 1회 복구도 같은 방식으로 끝났습니다. 리뷰/작업 내용이 실패했다는 뜻은 아닙니다. 이 작업을 어떻게 진행할지 알려주세요.",
+            ),
+            _ => (
+                "provider_response_refused",
+                "provider_response_refused가 감지되었고 동일 worker의 1회 output-contract 복구도 result.json 없이 종료되었습니다. worker/provider 응답을 확인한 뒤 이 작업을 어떻게 진행할지 알려주세요.",
+            ),
+        };
+        question_to_persist = Some((question.to_string(), EventActorKind::System));
+        lines.push(format!(
+            "output-contract recovery exhausted: {cause_label}; paused for user"
+        ));
+    }
+    if let Some(reason) = input_overlay_parity_failure.as_ref() {
+        state::write_str(&run_dir.join("partial-reason"), reason)?;
+        lines.push(format!(
+            "{}: serial input overlay parity failed before integration: {reason}",
+            task.id
+        ));
+    }
+    if flags.repairs_done_projection && next_state != TaskState::Done {
+        lines.push(format!(
+            "{}: retained Done while repairing its verified Git finish projection",
+            task.id
+        ));
+        next_state = TaskState::Done;
+    }
+    // Preserve the worker/evaluator outcome before Git integration can turn a
+    // passing Done into a manual-integration Partial. Review remediation is
+    // about failed review evidence, not a later delivery hold.
+    let evaluated_state = next_state;
+    let is_review = matches!(crate::packet::role_for(&task.kind), "reviewer" | "security");
+    let review_failed = review_evaluation_failed(is_review, evaluated_state);
+
+    let mut needs_user_origin = None;
+    let mut persisted_question = if next_state == TaskState::NeedsUser {
+        let (question, actor_kind) = question_to_persist.get_or_insert_with(|| {
+            (
+                format!("`{}` 작업을 계속하려면 어떤 결정을 내려야 할까요?", task.id),
+                EventActorKind::System,
+            )
+        });
+        let channel_context = channel_run_context(ws, &intent_id, &task.id);
+        persist_needs_user_question(ws, None, &channel_context, run_dir, question, *actor_kind)?;
+        needs_user_origin = needs_user_origin_for_finalize(
+            *actor_kind,
+            feedback
+                .as_ref()
+                .is_some_and(|f| feedback_next_state(f) == TaskState::NeedsUser),
+        );
+        Some(question.clone())
+    } else {
+        None
+    };
+
+    // Plan artifact classification before the evaluator writers run: past this
+    // point a missing handoff.md may be filled in by the evaluator fallback.
+    let finalization_entries = plan_finalization_artifact_entries(run_dir);
+    if flags.artifacts {
+        compact::write_checkpoint(run_dir, task, &eval, result.as_ref(), intent_summary)?;
+        compact::write_evaluator_summary(run_dir, task, &eval, result.as_ref())?;
+        if let Some(r) = &result {
+            append_nonblocking_follow_up_notes(run_dir, r)?;
+        }
+    }
+    if let Some(incident) = &output_contract_incident {
+        append_output_contract_incident_note(run_dir, incident)?;
+    }
+    append_output_contract_classification_skip_notes(
+        run_dir,
+        &output_contract_classification_skips,
+    )?;
+    let artifact_context = channel_run_context(ws, &intent_id, &task.id);
+    let worker_root = merge
+        .as_ref()
+        .map(|merge| merge.wt_path)
+        .unwrap_or(ws.root.as_path());
+    record_finalization_artifacts(
+        ws,
+        &artifact_context,
+        run_dir,
+        worker_root,
+        result.as_ref(),
+        finalization_entries,
+    )?;
+
+    // Harness learning loop (S3): record skills/rules the worker proposed. The
+    // worker authored the content; Yardlet (the core) does the writing.
+    if flags.learned {
+        if let Some(r) = &result {
+            let learned = crate::skills::record_run_suggestions(ws, &r.harness_suggestions);
+            if !learned.is_empty() {
+                lines.push(format!("learned skill(s): {}", learned.join(", ")));
+            }
+            let rules = crate::skills::record_run_rules(ws, &r.harness_suggestions);
+            if !rules.is_empty() {
+                lines.push(format!("learned rule(s): {}", rules.join(", ")));
+            }
+            // These land in the owning root outside the run's integration
+            // commit, so "learned" does not yet mean "durable". Say so, with
+            // the exact command, instead of leaving the operator to notice an
+            // untracked path (issue #45).
+            let untracked = untracked_harness_assets(ws, &learned, &rules);
+            if !untracked.is_empty() {
+                lines.push(format!(
+                    "learned harness assets are NOT in git yet: {}. Commit them with \
+                     `yardlet skill commit`",
+                    untracked.join(", ")
+                ));
+                let note = format!(
+                    "\n## Untracked harness assets\n\nThis run learned harness assets that are \
+                     on disk but not in git:\n\n{}\n\nThey are not durable until committed:\n\n\
+                     ```\nyardlet skill commit\n```\n",
+                    untracked
+                        .iter()
+                        .map(|path| format!("- `{path}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                let handoff = run_dir.join("handoff.md");
+                let mut existing = std::fs::read_to_string(&handoff).unwrap_or_default();
+                existing.push_str(&note);
+                let _ = state::write_str(&handoff, &existing);
+            }
+        }
+    }
+
+    // Integrate the worktree (parallel/recovery only). A Done run is merged
+    // back into the workspace in completion order; a conflict (or any merge
+    // error) is never auto-resolved — the task drops to Partial and its worktree
+    // is kept for manual integration. The committed state below is this
+    // post-merge state, so the queue and telemetry both record what really
+    // happened.
+    // Normal finalization starts with no ownership and receives it only from a
+    // successful integration below. Recovery may reconstruct it from the
+    // core-owned receipt outside the worker-writable run directory. The Git
+    // finish module independently prefers any earlier durable finish record.
+    let mut git_finish_not_needed =
+        flags.git_finish_recovery && recovery_no_change_complete(ws, run_id, &task.id);
+    let mut ownership = flags
+        .git_finish_recovery
+        .then(|| recovery_git_finish_ownership(ws, run_id, &task.id))
+        .flatten();
+    if let Some(m) = &merge {
+        // The worker's cwd IS the worktree, so a path it forms from its own cwd
+        // must resolve against that first (issue #55).
+        let declared_path_roots = DeclaredPathRoots {
+            worktree: m.wt_path,
+            workspace: &ws.root,
+        };
+        // Declared outputs Yardlet cannot place are not repository deliverables
+        // and must not flip a correct run, but they must not vanish either. The
+        // run lines are transient — a background or parallel drain may never put
+        // them in front of anyone — so the record goes in the handoff too.
+        let unplaceable = unplaceable_declared_outputs(result.as_ref(), &declared_path_roots);
+        if !unplaceable.is_empty() {
+            for path in &unplaceable {
+                lines.push(format!(
+                    "{}: declared output {path} is outside this workspace; Yardlet did not integrate it",
+                    task.id
+                ));
+            }
+            let note = format!(
+                "\n## Declared outputs outside the workspace\n\nThe worker declared these paths, \
+                 which are not inside this repository:\n\n{}\n\nYardlet did not integrate them and \
+                 cannot say anything about them. They are recorded here so they are not lost \
+                 silently; nothing about this run's state depends on them.\n",
+                unplaceable
+                    .iter()
+                    .map(|path| format!("- `{path}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let handoff = run_dir.join("handoff.md");
+            let mut existing = std::fs::read_to_string(&handoff).unwrap_or_default();
+            existing.push_str(&note);
+            let _ = state::write_str(&handoff, &existing);
+        }
+        if !m.auto_commit {
+            let has_changes = evidence
+                .as_ref()
+                .is_some_and(|paths| worker_changed_integratable_path(Some(paths)));
+            // A consume-only downstream must not go Partial on upstream bytes
+            // alone: receipted dependency-input overlays are core-delivered
+            // inputs, not changes this worker left uncommitted.
+            if next_state == TaskState::Done
+                && !has_changes
+                && !m.dependency_input_overlays.is_empty()
+            {
+                lines.push(format!(
+                    "{}: {} materialized dependency input(s) stay receipted core overlays, not worker changes",
+                    task.id,
+                    m.dependency_input_overlays.len()
+                ));
+            }
+            if next_state == TaskState::Done && has_changes {
+                next_state = TaskState::Partial;
+                let _ = state::write_str(&run_dir.join("partial-reason"), "auto_commit_disabled");
+                let note = format!(
+                    "\n## Git integration paused\n\n`auto_commit` is disabled, so Yardlet did not \
+                     commit or merge this run. The isolated worktree is retained at `{}`.\n",
+                    m.wt_path.display()
+                );
+                let hp = run_dir.join("handoff.md");
+                let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                existing.push_str(&note);
+                let _ = state::write_str(&hp, &existing);
+                lines.push(format!(
+                    "{}: auto_commit is disabled; worktree retained at {}",
+                    task.id,
+                    m.wt_path.display()
+                ));
+            } else if next_state == TaskState::Done {
+                let expected_tip = m
+                    .expected_tip_oid
+                    .filter(|oid| !oid.is_empty())
+                    .unwrap_or(m.baseline_oid);
+                if expected_tip != m.baseline_oid {
+                    next_state = TaskState::Partial;
+                    let _ = state::write_str(
+                        &run_dir.join("partial-reason"),
+                        "unintegrated_commit_retained",
+                    );
+                    lines.push(format!(
+                        "{}: unintegrated commit retained at {}",
+                        task.id,
+                        m.wt_path.display()
+                    ));
+                } else {
+                    if let Some(reason) =
+                        serial_input_overlay_parity_failure(&ws.root, m.core_input_overlays)
+                    {
+                        next_state = TaskState::Partial;
+                        state::write_str(&run_dir.join("partial-reason"), &reason)?;
+                        lines.push(format!(
+                            "{}: serial input overlay parity failed before cleanup: {reason}",
+                            task.id
+                        ));
+                    } else if let Some((reason, paths)) = no_change_contradiction(
+                        result.as_ref(),
+                        evidence.as_deref(),
+                        &declared_path_roots,
+                        m.core_input_overlays,
+                        m.dependency_input_overlays,
+                    ) {
+                        next_state = TaskState::Partial;
+                        state::write_str(&run_dir.join("partial-reason"), reason)?;
+                        let hp = run_dir.join("handoff.md");
+                        let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                        existing.push_str(&no_change_contradiction_note(reason, &paths, m.wt_path));
+                        let _ = state::write_str(&hp, &existing);
+                        lines.push(format!(
+                            "{}: refused to record no changes — {} still lists {}; worktree kept at {}",
+                            task.id,
+                            reason,
+                            paths.join(", "),
+                            m.wt_path.display()
+                        ));
+                    } else {
+                        let no_change_receipt = persist_no_change_receipt(
+                            ws,
+                            run_dir,
+                            run_id,
+                            &task.id,
+                            &intent_id,
+                            worker_id,
+                            m,
+                            expected_tip,
+                        )?;
+                        let cleanup = crate::parallel::cleanup_integrated_worktree(
+                            &ws.root,
+                            m.wt_path,
+                            m.branch,
+                            expected_tip,
+                            m.provenance,
+                        );
+                        for warning in cleanup.warnings {
+                            lines.push(format!("{}: {warning}", task.id));
+                        }
+                        persist_no_change_projection(
+                            run_dir,
+                            &no_change_receipt,
+                            cleanup.complete,
+                        )?;
+                        if !cleanup.complete {
+                            next_state = TaskState::Partial;
+                            let _ = state::write_str(
+                                &run_dir.join("partial-reason"),
+                                "worktree_cleanup_changed",
+                            );
+                        } else {
+                            git_finish_not_needed = true;
+                        }
+                    }
+                }
+            } else {
+                lines.push(format!(
+                    "{}: {} — worktree kept at {}",
+                    task.id,
+                    run_outcome_label(next_state),
+                    m.wt_path.display()
+                ));
+            }
+        } else if next_state == TaskState::Done {
+            let integration = match m.provenance {
+                IntegrationProvenance::SerialCoreStaged => {
+                    crate::parallel::integrate_serial_worktree(
+                        &ws.root,
+                        m.wt_path,
+                        run_dir,
+                        run_id,
+                        m.branch,
+                        &task.id,
+                        m.baseline_oid,
+                        m.expected_tip_oid,
+                    )
+                }
+                IntegrationProvenance::ParallelWorkerDirect => {
+                    crate::parallel::integrate_parallel_worktree(
+                        &ws.root,
+                        m.wt_path,
+                        m.branch,
+                        &task.id,
+                        m.baseline_oid,
+                        m.expected_tip_oid,
+                        m.core_input_overlays,
+                    )
+                }
+                IntegrationProvenance::Unknown => Ok(crate::parallel::Integration::Conflict(
+                    "worktree integration provenance is missing or inconsistent".to_string(),
+                )),
+            };
+            match integration {
+                Ok(crate::parallel::Integration::Merged {
+                    oid,
+                    base_oid,
+                    worker_oid,
+                    owned_oids,
+                }) => {
+                    ownership = Some(crate::git_finish::GitFinishOwnership {
+                        baseline_oid: base_oid.clone(),
+                        expected_oid: oid.clone(),
+                        owned_oids: owned_oids.clone(),
+                    });
+                    let cleanup_receipt = persist_run_integration(
+                        ws,
+                        run_dir,
+                        run_id,
+                        &task.id,
+                        &intent_id,
+                        worker_id,
+                        m,
+                        &base_oid,
+                        &worker_oid,
+                        &oid,
+                        &owned_oids,
+                    )?;
+                    lines.push(format!(
+                        "{}: merged {} into the workspace",
+                        task.id, m.branch
+                    ));
+                    let unintegrated = unintegrated_declared_outputs(
+                        &ws.root,
+                        &committed_paths_for(&ws.root, &oid),
+                        result.as_ref(),
+                        &declared_path_roots,
+                        m.core_input_overlays,
+                        m.dependency_input_overlays,
+                    );
+                    if let Some(reason) =
+                        serial_input_overlay_parity_failure(&ws.root, m.core_input_overlays)
+                    {
+                        next_state = TaskState::Partial;
+                        state::write_str(&run_dir.join("partial-reason"), &reason)?;
+                        lines.push(format!(
+                            "{}: serial input overlay parity failed after integration: {reason}",
+                            task.id
+                        ));
+                    } else if !unintegrated.is_empty() {
+                        // Some of the declared output landed and some did not.
+                        // Done would say the task is finished while part of its
+                        // deliverable is still outside Git (issue #91).
+                        next_state = TaskState::Partial;
+                        state::write_str(
+                            &run_dir.join("partial-reason"),
+                            "declared_outputs_not_integrated",
+                        )?;
+                        let hp = run_dir.join("handoff.md");
+                        let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                        existing.push_str(&partial_integration_note(&unintegrated, m.wt_path));
+                        let _ = state::write_str(&hp, &existing);
+                        lines.push(format!(
+                            "{}: declared output(s) not in the integration commit: {}",
+                            task.id,
+                            unintegrated.join(", ")
+                        ));
+                    } else {
+                        let cleanup = crate::parallel::cleanup_integrated_worktree(
+                            &ws.root,
+                            m.wt_path,
+                            m.branch,
+                            &worker_oid,
+                            m.provenance,
+                        );
+                        for warning in cleanup.warnings {
+                            lines.push(format!("{}: {warning}", task.id));
+                        }
+                        if cleanup.complete {
+                            persist_integrated_cleanup_projection(run_dir, &cleanup_receipt, true)?;
+                            // Settled here means no later startup has to
+                            // rediscover that by replaying git (issue #43).
+                            let _ = ws.archive_integrated_cleanup_receipt(run_id);
+                        }
+                    }
+                }
+                Ok(crate::parallel::Integration::NoChanges { worker_oid }) => {
+                    // A no-change outcome is durable: it writes a core-owned
+                    // receipt that later recovery replays as "nothing to
+                    // integrate". Refuse it before that receipt exists when the
+                    // run's own evidence or result.json still claims repository
+                    // output (issue #55).
+                    if let Some((reason, paths)) = no_change_contradiction(
+                        result.as_ref(),
+                        evidence.as_deref(),
+                        &declared_path_roots,
+                        m.core_input_overlays,
+                        m.dependency_input_overlays,
+                    ) {
+                        next_state = TaskState::Partial;
+                        state::write_str(&run_dir.join("partial-reason"), reason)?;
+                        let hp = run_dir.join("handoff.md");
+                        let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                        existing.push_str(&no_change_contradiction_note(reason, &paths, m.wt_path));
+                        let _ = state::write_str(&hp, &existing);
+                        lines.push(format!(
+                            "{}: refused to record no changes — {} still lists {}; worktree kept at {}",
+                            task.id,
+                            reason,
+                            paths.join(", "),
+                            m.wt_path.display()
+                        ));
+                    } else {
+                        let no_change_receipt = persist_no_change_receipt(
+                            ws,
+                            run_dir,
+                            run_id,
+                            &task.id,
+                            &intent_id,
+                            worker_id,
+                            m,
+                            &worker_oid,
+                        )?;
+                        if let Some(reason) =
+                            serial_input_overlay_parity_failure(&ws.root, m.core_input_overlays)
+                        {
+                            next_state = TaskState::Partial;
+                            state::write_str(&run_dir.join("partial-reason"), &reason)?;
+                            lines.push(format!(
+                                "{}: serial input overlay parity failed before cleanup: {reason}",
+                                task.id
+                            ));
+                        } else {
+                            let cleanup = crate::parallel::cleanup_integrated_worktree(
+                                &ws.root,
+                                m.wt_path,
+                                m.branch,
+                                &worker_oid,
+                                m.provenance,
+                            );
+                            for warning in cleanup.warnings {
+                                lines.push(format!("{}: {warning}", task.id));
+                            }
+                            persist_no_change_projection(
+                                run_dir,
+                                &no_change_receipt,
+                                cleanup.complete,
+                            )?;
+                            if cleanup.complete {
+                                lines.push(format!("{}: no file changes to merge", task.id));
+                                git_finish_not_needed = true;
+                            } else {
+                                next_state = TaskState::Partial;
+                                let _ = state::write_str(
+                                    &run_dir.join("partial-reason"),
+                                    "worktree_cleanup_changed",
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(crate::parallel::Integration::Conflict(why)) => {
+                    next_state = TaskState::Partial;
+                    let _ = state::write_str(&run_dir.join("partial-reason"), "merge_conflict");
+                    let note = format!(
+                        "\n## Merge conflict\n\nYard could not merge `{}` back: {}\n\
+                         The worktree is kept at `{}` for manual integration.\n",
+                        m.branch,
+                        why.trim(),
+                        m.wt_path.display()
+                    );
+                    let hp = run_dir.join("handoff.md");
+                    let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                    existing.push_str(&note);
+                    let _ = state::write_str(&hp, &existing);
+                    lines.push(format!(
+                        "{}: merge conflict — task is partial; worktree kept at {}",
+                        task.id,
+                        m.wt_path.display()
+                    ));
+                }
+                // An integration ERROR is not a conflict: nothing is left
+                // half-merged for a human to resolve, and telling them to
+                // resolve one sends them looking for markers that do not exist
+                // (issue #69). Record the error itself so the handoff can say
+                // what actually failed.
+                Err(e) => {
+                    next_state = TaskState::Partial;
+                    let _ = state::write_str(&run_dir.join("partial-reason"), "integration_error");
+                    let note = format!(
+                        "\n## Integration error\n\nYardlet could not integrate `{}`: {}\n\
+                         This is not a merge conflict: there is nothing to resolve by hand. \
+                         The worktree is kept at `{}`.\n",
+                        m.branch,
+                        e.to_string().trim(),
+                        m.wt_path.display()
+                    );
+                    let hp = run_dir.join("handoff.md");
+                    let mut existing = std::fs::read_to_string(&hp).unwrap_or_default();
+                    existing.push_str(&note);
+                    let _ = state::write_str(&hp, &existing);
+                    lines.push(format!("{}: integration error: {e}", task.id));
+                }
+                // The run-owned branch is gone. If THIS run already recorded a
+                // published integration, a second finalize is re-running over
+                // work that is already in the target: confirm it instead of
+                // demoting a correct terminal state (issue #69). Ownership is
+                // reconstructed from the run's own durable receipt, so the
+                // confirmation cannot claim commits this run does not own.
+                Ok(crate::parallel::Integration::BranchMissing { branch }) => {
+                    match already_integrated_ownership(ws, run_dir, run_id, &task.id) {
+                        Some(owned) => {
+                            ownership = Some(owned);
+                            lines.push(format!(
+                                "{}: {branch} was already integrated and cleaned up; \
+                                 confirming the recorded outcome",
+                                task.id
+                            ));
+                        }
+                        None => {
+                            next_state = TaskState::Partial;
+                            let _ = state::write_str(
+                                &run_dir.join("partial-reason"),
+                                "integration_branch_missing",
+                            );
+                            lines.push(format!(
+                                "{}: run-owned branch {branch} does not exist and this run \
+                                 recorded no integration; nothing to merge",
+                                task.id
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            lines.push(format!(
+                "{}: {} — worktree kept at {}",
+                task.id,
+                run_outcome_label(next_state),
+                m.wt_path.display()
+            ));
+        }
+    }
+
+    // Git finish runs only after evaluation and worktree integration. The OID
+    // is supplied only by the successful merge branch above, so a serial run,
+    // Captured before `ownership` is consumed below: whether this run put a
+    // merge into the repository is what decides, on an interrupt, between
+    // "unstarted again" and "already landed, do not run twice" (issue #110).
+    let run_integrated = ownership.is_some();
+    // no-op, conflict, or unrelated existing commit cannot acquire ownership.
+    let git_finish = if git_finish_not_needed {
+        crate::git_finish::finish_no_change_run(ws, run_dir, run_id, &task.id, next_state)?
+    } else if flags.git_finish_recovery {
+        crate::git_finish::recover_owned_run(
+            ws,
+            run_dir,
+            run_id,
+            &task.id,
+            next_state,
+            ownership,
+            flags.repairs_done_projection,
+        )?
+    } else {
+        crate::git_finish::finish_owned_run(ws, run_dir, run_id, &task.id, next_state, ownership)?
+    };
+    lines.push(git_finish.user_line());
+    // A no-op whose cleanup and delivery both settled here leaves the pending
+    // reconcile set immediately, instead of being rediscovered and replayed by
+    // every later startup (issue #43).
+    if git_finish_not_needed && git_finish.status.verified_complete() {
+        let _ = ws.archive_no_change_receipt(run_id);
+    }
+    // A run that changed no files still DID its work — a review's report, a
+    // deploy, anything whose effect is outside the repository. `ownership` only
+    // marks a merge, so reducing "already accounted for" to it requeued a
+    // stopped no-change run and repeated its external effect: a review measured
+    // a modeled counter going from one to two (issue #110).
+    let settled_no_change = git_finish_not_needed && result.is_some();
+    // The interruption verdict, applied at the LAST point before the queue
+    // transition and after every other decision has been made (issue #110).
+    //
+    // Not at spawn: there is more than one place a worker starts — initial,
+    // failover, parallel — and marking them missed two of the three. Not at
+    // finalization entry either: the interrupt routinely arrives DURING
+    // finalization, after any entry check has passed. Everything funnels here.
+    //
+    // Recorded in core-owned state rather than the run directory, because a
+    // parallel worker is handed that directory and a review had one forge the
+    // record. And read back from there, so `recover` in a fresh process — where
+    // the process flag no longer exists — reaches the same verdict.
+    if crate::signals::stop_requested() {
+        let _ = ws.record_run_interrupted(run_id, "operator_interrupt");
+    }
+    if ws.run_interruption_cause(run_id).is_some() {
+        // Two different facts, and one state cannot carry both. If integration
+        // already happened the output IS in the repository, and requeuing would
+        // run the work a second time — a review proved that repeats external
+        // effects, not just wasted compute. If it did not, the task is simply
+        // unstarted work again.
+        let integrated = run_integrated || settled_no_change;
+        next_state = if integrated {
+            let _ = state::write_str(&run_dir.join("partial-reason"), "stopped_after_integration");
+            lines.push(format!(
+                "{}: interrupted after its output was integrated; left Partial so it is \
+                 not run again",
+                task.id
+            ));
+            TaskState::Partial
+        } else {
+            lines.push(format!(
+                "{}: interrupted before integration; returned to the queue",
+                task.id
+            ));
+            TaskState::Queued
+        };
+    }
+    let projected_state = state_after_git_finish(next_state, &git_finish);
+    if projected_state != next_state {
+        next_state = projected_state;
+        let _ = state::write_str(&run_dir.join("partial-reason"), "git_finish_unverified");
+        lines.push(format!(
+            "{}: Git finish is not remotely verified; task remains partial",
+            task.id
+        ));
+    } else if next_state == TaskState::Done
+        && std::fs::read_to_string(run_dir.join("partial-reason"))
+            .ok()
+            .is_some_and(|reason| reason.trim() == "git_finish_unverified")
+    {
+        let _ = std::fs::remove_file(run_dir.join("partial-reason"));
+    }
+    // Capture the delivery-projected terminal outcome before review queue
+    // management can schedule another attempt. Telemetry describes this run's
+    // completed evaluation and Git finish, not the scheduler state of the task's
+    // next attempt.
+    let telemetry_state = next_state;
+
+    // Update the queue: set state AND ingest any follow-up tasks the worker
+    // proposed (propose -> ingest). Yardlet stays the sole queue writer — both
+    // land in one re-read-then-save.
+    // Recovery (follow_ups off) only finalizes the stranded run's state — it must
+    // not ingest new follow-ups or re-queue a review, which would rewrite the
+    // queue graph during a crash-recovery pass.
+    let queue_lock = ws.acquire_planning_lock()?;
+    let mut follow_ups = if flags.follow_ups && next_state != TaskState::NeedsUser {
+        result
+            .as_ref()
+            .map(|r| r.follow_up_tasks.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if is_review {
+        // A repeated review failure must not create another copy of a fix that
+        // this same queue already ran. If that fix was insufficient, stop for a
+        // human instead of multiplying identical remediation tasks.
+        let latest = ws.load_queue().unwrap_or_else(|_| queue.clone());
+        dedup_review_follow_ups(&mut follow_ups, &latest);
+        if let Some(f) = &feedback {
+            for fu in &mut follow_ups {
+                for unmet in &f.unmet_acceptance {
+                    if !fu.acceptance.contains(unmet) {
+                        fu.acceptance.push(unmet.clone());
+                    }
+                }
+                for failure in &f.failures {
+                    let evidence = format!("failed check evidence: {failure}");
+                    if !fu.acceptance.contains(&evidence) {
+                        fu.acceptance.push(evidence);
+                    }
+                }
+            }
+        }
+    }
+    // Workers (when loadable) let the queue commit ground a proposed follow-up's
+    // capabilities; if workers.yaml can't be read we skip grounding rather than
+    // false-park everything.
+    let workers = ws.load_workers().ok();
+    let intent_allowed_scope = if flags.follow_ups {
+        ws.load_intent()
+            .ok()
+            .flatten()
+            .map(|i| i.allowed_scope)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Sampled AGAIN, immediately before the queue is written. The earlier check
+    // runs before the planning lock, and an interrupt arriving in that window was
+    // still recorded as finished by a later `recover` — the window is small and
+    // it is exactly where a long finalization sits (issue #110).
+    let interrupted_now =
+        crate::signals::stop_requested() || ws.run_interruption_cause(run_id).is_some();
+    if interrupted_now && next_state == TaskState::Done {
+        let _ = ws.record_run_interrupted(run_id, "operator_interrupt");
+        next_state = if run_integrated || settled_no_change {
+            let _ = state::write_str(&run_dir.join("partial-reason"), "stopped_after_integration");
+            TaskState::Partial
+        } else {
+            TaskState::Queued
+        };
+        lines.push(format!(
+            "{}: interrupted during finalization; not recorded as finished",
+            task.id
+        ));
+    }
+    let governing_selection = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .and_then(|record| record.resolved_selection());
+    let ingested = finalize_on_latest_queue_locked(
+        ws,
+        &queue_lock,
+        queue,
+        &task.id,
+        next_state,
+        &intent_allowed_scope,
+        &follow_ups,
+        governing_selection.as_ref(),
+        workers.as_ref(),
+        needs_user_origin,
+        TransitionCause::RunOutcome,
+        &format!("worker evaluated task as {}", run_outcome_label(next_state)),
+        TransitionActor::Worker(run_id.to_string()),
+    )?;
+    if !ingested.is_empty() {
+        lines.push(format!(
+            "ingested {} worker-proposed follow-up task(s): {}",
+            ingested.len(),
+            ingested.join(", ")
+        ));
+    }
+
+    // The run's evaluated outcome, captured BEFORE review auto-remediation may
+    // overwrite next_state to Queued/NeedsUser — telemetry must record what the
+    // run actually evaluated to (a failed review), not the queue-management
+    // decision, or the trust report would not see the failure.
+    // Review auto-remediation (1c): a review that failed its criteria must not
+    // blind-loop on the same unchanged code. Re-queue THIS review to run AFTER the
+    // reviewer's proposed remediation (soft priority ordering, no hard dep) so the
+    // fix runs first and the review then re-verifies; the persisted feedback cap
+    // bounds the cycles across serial, parallel, and resumed drains.
+    if flags.follow_ups && review_failed {
+        // Sequence behind fixes in the runnable graph (Queued && deps_met),
+        // including approval-gated fixes. With no such remediation, surface to
+        // the user instead.
+        let remediation = schedulable_remediation_ids(queue, &ingested);
+        if remediation.is_empty() {
+            if persisted_question.is_none() {
+                let question = review_without_remediation_question(
+                    task,
+                    review_failure_cause(&eval),
+                    output_contract_incident.as_ref(),
+                );
+                let channel_context = channel_run_context(ws, &intent_id, &task.id);
+                persist_needs_user_question(
+                    ws,
+                    Some(&queue_lock),
+                    &channel_context,
+                    run_dir,
+                    &question,
+                    EventActorKind::System,
+                )?;
+                persisted_question = Some(question);
+            }
+            requeue_review_locked(ws, &queue_lock, queue, &task.id, TaskState::NeedsUser, &[])?;
+            next_state = TaskState::NeedsUser;
+            lines.push(format!(
+                "{}: review failed with no runnable fix — needs you",
+                task.id
+            ));
+        } else {
+            requeue_review_locked(
+                ws,
+                &queue_lock,
+                queue,
+                &task.id,
+                TaskState::Queued,
+                &remediation,
+            )?;
+            next_state = TaskState::Queued;
+            lines.push(format!(
+                "{}: review failed — re-queued behind remediation [{}] to re-verify",
+                task.id,
+                remediation.join(", ")
+            ));
+        }
+    }
+
+    drop(queue_lock);
+
+    // Mirror the canonical question into the legacy conversation transcript so
+    // both continuation paths receive the same actionable prompt.
+    if flags.conversation {
+        if let Some(question) = persisted_question.as_deref() {
+            let _ = state::append_conversation_turn(
+                ws,
+                &intent_id,
+                &task.id,
+                ConversationTurn {
+                    role: TurnRole::Worker,
+                    text: question.to_string(),
+                    run_id: run_id.to_string(),
+                    ts: Local::now().to_rfc3339(),
+                },
+            );
+        }
+    }
+
+    if let Some(attempt_id) = std::fs::read_to_string(run_dir.join("latest-attempt"))
+        .ok()
+        .map(|attempt| attempt.trim().to_string())
+        .filter(|attempt| !attempt.is_empty())
+    {
+        let context = channel_run_context(ws, &intent_id, &task.id);
+        let channel = ws.load_task_channel(&context.intent_id, &task.id)?;
+        let completion_id = format!("cmp_{run_id}");
+        if !channel.events.iter().any(|event| {
+            event.event_type == ChannelEventType::CompletionRecorded
+                && event.payload["completion_id"] == completion_id
+        }) {
+            record_channel_event(
+                ws,
+                None,
+                &context,
+                ChannelEventType::CompletionRecorded,
+                EventActor {
+                    kind: EventActorKind::System,
+                    id: String::new(),
+                },
+                Some(&attempt_id),
+                channel.events.last().map(|event| event.event_id.clone()),
+                serde_json::json!({
+                    "completion_id": completion_id,
+                    "run_id": run_id,
+                    "task_state": run_outcome_label(evaluated_state)
+                }),
+                None,
+            )?;
+            ws.load_or_rebuild_task_channel(&context.intent_id, &task.id)?;
+        }
+    }
+
+    if flags.telemetry {
+        let _ = telemetry::append_run(
+            ws,
+            &telemetry::RunTelemetry {
+                ts: Local::now().to_rfc3339(),
+                run_id: run_id.to_string(),
+                task_id: task.id.clone(),
+                intent_id: intent_id.clone(),
+                kind: task.kind.clone(),
+                risk: task.risk.clone(),
+                worker: worker_id.to_string(),
+                chosen_reason: reason.to_string(),
+                result_status: result
+                    .as_ref()
+                    .map(|r| r.status.clone())
+                    .unwrap_or_else(|| "no-result".to_string()),
+                eval_state: telemetry_eval_state(telemetry_state),
+                wall_seconds,
+                user_override,
+                skills: task.skills.clone(),
+                verdict_pass: result.as_ref().and_then(|r| {
+                    (!r.verdict.is_empty())
+                        .then(|| (r.verdict.iter().filter(|v| v.pass).count(), r.verdict.len()))
+                }),
+                feedback_cycle: feedback.as_ref().map(|f| f.cycle).unwrap_or(0),
+                max_feedback_cycles: task.max_feedback_cycles(),
+                feedback_retryable: feedback.as_ref().is_some_and(|f| f.retryable),
+                git_finish_status: git_finish.status.as_str().to_string(),
+            },
+        );
+    }
+
+    lines.push(format!("evaluation status: {}", eval.status));
+    lines.push(format!(
+        "next task state: {} {}",
+        next_state.glyph(),
+        run_outcome_label(next_state)
+    ));
+
+    // Seal the run record. It was written "running" at spawn and never updated,
+    // so without this every run.yaml looks in-flight forever — the Trust Report
+    // and any run-dir scan cannot tell a finished run from a stranded one. All
+    // paths (serial/parallel/recovery) end here, so this single write keeps the
+    // record honest. Best-effort: a record failure must not fail the run.
+    seal_run_record(
+        run_dir,
+        run_id,
+        task,
+        // The captured spawn-time intent (not the post-reload `queue.intent_id`),
+        // same as telemetry above — attribute the record to the intent the run
+        // belonged to even if the on-disk queue was re-planned mid-run.
+        intent_id.as_str(),
+        worker_id,
+        next_state,
+        merge.as_ref(),
+    );
+
+    Ok(FinalizeReport { next_state, lines })
+}
+
+fn state_after_git_finish(
+    state: TaskState,
+    record: &crate::git_finish::GitFinishRecord,
+) -> TaskState {
+    if state == TaskState::Done && record.policy.auto_push && !record.status.verified_complete() {
+        TaskState::Partial
+    } else {
+        state
+    }
+}
+
+fn telemetry_eval_state(state: TaskState) -> String {
+    format!("{state:?}")
+}
+
+/// Snake-case label for a run's terminal outcome, matching the queue's
+/// `TaskState` vocabulary so a sealed run.yaml reads the same as the queue.
+fn run_outcome_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::Done => "done",
+        TaskState::Blocked => "blocked",
+        TaskState::Failed => "failed",
+        TaskState::NeedsUser => "needs_user",
+        TaskState::Partial => "partial",
+        TaskState::Deferred => "deferred",
+    }
+}
+
+/// Rewrite `run.yaml` from its in-flight `running` to the run's real terminal
+/// outcome with a `completed_at`. Preserves the spawn-time fields by re-reading
+/// the existing record; falls back to what `finalize_run` already knows if the
+/// file is missing or unreadable.
+fn seal_run_record(
+    run_dir: &std::path::Path,
+    run_id: &str,
+    task: &crate::schemas::Task,
+    intent_id: &str,
+    worker_id: &str,
+    next_state: TaskState,
+    merge: Option<&MergeBack>,
+) {
+    let path = run_dir.join("run.yaml");
+    let mut rec: RunRecord = state::load_yaml(&path).unwrap_or(RunRecord {
+        adoption: None,
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        task_id: task.id.clone(),
+        intent_id: intent_id.to_string(),
+        worker: worker_id.to_string(),
+        model: task.model.clone(),
+        fallback_enabled: task.fallback_enabled.unwrap_or(false),
+        routing_provenance: task.routing_provenance.clone(),
+        state: String::new(),
+        started_at: String::new(),
+        completed_at: None,
+        worktree: merge
+            .map(|m| m.wt_path.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+        serial_isolated: false,
+        baseline_oid: merge
+            .map(|m| m.baseline_oid.to_string())
+            .unwrap_or_default(),
+        worktree_branch: merge.map(|m| m.branch.to_string()).unwrap_or_default(),
+        integration_oid: String::new(),
+        integration_base_oid: String::new(),
+        integration_worker_oid: String::new(),
+        integration_provenance: merge
+            .map(|m| m.provenance)
+            .unwrap_or(IntegrationProvenance::Unknown),
+        integration_cleanup_complete: false,
+        owned_oids: Vec::new(),
+        output_contract_incident: None,
+        result_recovered_from_stdout: None,
+    });
+    // Never preserve identity or worktree-location fields from the
+    // worker-writable projection. These values are all known by the core at
+    // finalization time, and recovery uses them to select and clean up runs.
+    rec.schema_version = 1;
+    rec.run_id = run_id.to_string();
+    rec.task_id = task.id.clone();
+    rec.intent_id = intent_id.to_string();
+    rec.worker = worker_id.to_string();
+    if let Some(merge) = merge {
+        apply_core_run_projection(
+            &mut rec,
+            CoreRunProjection {
+                run_id,
+                task_id: &task.id,
+                intent_id,
+                worker: worker_id,
+                worktree: merge.wt_path,
+                branch: merge.branch,
+                baseline_oid: merge.baseline_oid,
+                provenance: merge.provenance,
+            },
+        );
+    }
+    rec.state = run_outcome_label(next_state).to_string();
+    rec.completed_at = Some(Local::now().to_rfc3339());
+    if let Ok(text) = crate::yaml::to_string(&rec) {
+        let _ = state::write_str_atomic(&path, &text);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_run_integration(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    run_id: &str,
+    task_id: &str,
+    intent_id: &str,
+    worker_id: &str,
+    merge: &MergeBack<'_>,
+    base_oid: &str,
+    worker_oid: &str,
+    oid: &str,
+    owned_oids: &[String],
+) -> Result<state::IntegratedCleanupReceipt> {
+    if run_dir != ws.runs_dir().join(run_id) {
+        return Err(anyhow!(
+            "integration run directory does not match its core identity"
+        ));
+    }
+    let receipt = state::IntegratedCleanupReceipt {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        task_id: task_id.to_string(),
+        intent_id: intent_id.to_string(),
+        worker: worker_id.to_string(),
+        worktree: merge.wt_path.display().to_string(),
+        branch: merge.branch.to_string(),
+        baseline_oid: merge.baseline_oid.to_string(),
+        integration_base_oid: base_oid.to_string(),
+        integration_worker_oid: worker_oid.to_string(),
+        integration_oid: oid.to_string(),
+        provenance: merge.provenance,
+        owned_oids: owned_oids.to_vec(),
+        core_input_overlays: merge.core_input_overlays.to_vec(),
+        dependency_input_overlays: merge.dependency_input_overlays.to_vec(),
+    };
+    // The external receipt is the cleanup trust root and must become durable
+    // before the worker-writable run record is projected.
+    ws.save_integrated_cleanup_receipt(&receipt)?;
+    persist_integrated_cleanup_projection(run_dir, &receipt, false)?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_no_change_receipt(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    run_id: &str,
+    task_id: &str,
+    intent_id: &str,
+    worker_id: &str,
+    merge: &MergeBack<'_>,
+    worker_oid: &str,
+) -> Result<state::NoChangeReceipt> {
+    if run_dir != ws.runs_dir().join(run_id) || worker_oid != merge.baseline_oid {
+        return Err(anyhow!(
+            "no-change run identity is incomplete or inconsistent"
+        ));
+    }
+    let receipt = state::NoChangeReceipt {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        task_id: task_id.to_string(),
+        intent_id: intent_id.to_string(),
+        worker: worker_id.to_string(),
+        worktree: merge.wt_path.display().to_string(),
+        branch: merge.branch.to_string(),
+        baseline_oid: merge.baseline_oid.to_string(),
+        worker_oid: worker_oid.to_string(),
+        provenance: merge.provenance,
+        core_input_overlays: merge.core_input_overlays.to_vec(),
+        dependency_input_overlays: merge.dependency_input_overlays.to_vec(),
+    };
+    ws.save_no_change_receipt(&receipt)?;
+    persist_no_change_projection(run_dir, &receipt, false)?;
+    Ok(receipt)
+}
+
+#[derive(Clone, Copy)]
+struct CoreRunProjection<'a> {
+    run_id: &'a str,
+    task_id: &'a str,
+    intent_id: &'a str,
+    worker: &'a str,
+    worktree: &'a std::path::Path,
+    branch: &'a str,
+    baseline_oid: &'a str,
+    provenance: IntegrationProvenance,
+}
+
+fn apply_core_run_projection(record: &mut RunRecord, projection: CoreRunProjection<'_>) {
+    record.schema_version = 1;
+    record.run_id = projection.run_id.to_string();
+    record.task_id = projection.task_id.to_string();
+    record.intent_id = projection.intent_id.to_string();
+    record.worker = projection.worker.to_string();
+    if record.state.is_empty() {
+        record.state = "running".to_string();
+    }
+    record.worktree = projection.worktree.display().to_string();
+    record.worktree_branch = projection.branch.to_string();
+    record.serial_isolated = projection.provenance == IntegrationProvenance::SerialCoreStaged;
+    record.baseline_oid = projection.baseline_oid.to_string();
+    record.integration_provenance = projection.provenance;
+}
+
+fn persist_no_change_projection(
+    run_dir: &std::path::Path,
+    receipt: &state::NoChangeReceipt,
+    cleanup_complete: bool,
+) -> Result<()> {
+    if run_dir.file_name().and_then(|name| name.to_str()) != Some(receipt.run_id.as_str()) {
+        return Err(anyhow!(
+            "no-change run directory does not match its core identity"
+        ));
+    }
+    let path = run_dir.join("run.yaml");
+    let mut record: RunRecord = state::load_yaml(&path).unwrap_or_default();
+    let worktree = PathBuf::from(&receipt.worktree);
+    apply_core_run_projection(
+        &mut record,
+        CoreRunProjection {
+            run_id: &receipt.run_id,
+            task_id: &receipt.task_id,
+            intent_id: &receipt.intent_id,
+            worker: &receipt.worker,
+            worktree: &worktree,
+            branch: &receipt.branch,
+            baseline_oid: &receipt.baseline_oid,
+            provenance: receipt.provenance,
+        },
+    );
+    record.integration_oid.clear();
+    record.integration_base_oid.clear();
+    record.integration_worker_oid.clear();
+    record.owned_oids.clear();
+    record.integration_cleanup_complete = cleanup_complete;
+    state::write_str_atomic(&path, &crate::yaml::to_string(&record)?)
+}
+
+fn persist_integrated_cleanup_projection(
+    run_dir: &std::path::Path,
+    receipt: &state::IntegratedCleanupReceipt,
+    cleanup_complete: bool,
+) -> Result<()> {
+    let path = run_dir.join("run.yaml");
+    let mut record: RunRecord = state::load_yaml(&path).unwrap_or_default();
+    let worktree = PathBuf::from(&receipt.worktree);
+    apply_core_run_projection(
+        &mut record,
+        CoreRunProjection {
+            run_id: &receipt.run_id,
+            task_id: &receipt.task_id,
+            intent_id: &receipt.intent_id,
+            worker: &receipt.worker,
+            worktree: &worktree,
+            branch: &receipt.branch,
+            baseline_oid: &receipt.baseline_oid,
+            provenance: receipt.provenance,
+        },
+    );
+    record.integration_base_oid = receipt.integration_base_oid.clone();
+    record.integration_worker_oid = receipt.integration_worker_oid.clone();
+    record.integration_oid = receipt.integration_oid.clone();
+    record.integration_provenance = receipt.provenance;
+    record.integration_cleanup_complete = cleanup_complete;
+    record.owned_oids = receipt.owned_oids.clone();
+    state::write_str_atomic(&path, &crate::yaml::to_string(&record)?)
+}
+
+fn record_failover(run_dir: &std::path::Path, from: &str, to: &str, reason: &str) {
+    let event = RunFailover {
+        from: from.to_string(),
+        to: to.to_string(),
+        reason: reason.to_string(),
+        at: Local::now().to_rfc3339(),
+    };
+    let _ = write_str(
+        &run_dir.join("failover.json"),
+        &serde_json::to_string_pretty(&event).unwrap_or_default(),
+    );
+}
+
+/// Shared by the serial and parallel failover paths so the appended heading
+/// can never drift from `WORKER_FAILOVER_HEADING` and the authorship
+/// classifier (`handoff_is_worker_authored`).
+pub(crate) fn append_failover_note(run_dir: &std::path::Path, note: &str) -> Result<()> {
+    let mut md = format!("\n## {WORKER_FAILOVER_HEADING}\n\n");
+    md.push_str(note);
+    md.push('\n');
+    append_str(&run_dir.join("checkpoint.md"), &md)?;
+    append_str(&run_dir.join("handoff.md"), &md)?;
+    Ok(())
+}
+
+fn append_output_contract_incident_note(
+    run_dir: &std::path::Path,
+    incident: &OutputContractIncident,
+) -> Result<()> {
+    let terminal = incident
+        .terminal_attempt_id
+        .as_deref()
+        .unwrap_or("recovered");
+    let note = format!(
+        "\n## Output contract recovery\n\n- cause: `provider_response_refused`\n- worker: `{}`\n- first attempt: `{}`\n- recovery consumed: `{}`\n- terminal attempt: `{terminal}`\n- worker-output.log span: `{}..{}`\n",
+        incident.worker_id,
+        incident.first_attempt_id,
+        incident.recovery_consumed,
+        incident.first_log_span.byte_start,
+        incident.first_log_span.byte_end,
+    );
+    append_str(&run_dir.join("checkpoint.md"), &note)?;
+    append_str(&run_dir.join("handoff.md"), &note)?;
+    Ok(())
+}
+
+fn append_output_contract_classification_skip_notes(
+    run_dir: &std::path::Path,
+    notices: &[String],
+) -> Result<()> {
+    if notices.is_empty() {
+        return Ok(());
+    }
+    let mut note = String::from("\n## Provider refusal classification skipped\n\n");
+    for notice in notices {
+        note.push_str("- ");
+        note.push_str(notice);
+        note.push('\n');
+    }
+    append_str(&run_dir.join("checkpoint.md"), &note)?;
+    append_str(&run_dir.join("handoff.md"), &note)?;
+    Ok(())
+}
+
+fn append_nonblocking_follow_up_notes(run_dir: &std::path::Path, result: &RunResult) -> Result<()> {
+    if result.status != "done" || result.follow_up_tasks.is_empty() {
+        return Ok(());
+    }
+    let mut note = String::from("\n## Non-blocking follow-up notes\n\n");
+    note.push_str(
+        "Acceptance was reported as complete. These leftovers did not block Done and were \
+         kept as follow-up notes:\n",
+    );
+    let mut wrote_item = false;
+    for fu in &result.follow_up_tasks {
+        let title = fu.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        wrote_item = true;
+        note.push_str("- ");
+        note.push_str(title);
+        let reason = fu.reason.trim();
+        if !reason.is_empty() {
+            note.push_str(": ");
+            note.push_str(reason);
+        }
+        note.push('\n');
+    }
+    if !wrote_item {
+        return Ok(());
+    }
+    append_str(&run_dir.join("checkpoint.md"), &note)?;
+    append_str(&run_dir.join("handoff.md"), &note)?;
+    Ok(())
+}
+
+/// Context for CONTINUING a Partial task instead of redoing it: the previous
+/// run's checkpoint plus what evaluation said is still missing. Injected into
+/// the next packet of that task (docs/harness.md, phase H2).
+pub(crate) fn continuation_context(ws: &Workspace, task_id: &str) -> Option<String> {
+    let (_, run_dir) = latest_run_for(ws, task_id)?;
+    let mut s = String::new();
+    if let Ok(cp) = std::fs::read_to_string(run_dir.join("checkpoint.md")) {
+        s.push_str(cp.trim());
+        s.push_str("\n\n");
+    }
+    if let Ok(raw) = std::fs::read_to_string(run_dir.join("result.json")) {
+        if let Ok(r) = serde_json::from_str::<RunResult>(&raw) {
+            if !r.compact_summary.is_empty() {
+                s.push_str("Previous run summary: ");
+                s.push_str(&r.compact_summary);
+                s.push('\n');
+            }
+            if !r.validation.failures.is_empty() {
+                s.push_str("Unresolved failures:\n");
+                for f in &r.validation.failures {
+                    s.push_str("- ");
+                    s.push_str(f);
+                    s.push('\n');
+                }
+            }
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(run_dir.join("feedback.json")) {
+        if let Ok(f) = serde_json::from_str::<FeedbackRecord>(&raw) {
+            s.push_str(&format!(
+                "Feedback cycle {}/{} (retryable={}):\n",
+                f.cycle, f.max_cycles, f.retryable
+            ));
+            for failure in f.failures {
+                s.push_str("- Failed check: ");
+                s.push_str(&failure);
+                s.push('\n');
+            }
+            for unmet in f.unmet_acceptance {
+                s.push_str("- Unmet acceptance: ");
+                s.push_str(&unmet);
+                s.push('\n');
+            }
+        }
+    }
+    // Keep the packet lean even if a checkpoint ballooned.
+    const CAP: usize = 6 * 1024;
+    if s.len() > CAP {
+        let mut end = CAP;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push_str("\n[truncated]");
+    }
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Ownership for a run whose branch is gone because it was ALREADY integrated.
+/// Read only from this run's own durable receipt, and only when that receipt
+/// names this run and task and its integration commit is still reachable from
+/// the workspace head. Anything else returns None so a missing branch can never
+/// be mistaken for a completed integration.
+fn already_integrated_ownership(
+    ws: &Workspace,
+    run_dir: &std::path::Path,
+    run_id: &str,
+    task_id: &str,
+) -> Option<crate::git_finish::GitFinishOwnership> {
+    let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).ok()?;
+    if record.run_id != run_id || record.task_id != task_id {
+        return None;
+    }
+    let integration_oid = (!record.integration_oid.is_empty()).then_some(record.integration_oid)?;
+    // The recorded merge must actually be in this workspace's history; a
+    // receipt alone is not proof the work is present.
+    git_stdout(
+        &ws.root,
+        &["merge-base", "--is-ancestor", &integration_oid, "HEAD"],
+    )
+    .ok()?;
+    Some(crate::git_finish::GitFinishOwnership {
+        baseline_oid: record.integration_base_oid,
+        expected_oid: integration_oid,
+        owned_oids: record.owned_oids,
+    })
+}
+
+/// Repo-relative paths of just-learned harness assets that git does not track
+/// yet. Only files git reports as untracked are listed: an asset that updated
+/// an already-tracked skill shows up as a modification, which the normal
+/// workspace diff already surfaces.
+fn untracked_harness_assets(ws: &Workspace, skills: &[String], rules: &[String]) -> Vec<String> {
+    // `record_run_rules` returns bare names; the files it writes carry the
+    // `learned-` prefix.
+    let candidates: Vec<String> = skills
+        .iter()
+        .map(|name| format!(".agents/skills/{name}/SKILL.md"))
+        .chain(
+            rules
+                .iter()
+                .map(|name| format!(".agents/rules/learned-{name}.md")),
+        )
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    candidates
+        .into_iter()
+        .filter(|path| ws.root.join(path).exists())
+        .filter(|path| {
+            // `ls-files --error-unmatch` exits 1 for a path git does not track.
+            // ONLY that exit code means untracked. Any other failure means the
+            // question was not answered, and reporting "NOT in git yet" on the
+            // strength of a git that exited 42 is a claim this never checked
+            // (issue #104). Silence is the honest response to an unanswered
+            // question here, because the notice only ever adds a warning.
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.root)
+                .args(["ls-files", "--error-unmatch", "--"])
+                .arg(path)
+                .output()
+                .map(|out| out.status.code() == Some(1))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Why a run left its task Partial, as recorded in the run's `partial-reason`
+/// marker. The marker's presence means a human is needed before the drain can
+/// continue; its CONTENT says what they actually have to do, and those
+/// remediations differ (issue #40). Unrecognized markers keep their raw text
+/// rather than being folded into a familiar-looking cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartialReason {
+    pub kind: PartialReasonKind,
+    /// Raw marker text, for causes with no dedicated wording.
+    pub marker: String,
+    /// Cause-specific evidence, e.g. the pre-push checks that failed.
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartialReasonKind {
+    /// The merge itself conflicted; the worktree is kept for manual integration.
+    MergeConflict,
+    /// Integration failed for some other reason. Distinct from a conflict:
+    /// there is nothing to resolve by hand (issue #69).
+    IntegrationError,
+    /// The work merged cleanly; only delivery is unverified.
+    GitFinishUnverified,
+    WorktreeCleanupChanged,
+    AutoCommitDisabled,
+    Other,
+}
+
+impl PartialReason {
+    fn from_marker(marker: &str, run_dir: &std::path::Path) -> Self {
+        let marker = marker.trim().to_string();
+        let kind = match marker.as_str() {
+            "merge_conflict" => PartialReasonKind::MergeConflict,
+            "integration_error" => PartialReasonKind::IntegrationError,
+            "git_finish_unverified" => PartialReasonKind::GitFinishUnverified,
+            "worktree_cleanup_changed" => PartialReasonKind::WorktreeCleanupChanged,
+            "auto_commit_disabled" => PartialReasonKind::AutoCommitDisabled,
+            _ => PartialReasonKind::Other,
+        };
+        let detail = (kind == PartialReasonKind::GitFinishUnverified)
+            .then(|| git_finish_block_detail(run_dir))
+            .flatten();
+        Self {
+            kind,
+            marker,
+            detail,
+        }
+    }
+}
+
+/// Name the failing pre-push checks behind a `git_finish_unverified` Partial so
+/// the operator is not told to go hunting for the cause.
+fn git_finish_block_detail(run_dir: &std::path::Path) -> Option<String> {
+    let record: crate::git_finish::GitFinishRecord =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("git-finish.json")).ok()?)
+            .ok()?;
+    let failed: Vec<&str> = record
+        .checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| check.name.as_str())
+        .collect();
+    if !failed.is_empty() {
+        return Some(failed.join(", "));
+    }
+    Some(record.status.as_str().to_string())
+}
+
+/// The typed reason this task's latest run left it Partial, if it recorded one.
+/// A Partial with no marker is a worker self-report and is safe to auto-retry.
+pub(crate) fn latest_partial_reason(ws: &Workspace, task_id: &str) -> Option<PartialReason> {
+    let (_, dir) = latest_run_for(ws, task_id)?;
+    let marker = std::fs::read_to_string(dir.join("partial-reason")).ok()?;
+    Some(PartialReason::from_marker(&marker, &dir))
+}
+
+/// The intent a run belonged to, read from its `run.yaml` (empty if unknown).
+fn run_intent_id(run_dir: &std::path::Path) -> Option<String> {
+    state::load_yaml::<RunRecord>(&run_dir.join("run.yaml"))
+        .ok()
+        .map(|r| r.intent_id)
+        .filter(|s| !s.is_empty())
+}
+
+/// The most recent unanswered question a worker left for a given task, if any.
+///
+/// Scoped to the CURRENT intent. Task ids repeat across intents (a fresh plan
+/// can reuse `YARD-001`), and a past plan's `result.json`/conversation stays on
+/// disk (new plans do not sweep `runs/`). Without intent scoping the newest
+/// on-disk run for that bare id wins — surfacing a stale question from a past
+/// intent (the dogfood-caught stale-question defect). We take the live intent
+/// from the queue and only consider runs/turns that belong to it. When the
+/// intent is unknown (no queue / unattributed legacy run) we fall back to the
+/// old bare-id behavior rather than hide a genuine question.
+pub fn latest_question_for(ws: &Workspace, task_id: &str) -> Option<String> {
+    let current_queue = ws.load_queue().ok();
+    let current_intent = current_queue
+        .as_ref()
+        .map(|q| q.intent_id.clone())
+        .filter(|s| !s.is_empty());
+    if let Some(intent_id) = current_intent.as_deref() {
+        if let Ok(channel) = ws.load_task_channel(intent_id, task_id) {
+            if let Some(question) = channel
+                .questions
+                .iter()
+                .rev()
+                .find(|question| question.state == QuestionState::Open)
+            {
+                return Some(question.text.clone());
+            }
+        }
+    }
+    let mut best: Option<(SystemTime, String)> = None;
+    if let Ok(entries) = std::fs::read_dir(ws.runs_dir()) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let result_path = dir.join("result.json");
+            let Ok(text) = std::fs::read_to_string(&result_path) else {
+                continue;
+            };
+            let Ok(result) = serde_json::from_str::<RunResult>(&text) else {
+                continue;
+            };
+            if result.task_id != task_id {
+                continue;
+            }
+            // Reject a same-id result that belongs to a different (past) intent.
+            if let Some(cur) = &current_intent {
+                if run_intent_id(&dir).as_deref() != Some(cur.as_str()) {
+                    continue;
+                }
+            }
+            let Some(q) = result.question_for_user.filter(|q| !q.trim().is_empty()) else {
+                continue;
+            };
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                best = Some((mtime, q));
+            }
+        }
+    }
+    if let Some((_, q)) = best {
+        return Some(q);
+    }
+    // Canonical typed questions outrank the legacy conversation fallback. A
+    // queue-CAS -> conversation crash may leave an older unattributed worker
+    // turn on disk; returning it first would mask the current interaction or
+    // receipt-backed capability question.
+    if let Some(task) = current_queue.as_ref().and_then(|queue| {
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id && task.state == TaskState::NeedsUser)
+    }) {
+        if let Some(crate::yaml::Value::Mapping(interaction)) = task.interaction.as_ref() {
+            if let Some(question) = interaction
+                .get(crate::yaml::Value::String("decision_question".to_string()))
+                .and_then(crate::yaml::Value::as_str)
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+            {
+                return Some(question.to_string());
+            }
+        }
+        if let Some(question) = ws
+            .runtime_capability_decision_question(task_id)
+            .ok()
+            .flatten()
+        {
+            return Some(question);
+        }
+    }
+    // Legacy fallback: a question seeded straight into the conversation has
+    // no result.json. It is pending only while unanswered — i.e. the last turn
+    // is still the worker's; once the user replies, the last turn is theirs.
+    // Conversation files survive replanning, so scope attributable turns to
+    // the current intent.
+    let conv = ws.load_conversation(current_intent.as_deref().unwrap_or(""), task_id);
+    match conv.turns.last() {
+        Some(t) if t.role == TurnRole::Worker && !t.text.trim().is_empty() => {
+            if let Some(cur) = &current_intent {
+                if !t.run_id.is_empty() {
+                    let rd = ws.runs_dir().join(&t.run_id);
+                    if rd.join("run.yaml").exists()
+                        && run_intent_id(&rd).as_deref() != Some(cur.as_str())
+                    {
+                        return None;
+                    }
+                }
+            }
+            Some(t.text.clone())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel_event(
+        event_id: &str,
+        event_type: ChannelEventType,
+        attempt_id: Option<&str>,
+    ) -> ChannelEvent {
+        ChannelEvent {
+            schema_version: 1,
+            event_id: event_id.into(),
+            session_id: "session-test".into(),
+            seq: 0,
+            event_type,
+            recorded_at: String::new(),
+            actor: EventActor {
+                kind: EventActorKind::System,
+                id: String::new(),
+            },
+            action_id: None,
+            causation_id: None,
+            correlation_id: "cor-test".into(),
+            task_id: "YARD-001".into(),
+            attempt_id: attempt_id.map(str::to_string),
+            payload: serde_json::Value::Null,
+            raw_ref: None,
+        }
+    }
+
+    /// Issue #45: a learned skill on disk but not in git is not durable. The
+    /// reminder must fire for exactly the untracked ones, and must use the
+    /// real on-disk paths (rules carry a `learned-` prefix).
+    #[test]
+    fn untracked_learned_harness_assets_are_listed_for_the_operator() {
+        let root =
+            std::env::temp_dir().join(format!("yard-untracked-harness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sh = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        sh(&["init", "-q"]);
+        sh(&["config", "user.email", "t@example.com"]);
+        sh(&["config", "user.name", "t"]);
+
+        let ws = Workspace::at(&root);
+        let write = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "body\n").unwrap();
+        };
+        write(".agents/skills/tracked-skill/SKILL.md");
+        write(".agents/rules/learned-tracked-rule.md");
+        sh(&["add", "-A"]);
+        sh(&["commit", "-qm", "seed"]);
+
+        write(".agents/skills/fresh-skill/SKILL.md");
+        write(".agents/rules/learned-fresh-rule.md");
+
+        let untracked = untracked_harness_assets(
+            &ws,
+            &["fresh-skill".to_string(), "tracked-skill".to_string()],
+            &["fresh-rule".to_string(), "tracked-rule".to_string()],
+        );
+        assert_eq!(
+            untracked,
+            vec![
+                ".agents/skills/fresh-skill/SKILL.md".to_string(),
+                ".agents/rules/learned-fresh-rule.md".to_string(),
+            ],
+            "only the assets git does not track yet"
+        );
+
+        // Nothing learned, nothing to say.
+        assert!(untracked_harness_assets(&ws, &[], &[]).is_empty());
+        // A name with no file on disk is never reported.
+        assert!(untracked_harness_assets(&ws, &["ghost".to_string()], &[]).is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Only "git looked and does not track it" may produce the warning. A git
+    /// that fails for any other reason has not answered the question, and saying
+    /// "NOT in git yet" on the strength of that is a claim nothing verified
+    /// (issue #104, found while reviewing the fix for it).
+    ///
+    /// A directory that is not a repository is the realistic case: the file is
+    /// right there on disk, and `ls-files --error-unmatch` exits 128, not the 1
+    /// that means "this path is untracked".
+    #[test]
+    fn a_git_that_fails_for_another_reason_does_not_become_untracked() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-untracked-nonrepo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let skill = root.join(".agents/skills/some-skill/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "body\n").unwrap();
+
+        let ws = Workspace::at(&root);
+        let reported = untracked_harness_assets(&ws, &["some-skill".to_string()], &[]);
+        assert!(
+            reported.is_empty(),
+            "git failing because this is not a repository was read as proof the \
+             asset is untracked: {reported:?}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Issue #40: the marker's CONTENT decides the remediation. Reading only
+    /// its existence reported every blocked Partial as a merge conflict.
+    #[test]
+    fn partial_reason_is_typed_from_the_marker_content() {
+        let dir = std::env::temp_dir().join(format!("yard-partial-reason-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (marker, expected) in [
+            ("merge_conflict", PartialReasonKind::MergeConflict),
+            ("integration_error", PartialReasonKind::IntegrationError),
+            (
+                "git_finish_unverified",
+                PartialReasonKind::GitFinishUnverified,
+            ),
+            (
+                "worktree_cleanup_changed",
+                PartialReasonKind::WorktreeCleanupChanged,
+            ),
+            (
+                "auto_commit_disabled",
+                PartialReasonKind::AutoCommitDisabled,
+            ),
+            ("something_new", PartialReasonKind::Other),
+        ] {
+            // Trailing newline: writers use both forms.
+            let reason = PartialReason::from_marker(&format!("{marker}\n"), &dir);
+            assert_eq!(reason.kind, expected, "{marker}");
+            assert_eq!(reason.marker, marker);
+        }
+
+        // git_finish_unverified names the failing pre-push checks when the
+        // run recorded them.
+        std::fs::write(
+            dir.join("git-finish.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "run_id": "run-test",
+                "task_id": "YARD-001",
+                "attempted_at": "",
+                "status": "check_blocked",
+                "policy": {
+                    "auto_push": false,
+                    "remote": "origin",
+                    "target_ref": "refs/heads/main",
+                    "pre_push_checks": ["cargo fmt", "cargo clippy"]
+                },
+                "checks": [
+                    {"name": "cargo fmt", "passed": true},
+                    {"name": "cargo clippy", "passed": false}
+                ],
+                "push_invoked": false,
+                "push_succeeded": false,
+                "reason": "pre_push_check_failed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let reason = PartialReason::from_marker("git_finish_unverified", &dir);
+        assert_eq!(reason.detail.as_deref(), Some("cargo clippy"));
+
+        // A conflict marker never picks up Git finish detail.
+        let reason = PartialReason::from_marker("merge_conflict", &dir);
+        assert_eq!(reason.detail, None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn eval_with_failed_checks(names: &[&str]) -> evaluator::Evaluation {
+        evaluator::Evaluation {
+            run_id: "run-test".into(),
+            task_id: "YARD-002".into(),
+            status: "failed".into(),
+            checks: names
+                .iter()
+                .map(|name| evaluator::Check {
+                    name: (*name).into(),
+                    passed: false,
+                    fatal: true,
+                    note: String::new(),
+                })
+                .collect(),
+            next_task_state: TaskState::Failed,
+        }
+    }
+
+    fn review_task() -> crate::schemas::Task {
+        crate::yaml::from_str("id: YARD-002\ntitle: review\nkind: review\n").unwrap()
+    }
+
+    /// Issue #39: a review worker that exits without result.json produced NO
+    /// verdict. Telling the operator the review "did not pass" makes them queue
+    /// fix tasks for a review that never judged anything.
+    #[test]
+    fn review_without_artifacts_is_not_reported_as_a_failed_verdict() {
+        let missing = eval_with_failed_checks(&["result_file_present"]);
+        assert_eq!(
+            review_failure_cause(&missing),
+            ReviewFailureCause::ArtifactsMissing
+        );
+        let question = review_without_remediation_question(
+            &review_task(),
+            review_failure_cause(&missing),
+            None,
+        );
+        assert!(question.contains("판정 자체가 없습니다"), "{question}");
+        assert!(
+            !question.contains("리뷰가 통과하지 못했고"),
+            "must not claim a failing verdict: {question}"
+        );
+
+        let invalid = eval_with_failed_checks(&["result_schema_valid"]);
+        assert_eq!(
+            review_failure_cause(&invalid),
+            ReviewFailureCause::ArtifactsMissing
+        );
+
+        // A real failing verdict keeps the remediation wording.
+        let judged = eval_with_failed_checks(&["review_criteria_pass"]);
+        assert_eq!(
+            review_failure_cause(&judged),
+            ReviewFailureCause::VerdictFailed
+        );
+        let question = review_without_remediation_question(
+            &review_task(),
+            review_failure_cause(&judged),
+            None,
+        );
+        assert!(question.contains("리뷰가 통과하지 못했고"), "{question}");
+    }
+
+    /// Issue #38: when the missing artifacts are explained by a typed incident,
+    /// the operator prompt names that cause instead of leaving them guessing.
+    #[test]
+    fn review_artifacts_missing_question_names_a_typed_incident_cause() {
+        let incident = OutputContractIncident {
+            cause: OutputContractCause::WorkerDeferredToBackgroundTask,
+            worker_id: "claude-code".into(),
+            first_attempt_id: "attempt-1".into(),
+            first_log_span: WorkerOutputLogSpan {
+                path: "worker-output.log".into(),
+                byte_start: 0,
+                byte_end: 1,
+            },
+            recovery_consumed: true,
+            terminal_attempt_id: Some("attempt-2".into()),
+        };
+        let question = review_without_remediation_question(
+            &review_task(),
+            ReviewFailureCause::ArtifactsMissing,
+            Some(&incident),
+        );
+        assert!(question.contains("백그라운드 작업"), "{question}");
+    }
+
+    #[test]
+    fn finalization_artifact_causation_is_stable_across_recovery_publications() {
+        let attempt_id = "run-test";
+        let mut events = vec![
+            channel_event(
+                "evt-attempt",
+                ChannelEventType::AttemptPrepared,
+                Some(attempt_id),
+            ),
+            channel_event(
+                "evt-worker",
+                ChannelEventType::WorkerCompleted,
+                Some(attempt_id),
+            ),
+            channel_event(
+                "evt-validation",
+                ChannelEventType::ValidationCompleted,
+                Some(attempt_id),
+            ),
+        ];
+
+        assert_eq!(
+            finalization_artifact_causation(&events, attempt_id),
+            Some("evt-validation".to_string())
+        );
+
+        events.push(channel_event(
+            "evt-artifact",
+            ChannelEventType::ArtifactCreated,
+            Some(attempt_id),
+        ));
+        assert_eq!(
+            finalization_artifact_causation(&events, attempt_id),
+            Some("evt-validation".to_string())
+        );
+    }
+
+    #[test]
+    fn unparseable_started_at_never_defers_the_prepare_window_diagnosis() {
+        let run_id = "run-prepare-grace-unparseable";
+        let run_dir = std::env::temp_dir().join(format!(
+            "yard-prepare-grace-unparseable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        // stale_running_reason keys identity off the directory name.
+        let run_dir = run_dir.join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: YARD-001\nintent_id: intent-test\nworker: fixture\nstate: running\nstarted_at: \"not-a-timestamp\"\nworktree: .\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("worker-process.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\nattempt_id: att-grace\nworker_id: fixture\npid: 0\nstate: prepared\n"
+            ),
+        )
+        .unwrap();
+
+        let reason = stale_running_reason(&run_dir, "YARD-001", "intent-test")
+            .expect("an unverifiable started_at must fail closed, not defer forever");
+        assert!(
+            reason.contains("dispatch preparation"),
+            "reason should name the stalled prepare window: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(run_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn unparseable_started_at_never_defers_the_missing_provenance_diagnosis() {
+        let run_id = "run-provenance-grace-unparseable";
+        let run_dir = std::env::temp_dir().join(format!(
+            "yard-provenance-grace-unparseable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        // stale_running_reason keys identity off the directory name.
+        let run_dir = run_dir.join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: YARD-001\nintent_id: intent-test\nworker: fixture\nstate: running\nstarted_at: \"not-a-timestamp\"\nworktree: .\n"
+            ),
+        )
+        .unwrap();
+
+        let reason = stale_running_reason(&run_dir, "YARD-001", "intent-test")
+            .expect("an unverifiable started_at must fail closed, not defer forever");
+        assert!(
+            reason.contains("provenance is missing"),
+            "reason should name the missing provenance: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(run_dir.parent().unwrap());
+    }
+
+    fn planned_worker_authored(entries: &[(&'static str, &'static str, bool)], name: &str) -> bool {
+        entries
+            .iter()
+            .find(|(entry_name, _, _)| *entry_name == name)
+            .unwrap_or_else(|| panic!("missing finalization artifact entry {name}"))
+            .2
+    }
+
+    #[test]
+    fn finalization_plan_marks_worker_authored_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-handoff-worker-authored-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_str(&root.join("handoff.md"), "# Worker handoff\n").unwrap();
+
+        let entries = plan_finalization_artifact_entries(&root);
+        assert!(
+            planned_worker_authored(&entries, "handoff.md"),
+            "a handoff.md the worker wrote must be recorded worker_authored=true"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalization_plan_marks_evaluator_fallback_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-handoff-evaluator-fallback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let entries = plan_finalization_artifact_entries(&root);
+        assert!(
+            !planned_worker_authored(&entries, "handoff.md"),
+            "an evaluator-fallback handoff.md must be recorded worker_authored=false"
+        );
+        assert!(planned_worker_authored(&entries, "result.json"));
+        for core_owned in ["evaluation.json", "evaluator-summary.md", "checkpoint.md"] {
+            assert!(!planned_worker_authored(&entries, core_owned));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalization_plan_is_fixed_before_evaluator_fallback_write() {
+        // finalize_run plans the artifact classification BEFORE
+        // compact::write_evaluator_summary can create the fallback handoff.md;
+        // a fallback appearing afterwards must not flip the classification.
+        let root =
+            std::env::temp_dir().join(format!("yard-handoff-plan-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let entries = plan_finalization_artifact_entries(&root);
+        write_str(&root.join("handoff.md"), "# Handoff: fallback copy\n").unwrap();
+        assert!(
+            !planned_worker_authored(&entries, "handoff.md"),
+            "classification captured pre-fallback must stay worker_authored=false"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalization_plan_marks_failover_note_only_handoff_core_authored() {
+        // append_failover_note writes through append_str, which creates a
+        // missing handoff.md; a file holding nothing but that core-appended
+        // note must not pass as worker output.
+        let root = std::env::temp_dir().join(format!(
+            "yard-handoff-failover-note-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        append_failover_note(
+            &root,
+            "worker failover: codex -> claude-code; codex exited without result.json \
+             after 1/2 resume attempt(s)",
+        )
+        .unwrap();
+        assert!(root.join("handoff.md").is_file());
+
+        let entries = plan_finalization_artifact_entries(&root);
+        assert!(
+            !planned_worker_authored(&entries, "handoff.md"),
+            "a handoff.md created only by the core failover note must be recorded \
+             worker_authored=false"
+        );
+
+        // A second core-appended note keeps the file core-only.
+        append_failover_note(
+            &root,
+            "worker failover unavailable after claude-code exited without result.json: \
+             no ready worker",
+        )
+        .unwrap();
+        let entries = plan_finalization_artifact_entries(&root);
+        assert!(
+            !planned_worker_authored(&entries, "handoff.md"),
+            "stacked failover notes are still core-authored content"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failover_note_only_detection_requires_provably_core_content() {
+        // Empty or ambiguous content keeps the existence-based classification;
+        // authorship is only denied when every section is the core note.
+        assert!(!handoff_is_failover_note_only(""));
+        assert!(!handoff_is_failover_note_only("# Worker handoff\n"));
+        assert!(handoff_is_failover_note_only(
+            "\n## Worker failover\n\nworker failover: a -> b; no result.json\n"
+        ));
+        // Any other section heading is content beyond the core note.
+        assert!(!handoff_is_failover_note_only(
+            "\n## Worker failover\n\nnote\n\n## Summary\n\nworker text\n"
+        ));
+        // Worker prose before the appended note keeps worker authorship.
+        assert!(!handoff_is_failover_note_only(
+            "did the work\n\n## Worker failover\n\nnote\n"
+        ));
+    }
+
+    #[test]
+    fn finalization_plan_keeps_worker_handoff_with_failover_note_worker_authored() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-handoff-worker-plus-failover-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_str(
+            &root.join("handoff.md"),
+            "# Worker handoff\n\nWhat I changed and why.\n",
+        )
+        .unwrap();
+        append_failover_note(
+            &root,
+            "worker failover: codex -> claude-code; codex exited without result.json \
+             after 1/2 resume attempt(s)",
+        )
+        .unwrap();
+
+        let entries = plan_finalization_artifact_entries(&root);
+        assert!(
+            planned_worker_authored(&entries, "handoff.md"),
+            "a worker-authored handoff.md must stay worker_authored=true after the \
+             failover note is appended"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_invocation_ordinal_gets_a_distinct_attempt_identity() {
+        assert_eq!(attempt_id_for_ordinal("run-1", 1), "run-1");
+        assert_eq!(attempt_id_for_ordinal("run-1", 2), "run-1-attempt-2");
+        assert_eq!(attempt_id_for_ordinal("run-1", 3), "run-1-attempt-3");
+        assert_ne!(
+            attempt_id_for_ordinal("run-1", 2),
+            attempt_id_for_ordinal("run-1", 3)
+        );
+    }
+    use crate::schemas::{SelectionPolicy, Task, WorkQueue};
+
+    #[test]
+    fn telemetry_serializes_the_final_git_finish_projection() {
+        assert_eq!(telemetry_eval_state(TaskState::Partial), "Partial");
+        assert_eq!(telemetry_eval_state(TaskState::Done), "Done");
+    }
+
+    #[test]
+    fn auto_push_projects_only_remote_verified_finish_to_done() {
+        let make = |status| crate::git_finish::GitFinishRecord {
+            schema_version: 2,
+            run_id: "run-test".into(),
+            task_id: "YARD-001".into(),
+            attempted_at: String::new(),
+            status,
+            policy: crate::git_finish::GitFinishPolicySnapshot {
+                auto_push: true,
+                delivery: crate::schemas::GitFinishDelivery::Direct,
+                remote: "fixture".into(),
+                target_ref: "refs/heads/main".into(),
+                pre_push_checks: vec![],
+            },
+            expected_oid: None,
+            baseline_oid: String::new(),
+            owned_oids: vec![],
+            checks: vec![],
+            push_invoked: false,
+            push_succeeded: false,
+            remote_oid: None,
+            remote_before_oid: None,
+            head_ref: None,
+            pull_request_number: None,
+            pull_request_state: None,
+            reason: String::new(),
+        };
+        for status in [
+            crate::git_finish::GitFinishStatus::Prepared,
+            crate::git_finish::GitFinishStatus::CheckBlocked,
+            crate::git_finish::GitFinishStatus::SafetyBlocked,
+            crate::git_finish::GitFinishStatus::GitFailed,
+            crate::git_finish::GitFinishStatus::RemoteMismatch,
+        ] {
+            assert_eq!(
+                state_after_git_finish(TaskState::Done, &make(status)),
+                TaskState::Partial,
+                "{status:?}"
+            );
+        }
+        for status in [
+            crate::git_finish::GitFinishStatus::NotNeeded,
+            crate::git_finish::GitFinishStatus::Pushed,
+            crate::git_finish::GitFinishStatus::AlreadyApplied,
+            crate::git_finish::GitFinishStatus::PullRequestOpen,
+        ] {
+            assert_eq!(
+                state_after_git_finish(TaskState::Done, &make(status)),
+                TaskState::Done,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_git_finish_recovery_skips_done_historical_runs_on_other_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-done-historical-git-finishes-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+        let mut q = queue(vec![
+            task("YARD-001", TaskState::Done, 10, false),
+            task("YARD-005", TaskState::Done, 20, false),
+            task("YARD-010", TaskState::Partial, 30, false),
+        ]);
+        q.intent_id = "intent-git-finish-history".into();
+        ws.save_queue(&q).unwrap();
+
+        for (index, task_id, state, target_ref) in [
+            (1, "YARD-001", "done", "refs/heads/release-v010-001"),
+            (5, "YARD-005", "done", "refs/heads/release-v010-005"),
+            (10, "YARD-010", "partial", "refs/heads/main"),
+        ] {
+            let run_id = format!("run-20990101-0000{index:02}-{task_id}");
+            let run_dir = ws.runs_dir().join(&run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            write_str(&run_dir.join("result.json"), "{\"status\":\"done\"}").unwrap();
+            state::save_yaml(
+                &run_dir.join("run.yaml"),
+                &RunRecord {
+                    adoption: None,
+                    schema_version: 1,
+                    run_id: run_id.clone(),
+                    task_id: task_id.into(),
+                    intent_id: q.intent_id.clone(),
+                    worker: "codex".into(),
+                    state: state.into(),
+                    started_at: format!("2099-01-01T00:00:{index:02}+00:00"),
+                    completed_at: Some(format!("2099-01-01T00:01:{index:02}+00:00")),
+                    integration_oid: format!("integration-{index}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            ws.save_git_finish_record(
+                &run_dir,
+                &crate::git_finish::GitFinishRecord {
+                    schema_version: 2,
+                    run_id,
+                    task_id: task_id.into(),
+                    attempted_at: String::new(),
+                    status: crate::git_finish::GitFinishStatus::CheckBlocked,
+                    policy: crate::git_finish::GitFinishPolicySnapshot {
+                        auto_push: true,
+                        delivery: crate::schemas::GitFinishDelivery::Direct,
+                        remote: format!("fixture-{index}"),
+                        target_ref: target_ref.into(),
+                        pre_push_checks: vec![],
+                    },
+                    expected_oid: Some(format!("integration-{index}")),
+                    baseline_oid: format!("baseline-{index}"),
+                    owned_oids: vec![format!("integration-{index}")],
+                    checks: vec![],
+                    push_invoked: false,
+                    push_succeeded: false,
+                    remote_oid: None,
+                    remote_before_oid: None,
+                    head_ref: None,
+                    pull_request_number: None,
+                    pull_request_state: None,
+                    reason: "historical fixture".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let candidates = pending_git_finishes(&ws, &q);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["YARD-010"],
+            "Done historical runs must not be re-finalized for unrelated targets"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_git_finish_recovery_retains_only_latest_verified_stale_done_run() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-latest-verified-stale-git-finish-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+        let task_id = "YARD-DONE-STALE";
+        let mut q = queue(vec![task(task_id, TaskState::Done, 10, false)]);
+        q.intent_id = "intent-latest-verified-stale".into();
+        ws.save_queue(&q).unwrap();
+
+        for index in [1, 2] {
+            let run_id = format!("run-20990101-00000{index}-{task_id}");
+            let run_dir = ws.runs_dir().join(&run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            write_str(&run_dir.join("result.json"), "{\"status\":\"done\"}").unwrap();
+            state::save_yaml(
+                &run_dir.join("run.yaml"),
+                &RunRecord {
+                    adoption: None,
+                    schema_version: 1,
+                    run_id: run_id.clone(),
+                    task_id: task_id.into(),
+                    intent_id: q.intent_id.clone(),
+                    worker: "codex".into(),
+                    state: "partial".into(),
+                    started_at: format!("2099-01-01T00:00:0{index}+00:00"),
+                    completed_at: Some(format!("2099-01-01T00:01:0{index}+00:00")),
+                    integration_oid: format!("integration-{index}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            ws.save_git_finish_record(
+                &run_dir,
+                &crate::git_finish::GitFinishRecord {
+                    schema_version: 2,
+                    run_id: run_id.clone(),
+                    task_id: task_id.into(),
+                    attempted_at: String::new(),
+                    status: crate::git_finish::GitFinishStatus::Pushed,
+                    policy: crate::git_finish::GitFinishPolicySnapshot {
+                        auto_push: true,
+                        delivery: crate::schemas::GitFinishDelivery::Direct,
+                        remote: "fixture".into(),
+                        target_ref: "refs/heads/main".into(),
+                        pre_push_checks: vec![],
+                    },
+                    expected_oid: Some(format!("integration-{index}")),
+                    baseline_oid: format!("baseline-{index}"),
+                    owned_oids: vec![format!("integration-{index}")],
+                    checks: vec![],
+                    push_invoked: true,
+                    push_succeeded: true,
+                    remote_oid: Some(format!("integration-{index}")),
+                    remote_before_oid: Some(format!("baseline-{index}")),
+                    head_ref: None,
+                    pull_request_number: None,
+                    pull_request_state: None,
+                    reason: "remote_verified".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let candidates = pending_git_finishes(&ws, &q);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-20990101-000002-YARD-DONE-STALE"],
+            "only the latest verified run may repair a stale Done projection"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_messages_are_surface_neutral_no_command_literals() {
+        // AC-004: engine-streamed guidance names WHAT to do, never a `yardlet ...`
+        // command literal (each surface renders its own affordance).
+        let msgs = [
+            gate_msg::needs_user(Lang::En, "YARD-007"),
+            gate_msg::blocked(Lang::En, "YARD-008"),
+            gate_msg::drained_with_deferred(Lang::En, &["YARD-009", "YARD-010"]),
+            gate_msg::drained_complete(Lang::En),
+        ];
+        for m in &msgs {
+            assert!(
+                !m.contains("yardlet"),
+                "gate message leaked a command literal: {m:?}"
+            );
+        }
+        assert!(gate_msg::needs_user(Lang::En, "YARD-007").contains("YARD-007"));
+        assert!(gate_msg::blocked(Lang::En, "YARD-008").contains("YARD-008"));
+        let def = gate_msg::drained_with_deferred(Lang::En, &["YARD-009", "YARD-010"]);
+        assert!(def.contains("YARD-009") && def.contains("YARD-010"));
+    }
+
+    #[test]
+    fn korean_drain_progress_line_uses_localized_state_label() {
+        let leaked = [
+            "Running",
+            "Done",
+            "Failed",
+            "Blocked",
+            "NeedsUser",
+            "Partial",
+            "Deferred",
+            "Queued",
+            "running",
+            "done",
+            "failed",
+            "blocked",
+            "needs-you",
+            "partial",
+            "deferred",
+            "queued",
+        ];
+
+        for state in [
+            TaskState::Running,
+            TaskState::Done,
+            TaskState::Failed,
+            TaskState::Blocked,
+            TaskState::NeedsUser,
+            TaskState::Partial,
+            TaskState::Deferred,
+            TaskState::Queued,
+        ] {
+            let line = task_state_progress_line(Lang::Ko, "YARD-006", state);
+            assert!(line.starts_with("YARD-006 \u{2192} "), "{line}");
+            assert!(
+                line.contains(i18n::task_state_label(Lang::Ko.l(), state)),
+                "{line}"
+            );
+            for token in leaked {
+                assert!(
+                    !line.contains(token),
+                    "Korean progress line leaked English state token {token}: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn korean_auto_drain_localizes_completion_chrome_and_preserves_task_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-korean-auto-drain-i18n-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        let mut done = task("YARD-KEEP", TaskState::Done, 10, false);
+        done.title = "한국어 완료 작업".into();
+        let mut q = queue(vec![done]);
+        q.intent_id = "intent-korean-i18n".into();
+        ws.save_queue(&q).unwrap();
+
+        let lines = run_auto(&ws, false, None, Some(1), true, |_| {}).unwrap();
+        let last = lines.last().expect("drain completion line");
+        assert!(last.contains("완료:"), "{last}");
+        assert!(last.contains("큐"), "{last}");
+        assert!(!last.contains("done:"), "{last}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validation_runner_blocks_on_failure() {
+        let dir = std::env::temp_dir().join(format!("yard-valrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let billing = crate::schemas::BillingPolicy::default();
+        // A passing command -> ran and passed.
+        let (ran, passed) = run_validation_commands(&["true".to_string()], &dir, &dir, &billing);
+        assert!(ran && passed);
+        // A failing command -> ran but not passed (this is the gate that blocks Done).
+        let (ran, passed) = run_validation_commands(&["false".to_string()], &dir, &dir, &billing);
+        assert!(ran && !passed);
+        assert!(dir.join("validation.json").is_file());
+        // No commands -> nothing ran (a task with nothing to validate is allowed).
+        let (ran, _) = run_validation_commands(&[], &dir, &dir, &billing);
+        assert!(!ran);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validation_scoped_to_code_tasks_only() {
+        // goal-1 c: configured validation gates CODE. A doc/non-code task must
+        // not be run through (and failed by) an unrelated whole-app command.
+        let mut t = task("X", TaskState::Queued, 1, false);
+        for k in ["", "implementation", "IMPLEMENTATION", "feature"] {
+            t.kind = k.into();
+            assert!(validation_applies(&t), "code task {k:?} should validate");
+        }
+        for k in ["research", "review", "safety"] {
+            t.kind = k.into();
+            assert!(
+                !validation_applies(&t),
+                "non-code task {k:?} must not be gated by validation"
+            );
+        }
+    }
+
+    fn write_needs_user_run(ws: &Workspace, run_id: &str, intent: &str, question: &str) {
+        let rd = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&rd).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "needs_user".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: Some(question.into()),
+            compact_summary: String::new(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &rd.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(
+            &rd.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\nintent_id: {intent}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn latest_question_is_scoped_to_the_current_intent() {
+        // stale-question (AC-006): a past plan's result.json for the SAME task id
+        // stays on disk. `answer` must surface the CURRENT intent's question, not
+        // the past one — even when the stale run is newer on disk.
+        let root = std::env::temp_dir().join(format!("yard-staleq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::NeedsUser, 10, false);
+        t.kind = "implementation".into();
+        let mut q = queue(vec![t]);
+        q.intent_id = "intent-current".into();
+        ws.save_queue(&q).unwrap();
+
+        // Current-intent run FIRST, then a NEWER stale run from a past intent
+        // that reused the same task id. Newest-by-mtime would pick the stale one.
+        write_needs_user_run(
+            &ws,
+            "run-20260710-100000",
+            "intent-current",
+            "current question",
+        );
+        write_needs_user_run(
+            &ws,
+            "run-20260710-120000",
+            "intent-old",
+            "STALE past question",
+        );
+
+        assert_eq!(
+            latest_question_for(&ws, "YARD-001").as_deref(),
+            Some("current question")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn latest_question_ignores_a_past_intent_when_current_has_none() {
+        // Only a past intent left a question: the current plan has none pending,
+        // so nothing is surfaced (the stale one is not resurrected).
+        let root = std::env::temp_dir().join(format!("yard-staleq2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::NeedsUser, 10, false);
+        t.kind = "implementation".into();
+        let mut q = queue(vec![t]);
+        q.intent_id = "intent-current".into();
+        ws.save_queue(&q).unwrap();
+
+        write_needs_user_run(
+            &ws,
+            "run-20260101-000000",
+            "intent-old",
+            "STALE past question",
+        );
+
+        assert_eq!(latest_question_for(&ws, "YARD-001"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn task(id: &str, state: TaskState, priority: i64, needs_approval: bool) -> Task {
+        Task {
+            id: id.into(),
+            title: id.into(),
+            state,
+            priority,
+            risk: String::new(),
+            kind: String::new(),
+            preferred_worker: String::new(),
+            model: String::new(),
+            fallback_enabled: None,
+            effort: String::new(),
+            depends_on: vec![],
+            skills: vec![],
+            required_capabilities: vec![],
+            allowed_scope: vec![],
+            acceptance: vec![],
+            goal: None,
+            validation: None,
+            approval: if needs_approval {
+                Some(crate::yaml::from_str("required: true").unwrap())
+            } else {
+                None
+            },
+            interaction: None,
+            worker_rationale: None,
+            provenance: String::new(),
+            routing_provenance: None,
+        }
+    }
+
+    fn queue(tasks: Vec<Task>) -> WorkQueue {
+        WorkQueue {
+            schema_version: 1,
+            queue_id: "q".into(),
+            intent_id: String::new(),
+            selection_policy: SelectionPolicy::default(),
+            tasks,
+        }
+    }
+
+    fn opts() -> RunOptions {
+        RunOptions {
+            execute: false,
+            worker_override: None,
+            target: None,
+            answer: None,
+            full_access: false,
+            accept_ambiguity: false,
+            chain: None,
+        }
+    }
+
+    fn init_test_workspace(name: &str, worker_yaml: &str) -> Workspace {
+        let root = std::env::temp_dir().join(format!("yard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        let ws = Workspace::at(&root);
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .output();
+        write_str(&root.join("fixture.txt"), "fixture\n").unwrap();
+        for args in [
+            &["config", "user.name", "Yardlet Test"][..],
+            &["config", "user.email", "yardlet@example.test"][..],
+            &["add", "fixture.txt"][..],
+            &["commit", "-q", "-m", "fixture baseline"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        write_str(
+            &ws.config_path(),
+            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\n# unit fixtures opt into full access explicitly: they exercise run/parallel\n# mechanics with bash fixture workers that declare no sandbox contract\ndefault_access: full\n",
+        )
+        .unwrap();
+        write_str(&ws.billing_path(), "schema_version: 1\n").unwrap();
+        write_str(
+            &ws.intent_path(),
+            "schema_version: 1\nid: intent-test\nsummary: test\nstatus: accepted\n",
+        )
+        .unwrap();
+        write_str(&ws.workers_path(), worker_yaml).unwrap();
+        ws
+    }
+
+    fn finish_record_with_ownership(
+        run_id: &str,
+        policy: crate::git_finish::GitFinishPolicySnapshot,
+        baseline_oid: &str,
+        expected_oid: &str,
+    ) -> crate::git_finish::GitFinishRecord {
+        crate::git_finish::GitFinishRecord {
+            schema_version: 2,
+            run_id: run_id.into(),
+            task_id: "YARD-STAGING".into(),
+            attempted_at: String::new(),
+            status: crate::git_finish::GitFinishStatus::Prepared,
+            policy,
+            expected_oid: Some(expected_oid.into()),
+            baseline_oid: baseline_oid.into(),
+            owned_oids: vec![expected_oid.into()],
+            checks: vec![],
+            push_invoked: false,
+            push_succeeded: false,
+            remote_oid: None,
+            remote_before_oid: Some(baseline_oid.into()),
+            head_ref: None,
+            pull_request_number: None,
+            pull_request_state: None,
+            reason: "ready_to_push".into(),
+        }
+    }
+
+    fn directory_has_ascii_case_insensitive_name(
+        directory: &std::path::Path,
+        expected: &str,
+    ) -> bool {
+        std::fs::read_dir(directory).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+            })
+        })
+    }
+
+    #[test]
+    fn main_owned_run_artifact_names_are_ascii_case_insensitive() {
+        for name in [
+            "run.yaml",
+            "RUN.YAML",
+            "Run.Yaml",
+            "TASK-PACKET.MD",
+            "Worker.Pid",
+            "WORKER-OUTPUT.LOG",
+            "GIT-FINISH.JSON",
+            "Git-Finish.Json",
+            "GIT-INTEGRATION.JSON",
+            "FEEDBACK.JSON",
+            "CANONICAL-STATE-SEED",
+            "Canonical-State-Seed",
+            "CANCELLED",
+            "Partial-Reason",
+            "FAILOVER.JSON",
+            "Evaluation.Json",
+            "VALIDATION.JSON",
+            "PROVIDER-REFUSAL-CLASSIFICATION-SKIPS.YAML",
+            "EVIDENCE",
+            "Hooks",
+            "validation-0.log",
+            "VALIDATION-42.LOG",
+        ] {
+            assert!(
+                is_main_owned_run_artifact_name(std::ffi::OsStr::new(name)),
+                "{name} must remain main-owned"
+            );
+        }
+        for name in [
+            "result.json",
+            "handoff.md",
+            "checkpoint.md",
+            "report.md",
+            "validation.log",
+            "validation-.log",
+            "validation-one.log",
+            "validation-1.log.bak",
+            "git-finish.json.bak",
+            "canonical-state-seed-copy",
+        ] {
+            assert!(
+                !is_main_owned_run_artifact_name(std::ffi::OsStr::new(name)),
+                "{name} must remain importable"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_import_keeps_main_reserved_artifacts_at_every_depth() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-worker-import-reserved-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("staged");
+        let canonical = root.join("canonical");
+        for directory in [
+            staged.join("nested/deep"),
+            staged.join("evidence/canonical-state-seed"),
+            staged.join("nested/evidence/canonical-state-seed"),
+            canonical.join("evidence/canonical-state-seed"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        write_str(&staged.join("result.json"), "worker result\n").unwrap();
+        write_str(&staged.join("nested/deep/handoff.md"), "worker handoff\n").unwrap();
+        for path in [
+            staged.join("git-finish.json"),
+            staged.join("nested/deep/git-finish.json"),
+            staged.join("git-integration.json"),
+            staged.join("nested/deep/git-integration.json"),
+            staged.join("feedback.json"),
+            staged.join("nested/deep/feedback.json"),
+        ] {
+            write_str(&path, "worker forged\n").unwrap();
+        }
+        write_str(
+            &staged.join("evidence/canonical-state-seed/intent-contract.yaml"),
+            "worker forged seed\n",
+        )
+        .unwrap();
+        write_str(
+            &staged.join("nested/evidence/canonical-state-seed/work-queue.yaml"),
+            "worker forged nested seed\n",
+        )
+        .unwrap();
+
+        write_str(&canonical.join("git-finish.json"), "main finish\n").unwrap();
+        write_str(
+            &canonical.join("git-integration.json"),
+            "main transaction\n",
+        )
+        .unwrap();
+        write_str(&canonical.join("feedback.json"), "main feedback\n").unwrap();
+        write_str(
+            &canonical.join("evidence/canonical-state-seed/intent-contract.yaml"),
+            "main seed\n",
+        )
+        .unwrap();
+
+        import_worker_run_artifacts(&staged, &canonical).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("git-finish.json")).unwrap(),
+            "main finish\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("git-integration.json")).unwrap(),
+            "main transaction\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("feedback.json")).unwrap(),
+            "main feedback\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                canonical.join("evidence/canonical-state-seed/intent-contract.yaml")
+            )
+            .unwrap(),
+            "main seed\n"
+        );
+        assert!(!canonical.join("nested/deep/git-finish.json").exists());
+        assert!(!canonical.join("nested/deep/git-integration.json").exists());
+        assert!(!canonical.join("nested/deep/feedback.json").exists());
+        assert!(!canonical
+            .join("nested/evidence/canonical-state-seed")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("result.json")).unwrap(),
+            "worker result\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("nested/deep/handoff.md")).unwrap(),
+            "worker handoff\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_import_rejects_core_control_and_validation_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-worker-import-core-artifacts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("staged");
+        let canonical = root.join("canonical");
+        for directory in [
+            staged.join("nested/deep/evidence"),
+            staged.join("nested/deep/hooks/pre-run"),
+            staged.join("evidence"),
+            staged.join("hooks/post-run"),
+            canonical.join("nested/deep"),
+            canonical.join("evidence"),
+            canonical.join("hooks/post-run"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        for path in [
+            staged.join("cancelled"),
+            staged.join("partial-reason"),
+            staged.join("failover.json"),
+            staged.join("evaluation.json"),
+            staged.join("validation.json"),
+            staged.join("validation-0.log"),
+            staged.join("nested/deep/CANCELLED"),
+            staged.join("nested/deep/Partial-Reason"),
+            staged.join("nested/deep/FAILOVER.JSON"),
+            staged.join("nested/deep/Evaluation.Json"),
+            staged.join("nested/deep/VALIDATION.JSON"),
+            staged.join("nested/deep/VALIDATION-42.LOG"),
+        ] {
+            write_str(&path, "worker forged\n").unwrap();
+        }
+        write_str(&staged.join("validation.log"), "worker validation\n").unwrap();
+        write_str(
+            &staged.join("evidence/repo-summary.md"),
+            "worker evidence\n",
+        )
+        .unwrap();
+        write_str(&staged.join("hooks/post-run/check.log"), "worker hook\n").unwrap();
+        write_str(
+            &staged.join("nested/deep/evidence/forged.txt"),
+            "worker evidence\n",
+        )
+        .unwrap();
+        write_str(
+            &staged.join("nested/deep/hooks/pre-run/forged.log"),
+            "worker hook\n",
+        )
+        .unwrap();
+
+        for path in [
+            canonical.join("partial-reason"),
+            canonical.join("failover.json"),
+            canonical.join("evaluation.json"),
+            canonical.join("validation.json"),
+            canonical.join("validation-0.log"),
+        ] {
+            write_str(&path, "main owned\n").unwrap();
+        }
+        write_str(
+            &canonical.join("evidence/repo-summary.md"),
+            "main evidence\n",
+        )
+        .unwrap();
+        write_str(&canonical.join("hooks/post-run/check.log"), "main hook\n").unwrap();
+
+        import_worker_run_artifacts(&staged, &canonical).unwrap();
+
+        assert!(!canonical.join("cancelled").exists());
+        for path in [
+            canonical.join("partial-reason"),
+            canonical.join("failover.json"),
+            canonical.join("evaluation.json"),
+            canonical.join("validation.json"),
+            canonical.join("validation-0.log"),
+        ] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "main owned\n");
+        }
+        for name in [
+            "cancelled",
+            "partial-reason",
+            "failover.json",
+            "evaluation.json",
+            "validation.json",
+            "validation-42.log",
+        ] {
+            assert!(
+                !directory_has_ascii_case_insensitive_name(&canonical.join("nested/deep"), name),
+                "nested {name} must remain main-owned"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("evidence/repo-summary.md")).unwrap(),
+            "main evidence\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("hooks/post-run/check.log")).unwrap(),
+            "main hook\n"
+        );
+        assert!(!canonical.join("nested/deep/evidence").exists());
+        assert!(!canonical.join("nested/deep/hooks").exists());
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("validation.log")).unwrap(),
+            "worker validation\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_import_rejects_case_variants_of_main_reserved_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-worker-import-case-reserved-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("staged");
+        let canonical = root.join("canonical");
+        for directory in [
+            staged.join("nested/deep"),
+            staged.join("nested/evidence/CANONICAL-STATE-SEED"),
+            canonical.join("evidence/canonical-state-seed"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        for (path, contents) in [
+            (staged.join("RUN.YAML"), "worker forged run\n"),
+            (staged.join("GIT-FINISH.JSON"), "worker forged finish\n"),
+            (staged.join("Feedback.Json"), "worker forged feedback\n"),
+            (staged.join("nested/TASK-PACKET.MD"), "worker packet\n"),
+            (staged.join("nested/deep/WORKER.PID"), "123\n"),
+            (staged.join("nested/deep/Worker-Output.Log"), "worker log\n"),
+            (staged.join("nested/deep/result.json"), "worker result\n"),
+            (
+                staged.join("nested/evidence/CANONICAL-STATE-SEED/work-queue.yaml"),
+                "worker forged seed\n",
+            ),
+        ] {
+            write_str(&path, contents).unwrap();
+        }
+
+        for (path, contents) in [
+            (canonical.join("run.yaml"), "main run\n"),
+            (canonical.join("git-finish.json"), "main finish\n"),
+            (canonical.join("feedback.json"), "main feedback\n"),
+            (
+                canonical.join("evidence/canonical-state-seed/work-queue.yaml"),
+                "main seed\n",
+            ),
+        ] {
+            write_str(&path, contents).unwrap();
+        }
+
+        import_worker_run_artifacts(&staged, &canonical).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("run.yaml")).unwrap(),
+            "main run\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("git-finish.json")).unwrap(),
+            "main finish\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("feedback.json")).unwrap(),
+            "main feedback\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                canonical.join("evidence/canonical-state-seed/work-queue.yaml")
+            )
+            .unwrap(),
+            "main seed\n"
+        );
+        assert!(!directory_has_ascii_case_insensitive_name(
+            &canonical.join("nested"),
+            "task-packet.md"
+        ));
+        assert!(!directory_has_ascii_case_insensitive_name(
+            &canonical.join("nested/deep"),
+            "worker.pid"
+        ));
+        assert!(!directory_has_ascii_case_insensitive_name(
+            &canonical.join("nested/deep"),
+            "worker-output.log"
+        ));
+        assert!(!directory_has_ascii_case_insensitive_name(
+            &canonical.join("nested/evidence"),
+            "canonical-state-seed"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("nested/deep/result.json")).unwrap(),
+            "worker result\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_import_rejects_filesystem_equivalent_unicode_reserved_components() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-worker-import-unicode-alias-reserved-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let staged = root.join("staged");
+        let canonical = root.join("canonical");
+        for directory in [
+            staged.join("nested/deep"),
+            staged.join("nested/ordinary/canonical-ſtate-seed"),
+            canonical.join("nested/deep"),
+            canonical.join("nested/ordinary/canonical-state-seed"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        for (path, contents) in [
+            (staged.join("task-pacKet.md"), "worker forged packet\n"),
+            (
+                staged.join("nested/deep/git-finiſh.json"),
+                "worker forged finish\n",
+            ),
+            (
+                staged.join("nested/ordinary/canonical-ſtate-seed/work-queue.yaml"),
+                "worker forged seed\n",
+            ),
+            (
+                staged.join("nested/deep/검토-결과.json"),
+                "allowed unicode artifact\n",
+            ),
+        ] {
+            write_str(&path, contents).unwrap();
+        }
+
+        // The regression is meaningful only on a filesystem that really
+        // aliases these Unicode spellings to the trusted ASCII entries. APFS
+        // in its default case-insensitive mode does; case-sensitive fixtures
+        // safely exercise the non-alias boundary instead.
+        let unicode_aliases_are_active = std::fs::canonicalize(staged.join("task-pacKet.md"))
+            .ok()
+            .zip(std::fs::canonicalize(staged.join("task-packet.md")).ok())
+            .is_some_and(|(unicode, ascii)| unicode == ascii)
+            && std::fs::canonicalize(staged.join("nested/deep/git-finiſh.json"))
+                .ok()
+                .zip(std::fs::canonicalize(staged.join("nested/deep/git-finish.json")).ok())
+                .is_some_and(|(unicode, ascii)| unicode == ascii);
+        for (path, contents) in [
+            (canonical.join("task-packet.md"), "main packet\n"),
+            (
+                canonical.join("nested/deep/git-finish.json"),
+                "main finish\n",
+            ),
+            (
+                canonical.join("nested/ordinary/canonical-state-seed/work-queue.yaml"),
+                "main seed\n",
+            ),
+        ] {
+            write_str(&path, contents).unwrap();
+        }
+
+        import_worker_run_artifacts(&staged, &canonical).unwrap();
+
+        if unicode_aliases_are_active {
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("task-packet.md")).unwrap(),
+                "main packet\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("nested/deep/git-finish.json")).unwrap(),
+                "main finish\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    canonical.join("nested/ordinary/canonical-state-seed/work-queue.yaml")
+                )
+                .unwrap(),
+                "main seed\n"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("task-packet.md")).unwrap(),
+                "main packet\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("task-pacKet.md")).unwrap(),
+                "worker forged packet\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("nested/deep/git-finish.json")).unwrap(),
+                "main finish\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(canonical.join("nested/deep/git-finiſh.json")).unwrap(),
+                "worker forged finish\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    canonical.join("nested/ordinary/canonical-state-seed/work-queue.yaml")
+                )
+                .unwrap(),
+                "main seed\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    canonical.join("nested/ordinary/canonical-ſtate-seed/work-queue.yaml")
+                )
+                .unwrap(),
+                "worker forged seed\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(canonical.join("nested/deep/검토-결과.json")).unwrap(),
+            "allowed unicode artifact\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn case_variant_staged_git_finish_is_not_adopted_as_recorded_ownership() {
+        let ws = init_test_workspace(
+            "case-staged-git-finish-seed",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let config_policy = ws.load_config().unwrap().git_finish;
+        let trusted_policy = crate::git_finish::GitFinishPolicySnapshot {
+            auto_push: config_policy.auto_push,
+            delivery: config_policy.delivery,
+            remote: config_policy.remote,
+            target_ref: config_policy.target_ref,
+            pre_push_checks: vec![],
+        };
+
+        let trusted_run_id = "run-20990101-000000-case-trusted";
+        let trusted_run_dir = ws.runs_dir().join(trusted_run_id);
+        std::fs::create_dir_all(&trusted_run_dir).unwrap();
+        let trusted_baseline = "1".repeat(40);
+        let trusted_expected = "2".repeat(40);
+        let trusted = finish_record_with_ownership(
+            trusted_run_id,
+            trusted_policy,
+            &trusted_baseline,
+            &trusted_expected,
+        );
+        ws.save_git_finish_record(&trusted_run_dir, &trusted)
+            .unwrap();
+
+        let unmodified = crate::git_finish::finish_owned_run(
+            &ws,
+            &trusted_run_dir,
+            trusted_run_id,
+            "YARD-STAGING",
+            TaskState::Done,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unmodified.baseline_oid, trusted_baseline);
+        assert_eq!(
+            unmodified.expected_oid.as_deref(),
+            Some(trusted_expected.as_str())
+        );
+        assert_eq!(unmodified.owned_oids, vec![trusted_expected]);
+
+        let forged_run_id = "run-20990101-000000-case-forged";
+        let forged_run_dir = ws.runs_dir().join(forged_run_id);
+        let staged = ws
+            .agents_dir()
+            .join("worktrees/case-staging-seed/.agents/runs")
+            .join(forged_run_id);
+        std::fs::create_dir_all(&staged).unwrap();
+        let forged = finish_record_with_ownership(
+            forged_run_id,
+            crate::git_finish::GitFinishPolicySnapshot {
+                auto_push: true,
+                delivery: crate::schemas::GitFinishDelivery::Direct,
+                remote: "attacker".into(),
+                target_ref: "refs/heads/main".into(),
+                pre_push_checks: vec![],
+            },
+            &"a".repeat(40),
+            &"b".repeat(40),
+        );
+        write_str(
+            &staged.join("GIT-FINISH.JSON"),
+            &serde_json::to_string_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        import_worker_run_artifacts(&staged, &forged_run_dir).unwrap();
+        let imported_worker_record =
+            directory_has_ascii_case_insensitive_name(&forged_run_dir, "git-finish.json");
+        let mutated = crate::git_finish::finish_owned_run(
+            &ws,
+            &forged_run_dir,
+            forged_run_id,
+            "YARD-STAGING",
+            TaskState::Done,
+            None,
+        )
+        .unwrap();
+        assert!(!mutated.policy.auto_push);
+        assert_eq!(mutated.expected_oid, None);
+        assert!(mutated.baseline_oid.is_empty());
+        assert!(mutated.owned_oids.is_empty());
+        assert_eq!(mutated.status, crate::git_finish::GitFinishStatus::Disabled);
+        assert!(
+            !imported_worker_record,
+            "worker-staged case variant reached the canonical run directory"
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn worker_staged_git_finish_cannot_seed_recorded_ownership() {
+        let ws = init_test_workspace(
+            "staged-git-finish-seed",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let run_id = "run-20990101-000000-staging-seed";
+        let run_dir = ws.runs_dir().join(run_id);
+        let staged = ws
+            .agents_dir()
+            .join("worktrees/staging-seed/.agents/runs")
+            .join(run_id);
+        std::fs::create_dir_all(&staged).unwrap();
+        let forged = finish_record_with_ownership(
+            run_id,
+            crate::git_finish::GitFinishPolicySnapshot {
+                auto_push: true,
+                delivery: crate::schemas::GitFinishDelivery::Direct,
+                remote: "attacker".into(),
+                target_ref: "refs/heads/main".into(),
+                pre_push_checks: vec![],
+            },
+            &"a".repeat(40),
+            &"b".repeat(40),
+        );
+        write_str(
+            &staged.join("git-finish.json"),
+            &serde_json::to_string_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        import_worker_run_artifacts(&staged, &run_dir).unwrap();
+        let finished = crate::git_finish::finish_owned_run(
+            &ws,
+            &run_dir,
+            run_id,
+            "YARD-STAGING",
+            TaskState::Done,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            finished.status,
+            crate::git_finish::GitFinishStatus::Disabled
+        );
+        assert!(!finished.policy.auto_push);
+        assert_eq!(finished.expected_oid, None);
+        assert!(finished.baseline_oid.is_empty());
+        assert!(finished.owned_oids.is_empty());
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn worker_staged_git_finish_cannot_replace_main_recorded_ownership() {
+        let ws = init_test_workspace(
+            "staged-git-finish-replace",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let run_id = "run-20990101-000000-staging-replace";
+        let run_dir = ws.runs_dir().join(run_id);
+        let staged = ws
+            .agents_dir()
+            .join("worktrees/staging-replace/.agents/runs")
+            .join(run_id);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let config_policy = ws.load_config().unwrap().git_finish;
+        let snapshot = crate::git_finish::GitFinishPolicySnapshot {
+            auto_push: config_policy.auto_push,
+            delivery: config_policy.delivery,
+            remote: config_policy.remote,
+            target_ref: config_policy.target_ref,
+            pre_push_checks: vec![],
+        };
+        let trusted_baseline = "1".repeat(40);
+        let trusted_expected = "2".repeat(40);
+        let trusted =
+            finish_record_with_ownership(run_id, snapshot, &trusted_baseline, &trusted_expected);
+        ws.save_git_finish_record(&run_dir, &trusted).unwrap();
+
+        let forged = finish_record_with_ownership(
+            run_id,
+            crate::git_finish::GitFinishPolicySnapshot {
+                auto_push: true,
+                delivery: crate::schemas::GitFinishDelivery::Direct,
+                remote: "attacker".into(),
+                target_ref: "refs/heads/main".into(),
+                pre_push_checks: vec![],
+            },
+            &"a".repeat(40),
+            &"b".repeat(40),
+        );
+        write_str(
+            &staged.join("git-finish.json"),
+            &serde_json::to_string_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        import_worker_run_artifacts(&staged, &run_dir).unwrap();
+        let finished = crate::git_finish::finish_owned_run(
+            &ws,
+            &run_dir,
+            run_id,
+            "YARD-STAGING",
+            TaskState::Done,
+            Some(crate::git_finish::GitFinishOwnership {
+                baseline_oid: trusted_baseline.clone(),
+                expected_oid: trusted_expected.clone(),
+                owned_oids: vec![trusted_expected.clone()],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            finished.status,
+            crate::git_finish::GitFinishStatus::Disabled
+        );
+        assert_eq!(finished.baseline_oid, trusted_baseline);
+        assert_eq!(
+            finished.expected_oid.as_deref(),
+            Some(trusted_expected.as_str())
+        );
+        assert_eq!(finished.owned_oids, vec![trusted_expected]);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn feedback_cycles_are_persisted_bounded_and_keep_exact_review_evidence() {
+        let ws = init_test_workspace(
+            "feedback-ledger",
+            "schema_version: 1\nrouting: {default_worker: codex}\nworkers: []\n",
+        );
+        let mut t = task("YARD-FB", TaskState::Running, 10, false);
+        t.kind = "review".into();
+        t.acceptance = vec![crate::yaml::Value::String("parser tests pass".into())];
+        t.goal = Some(crate::schemas::TaskGoal {
+            condition: "all acceptance passes".into(),
+            max_feedback_cycles: 1,
+            feedback_policy: "inject_failed_checks".into(),
+        });
+        let eval = evaluator::Evaluation {
+            run_id: "run-1".into(),
+            task_id: t.id.clone(),
+            status: "partial".into(),
+            checks: vec![evaluator::fatal_failure(
+                "review_criteria_pass",
+                "criteria failed: AC-001",
+            )],
+            next_task_state: TaskState::Partial,
+        };
+        let mut result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: "run-1".into(),
+            task_id: t.id.clone(),
+            status: "partial".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "review failed".into(),
+            verdict: vec![crate::schemas::Verdict {
+                criterion_id: "AC-001".into(),
+                pass: false,
+                evidence: "src/parser.rs:42 still accepts invalid input".into(),
+            }],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+
+        let run1 = ws.runs_dir().join("run-1");
+        std::fs::create_dir_all(&run1).unwrap();
+        let first =
+            feedback_for_run(&ws, &run1, "run-1", "intent-test", &t, &eval, Some(&result)).unwrap();
+        assert_eq!(first.cycle, 1);
+        assert_eq!(feedback_next_state(&first), TaskState::Partial);
+        assert!(first
+            .unmet_acceptance
+            .iter()
+            .any(|s| { s.contains("src/parser.rs:42") && s.contains("parser tests pass") }));
+        write_str(
+            &run1.join("feedback.json"),
+            &serde_json::to_string(&first).unwrap(),
+        )
+        .unwrap();
+
+        result.run_id = "run-2".into();
+        let run2 = ws.runs_dir().join("run-2");
+        std::fs::create_dir_all(&run2).unwrap();
+        let second =
+            feedback_for_run(&ws, &run2, "run-2", "intent-test", &t, &eval, Some(&result)).unwrap();
+        assert_eq!(second.cycle, 2);
+        assert_eq!(feedback_next_state(&second), TaskState::NeedsUser);
+        assert!(second.terminal_reason.contains("cap exceeded"));
+        assert!(second
+            .question_for_user
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|question| question.ends_with('?')));
+        let mut invalid = second.clone();
+        invalid.question_for_user = Some("   ".into());
+        assert_eq!(feedback_next_state(&invalid), TaskState::Failed);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_retry_injects_failed_validation_then_converges_to_done() {
+        let source =
+            std::env::temp_dir().join(format!("yard-feedback-worker-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let worker = write_worker_script(
+            &source,
+            "worker.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+attempts="$2"
+packet_dir="$3"
+if [ -f "$attempts" ]; then n=$(cat "$attempts"); else n=0; fi
+n=$((n + 1))
+printf "%s" "$n" > "$attempts"
+cat > "$packet_dir/packet-$n.txt"
+run_id=$(basename "$run_dir")
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-FB",
+  "status": "done",
+  "validation": {"commands_run": [], "passed": true, "failures": []},
+  "compact_summary": "attempt $n"
+}
+EOF
+printf "# handoff\nattempt %s\n" "$n" > "$run_dir/handoff.md"
+if [ "$n" -eq 1 ]; then
+  printf "merge_conflict\n" > "$run_dir/partial-reason"
+fi
+"##,
+        );
+        let root = std::env::temp_dir().join(format!("yard-feedback-auto-{}", std::process::id()));
+        let attempts = root.join("attempts");
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}, {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&attempts),
+            shell_literal(&root)
+        );
+        let ws = init_test_workspace("feedback-auto", &worker_yaml);
+        let attempts = ws.root.join("attempts");
+        // Rebuild the profile with paths inside the actual workspace returned
+        // by init_test_workspace.
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}, {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&attempts),
+            shell_literal(&ws.root)
+        );
+        write_str(&ws.workers_path(), &worker_yaml).unwrap();
+
+        let mut t = task("YARD-FB", TaskState::Queued, 10, false);
+        t.kind = "implementation".into();
+        t.goal = Some(crate::schemas::TaskGoal {
+            condition: "validation passes".into(),
+            max_feedback_cycles: 1,
+            feedback_policy: "inject_failed_checks".into(),
+        });
+        t.validation = Some(
+            crate::yaml::from_str(&format!(
+                "required: true\ncommands:\n  - 'test \"$(cat {})\" -ge 2'\n",
+                attempts.display()
+            ))
+            .unwrap(),
+        );
+        let mut q = queue(vec![t]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let events = run_auto(&ws, false, None, Some(1), true, |_| {}).unwrap();
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+        assert_eq!(std::fs::read_to_string(&attempts).unwrap(), "2");
+        let second_packet = std::fs::read_to_string(ws.root.join("packet-2.txt")).unwrap();
+        assert!(second_packet.contains("Feedback cycle 1/1"));
+        assert!(second_packet.contains("validation command"));
+        assert!(second_packet.contains("validation passes"));
+        assert!(events
+            .iter()
+            .any(|e| e.contains("continuing from its checkpoint")));
+        let telemetry = crate::telemetry::read_runs(&ws);
+        assert_eq!(telemetry.len(), 2);
+        assert_eq!(telemetry[0].feedback_cycle, 1);
+        assert_eq!(telemetry[0].max_feedback_cycles, 1);
+        assert!(telemetry[0].feedback_retryable);
+        assert_eq!(telemetry[1].eval_state, "Done");
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn shell_literal(path: &std::path::Path) -> String {
+        serde_json::to_string(&path.display().to_string()).unwrap()
+    }
+
+    fn write_worker_script(root: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = root.join(name);
+        write_str(&path, body).unwrap();
+        path
+    }
+
+    fn only_run_dir(ws: &Workspace) -> std::path::PathBuf {
+        let mut runs = std::fs::read_dir(ws.runs_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        runs.sort();
+        assert_eq!(
+            runs.len(),
+            1,
+            "expected exactly one run directory: {runs:?}"
+        );
+        runs.pop().unwrap()
+    }
+
+    #[test]
+    fn stale_completed_delivery_target_blocks_new_added_task_before_worker_spawn() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-stale-git-finish-target-source-{}",
+            std::process::id()
+        ));
+        let remote = std::env::temp_dir().join(format!(
+            "yard-stale-git-finish-target-remote-{}.git",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&source).unwrap();
+        let spawn_marker = source.join("worker-spawned");
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+task_id="$2"
+spawn_marker="$3"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+touch "$spawn_marker"
+printf "new task output\n" > stale-target-output.txt
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": ["stale-target-output.txt"], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "green worker result",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", \"YARD-012\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder),
+            shell_literal(&spawn_marker)
+        );
+        let ws = init_test_workspace("stale-git-finish-target", &worker_yaml);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["branch", "-M", "main"]);
+        let init_remote = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(
+            init_remote.status.success(),
+            "git init --bare: {}",
+            String::from_utf8_lossy(&init_remote.stderr)
+        );
+        git(&["remote", "add", "fixture", remote.to_str().unwrap()]);
+        let baseline = git(&["rev-parse", "HEAD"]);
+        let stale_target = "refs/heads/codex/yard-011-delivery";
+        let checkout_branch = "codex/yard-012-new-task";
+        let checkout_ref = format!("refs/heads/{checkout_branch}");
+        git(&["push", "-q", "fixture", "HEAD:refs/heads/main"]);
+        git(&["push", "-q", "fixture", &format!("HEAD:{stale_target}")]);
+        git(&["fetch", "-q", "fixture", "main:refs/remotes/fixture/main"]);
+
+        let mut config = ws.load_config().unwrap();
+        config.auto_commit = true;
+        config.git_finish = crate::schemas::GitFinishPolicy {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: stale_target.into(),
+            pre_push_checks: vec![],
+        };
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+
+        let previous_task_id = "YARD-011";
+        let previous_run_id = "run-20990101-000000-yard-011";
+        let mut previous_task = task(previous_task_id, TaskState::Done, 10, false);
+        previous_task.kind = "implementation".into();
+        let mut q = queue(vec![previous_task]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let previous_run_dir = ws.runs_dir().join(previous_run_id);
+        std::fs::create_dir_all(&previous_run_dir).unwrap();
+        write_str(
+            &previous_run_dir.join("result.json"),
+            "{\"status\":\"done\"}",
+        )
+        .unwrap();
+        state::save_yaml(
+            &previous_run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: previous_run_id.into(),
+                task_id: previous_task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "codex".into(),
+                state: "done".into(),
+                started_at: "2099-01-01T00:00:00+00:00".into(),
+                completed_at: Some("2099-01-01T00:01:00+00:00".into()),
+                integration_oid: baseline.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ws.save_git_finish_record(
+            &previous_run_dir,
+            &crate::git_finish::GitFinishRecord {
+                schema_version: 2,
+                run_id: previous_run_id.into(),
+                task_id: previous_task_id.into(),
+                attempted_at: "2099-01-01T00:01:00+00:00".into(),
+                status: crate::git_finish::GitFinishStatus::Pushed,
+                policy: crate::git_finish::GitFinishPolicySnapshot {
+                    auto_push: true,
+                    delivery: crate::schemas::GitFinishDelivery::Direct,
+                    remote: "fixture".into(),
+                    target_ref: stale_target.into(),
+                    pre_push_checks: vec![],
+                },
+                expected_oid: Some(baseline.clone()),
+                baseline_oid: baseline.clone(),
+                owned_oids: vec![baseline.clone()],
+                checks: vec![],
+                push_invoked: true,
+                push_succeeded: true,
+                remote_oid: Some(baseline.clone()),
+                remote_before_oid: Some(baseline.clone()),
+                head_ref: None,
+                pull_request_number: None,
+                pull_request_state: None,
+                reason: "remote_verified".into(),
+            },
+        )
+        .unwrap();
+
+        git(&["checkout", "-q", "-b", checkout_branch, "fixture/main"]);
+        let added = ws
+            .append_user_task(crate::state::UserTaskInput {
+                title: "new task after completed delivery".into(),
+                risk: "low".into(),
+                kind: "implementation".into(),
+                preferred_worker: "builder".into(),
+                depends_on: vec![],
+                allowed_scope: vec!["stale-target-output.txt".into()],
+            })
+            .unwrap();
+        assert_eq!(added.id, "YARD-012");
+
+        let outcome = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some(added.id.clone()),
+                ..opts()
+            },
+        );
+        if spawn_marker.exists() {
+            let report = outcome.expect("the current stale-target path finalizes after spawning");
+            let finish = ws.load_git_finish_record(&report.run_dir).unwrap();
+            panic!(
+                "worker spawned before stale target_ref was rejected; \
+                 expected pre-spawn retarget block, got final reason={} and state={:?}",
+                finish.reason, report.result_state
+            );
+        }
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(report) => panic!(
+                "stale target_ref unexpectedly produced a run report without spawning: {:?}",
+                report.result_state
+            ),
+        };
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("branch_does_not_match_target_ref")
+                && diagnostic.contains(stale_target)
+                && diagnostic.contains(&checkout_ref),
+            "retarget diagnostic must name the typed reason and both refs: {diagnostic}"
+        );
+        let mut new_runs = std::fs::read_dir(ws.runs_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &previous_run_dir)
+            .collect::<Vec<_>>();
+        assert_eq!(new_runs.len(), 1, "expected one blocked new-task run");
+        let blocked_run_dir = new_runs.pop().unwrap();
+        let blocked = ws.load_git_finish_record(&blocked_run_dir).unwrap();
+        assert_eq!(
+            blocked.status,
+            crate::git_finish::GitFinishStatus::SafetyBlocked
+        );
+        assert!(blocked
+            .reason
+            .starts_with("branch_does_not_match_target_ref"));
+        assert_eq!(blocked.policy.target_ref, stale_target);
+        assert!(!blocked.push_invoked);
+        let blocked_run: RunRecord = state::load_yaml(&blocked_run_dir.join("run.yaml")).unwrap();
+        assert_eq!(blocked_run.state, "blocked");
+        assert!(blocked_run.completed_at.is_some());
+        assert_eq!(
+            git(&["ls-remote", "--refs", "fixture", stale_target])
+                .split_whitespace()
+                .next(),
+            Some(baseline.as_str())
+        );
+        assert!(
+            git(&["ls-remote", "--refs", "fixture", &checkout_ref]).is_empty(),
+            "pre-spawn block must not create or update the checkout ref"
+        );
+        assert_eq!(
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.id == added.id)
+                .unwrap()
+                .state,
+            TaskState::Queued,
+            "retargeting the workspace policy should make the unchanged task retryable"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&remote);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn assert_serial_worktree_and_branch_removed(ws: &Workspace, run_dir: &std::path::Path) {
+        let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert!(record.serial_isolated, "run must own a serial worktree");
+        assert!(
+            !std::path::Path::new(&record.worktree).exists(),
+            "owned worktree must be removed: {}",
+            record.worktree
+        );
+        assert!(
+            git_stdout(&ws.root, &["branch", "--list", &record.worktree_branch])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "owned branch must be removed: {}",
+            record.worktree_branch
+        );
+    }
+
+    fn assert_serial_location_removed(ws: &Workspace, run_id: &str, branch: &str) {
+        let worktree = ws.agents_dir().join("worktrees").join(run_id);
+        assert!(
+            !worktree.exists(),
+            "owned worktree must be removed: {}",
+            worktree.display()
+        );
+        assert!(
+            git_stdout(&ws.root, &["branch", "--list", branch])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "owned branch must be removed: {branch}"
+        );
+    }
+
+    #[test]
+    fn intentless_serial_run_seeds_queue_and_executes_without_leaking_worktree() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-intentless-serial-worker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+test -f .agents/work-queue.yaml
+test ! -e .agents/intent-contract.yaml
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-NO-INTENT",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "intent 없이 실행 완료",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder)
+        );
+        let ws = init_test_workspace("intentless-serial-run", &worker_yaml);
+        std::fs::remove_file(ws.intent_path()).unwrap();
+        ws.save_queue(&queue(vec![task(
+            "YARD-NO-INTENT",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-NO-INTENT".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert!(report
+            .run_dir
+            .join("evidence/canonical-state-seed/work-queue.yaml")
+            .is_file());
+        assert!(!report
+            .run_dir
+            .join("evidence/canonical-state-seed/intent-contract.yaml")
+            .exists());
+        assert_serial_worktree_and_branch_removed(&ws, &report.run_dir);
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn prepare_error_after_worktree_creation_removes_worktree_and_branch() {
+        let ws = init_test_workspace(
+            "serial-prepare-error-cleanup",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let run_id = "run-20990101-000000-prepare-error";
+        let task_id = "YARD-PREPARE-ERR";
+        let branch = format!("yard/{}/{}", task_id.to_lowercase(), run_id);
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(run_dir.join("evidence")).unwrap();
+        write_str(
+            &run_dir.join("evidence/canonical-state-seed"),
+            "blocks seed directory creation\n",
+        )
+        .unwrap();
+
+        prepare_serial_worktree(&ws, &run_dir, run_id, task_id)
+            .err()
+            .expect("seed directory creation must fail after worktree creation");
+
+        assert_serial_location_removed(&ws, run_id, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_prepare_persists_harness_copy_warnings_as_run_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let ws = init_test_workspace(
+            "serial-harness-warning-evidence",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        ws.save_queue(&queue(vec![task(
+            "YARD-HARNESS-WARN",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+        let external_rules = ws.root.join("external-rules");
+        std::fs::create_dir_all(&external_rules).unwrap();
+        symlink(&external_rules, ws.agents_dir().join("rules")).unwrap();
+        let run_id = "run-20990101-000000-harness-warn";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let owned = prepare_serial_worktree(&ws, &run_dir, run_id, "YARD-HARNESS-WARN").unwrap();
+
+        let log_path = run_dir.join("evidence/harness-copy-warnings.log");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+            panic!(
+                "harness copy warnings must land in {}: {error}",
+                log_path.display()
+            )
+        });
+        assert!(
+            log.contains("skipped non-directory harness root"),
+            "evidence must carry the copy_dir warning text: {log}"
+        );
+        assert!(
+            log.contains(&ws.agents_dir().join("rules").display().to_string()),
+            "evidence must name the skipped harness source: {log}"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &owned.path, &owned.branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_prepare_without_harness_copy_warnings_writes_no_evidence_file() {
+        let ws = init_test_workspace(
+            "serial-harness-clean-evidence",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        ws.save_queue(&queue(vec![task(
+            "YARD-HARNESS-CLEAN",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+        write_str(&ws.agents_dir().join("rules/clean.md"), "# clean\n").unwrap();
+        let run_id = "run-20990101-000000-harness-clean";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let owned = prepare_serial_worktree(&ws, &run_dir, run_id, "YARD-HARNESS-CLEAN").unwrap();
+
+        assert!(
+            !run_dir.join("evidence/harness-copy-warnings.log").exists(),
+            "clean preparation must not create the warnings evidence file"
+        );
+        assert!(
+            owned.path.join(".agents/rules/clean.md").is_file(),
+            "clean preparation must still seed harness assets into the worktree"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &owned.path, &owned.branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_create_queue_write_error_removes_worktree_and_branch() {
+        // On a saturated machine this scenario's subprocess layers can fail
+        // for purely environmental reasons: the pre-run hook can miss its
+        // fixed wall-clock ceiling or fail to spawn (rerouting run_next into
+        // the hook-blocked Failed path before the post-create queue write
+        // under test), and the best-effort worktree cleanup's own git calls
+        // can fail to spawn. Rebuild the scenario on a fresh workspace and
+        // retry those signatures a bounded number of times; a genuine
+        // regression stays deterministic across attempts and still fails.
+        let mut environmental = Vec::new();
+        for attempt in 0..3 {
+            match post_create_queue_write_error_attempt(attempt) {
+                Ok(()) => return,
+                Err(reason) => environmental.push(reason),
+            }
+        }
+        panic!("scenario stayed load-degraded across retries: {environmental:?}");
+    }
+
+    #[cfg(unix)]
+    fn post_create_queue_write_error_attempt(attempt: usize) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = init_test_workspace(
+            &format!("serial-post-create-error-cleanup-{attempt}"),
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers:\n  - id: builder\n    invocation: {command: bash, supports_noninteractive: true, output_contract: files}\n",
+        );
+        ws.save_queue(&queue(vec![task(
+            "YARD-POST-CREATE-ERR",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+        let hooks = ws.agents_dir().join("hooks/pre-run.d");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("00-break-queue-write.sh");
+        write_str(
+            &hook,
+            "#!/bin/sh\nrm -f .agents/work-queue.yaml\nmkdir .agents/work-queue.yaml\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-POST-CREATE-ERR".into()),
+                ..opts()
+            },
+        );
+        if let Ok(report) = outcome {
+            let hook_never_ran = report.lines.iter().any(|line| {
+                line.contains("pre-run hook blocked the run")
+                    && (line.contains("timed out") || line.contains("spawn failed"))
+            });
+            let lines = report.lines.clone();
+            let _ = std::fs::remove_dir_all(&ws.root);
+            if hook_never_ran {
+                return Err(format!(
+                    "attempt {attempt}: hook never completed: {lines:?}"
+                ));
+            }
+            panic!(
+                "the hook-created queue directory must fail the post-create queue write: {lines:?}"
+            );
+        }
+
+        let run_dir = only_run_dir(&ws);
+        let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert!(record.serial_isolated, "run must own a serial worktree");
+        let worktree_left = std::path::Path::new(&record.worktree).exists();
+        let branch_listing = git_stdout(&ws.root, &["branch", "--list", &record.worktree_branch]);
+        let branch_left = match &branch_listing {
+            Ok(listing) => !listing.trim().is_empty(),
+            Err(error) => {
+                let reason = format!("attempt {attempt}: branch listing failed: {error:#}");
+                let _ = std::fs::remove_dir_all(&ws.root);
+                return Err(reason);
+            }
+        };
+        let _ = std::fs::remove_dir_all(&ws.root);
+        if worktree_left || branch_left {
+            return Err(format!(
+                "attempt {attempt}: best-effort cleanup left worktree={worktree_left} branch={branch_left} ({} / {})",
+                record.worktree, record.worktree_branch
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_error_removes_owned_serial_worktree_and_branch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = init_test_workspace(
+            "serial-spawn-error-cleanup",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let worker = write_worker_script(
+            &ws.root,
+            "vanishing-worker.sh",
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  rm -f "$0"
+  printf "vanishing-worker 1.0\n"
+  exit 0
+fi
+exit 0
+"#,
+        );
+        let mut permissions = std::fs::metadata(&worker).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&worker, permissions).unwrap();
+        write_str(
+            &ws.workers_path(),
+            &format!(
+                "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: {}\n      supports_noninteractive: true\n      output_contract: files\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+                shell_literal(&worker)
+            ),
+        )
+        .unwrap();
+        ws.save_queue(&queue(vec![task(
+            "YARD-SPAWN-ERR",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        let error = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-SPAWN-ERR".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("the worker binary disappears after readiness probing");
+
+        assert!(error.to_string().contains("spawning worker"), "{error:#}");
+        assert_serial_worktree_and_branch_removed(&ws, &only_run_dir(&ws));
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn import_error_after_worker_run_retains_owned_serial_worktree() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-serial-import-error-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let worker = write_worker_script(
+            &source,
+            "remove-staging.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+cat >/dev/null
+rm -rf "$run_dir"
+exit 0
+"#,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker)
+        );
+        let ws = init_test_workspace("serial-import-error-cleanup", &worker_yaml);
+        ws.save_queue(&queue(vec![task(
+            "YARD-IMPORT-ERR",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-IMPORT-ERR".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("removing the staging run directory must fail artifact import");
+
+        let record: RunRecord = state::load_yaml(&only_run_dir(&ws).join("run.yaml")).unwrap();
+        assert!(std::path::Path::new(&record.worktree).exists());
+        assert!(
+            !git_stdout(&ws.root, &["branch", "--list", &record.worktree_branch])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        crate::parallel::remove_worktree(
+            &ws.root,
+            std::path::Path::new(&record.worktree),
+            &record.worktree_branch,
+        );
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn receipt_persist_error_after_merge_retains_worktree_and_refs() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-receipt-persist-worker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let worker = write_worker_script(
+            &source,
+            "worker.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+printf 'worker change\n' > receipt-owned.txt
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-RECEIPT-ERR",
+  "status": "done",
+  "validation": {"commands_run": [], "passed": true, "failures": []},
+  "compact_summary": "worker completed before receipt failure"
+}
+EOF
+printf '# handoff\n' > "$run_dir/handoff.md"
+"#,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker)
+        );
+        let ws = init_test_workspace("receipt-persist-error", &worker_yaml);
+        let mut config = ws.load_config().unwrap();
+        config.auto_commit = true;
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+        let blocker = ws.checkpoints_dir().join("integrated-cleanup");
+        write_str(&blocker, "blocks receipt directory creation\n").unwrap();
+        let mut queued = task("YARD-RECEIPT-ERR", TaskState::Queued, 10, false);
+        queued.kind = "implementation".into();
+        ws.save_queue(&queue(vec![queued])).unwrap();
+
+        let error = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-RECEIPT-ERR".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("the blocked core receipt path must fail finalization");
+
+        assert!(
+            error.to_string().contains("integrated-cleanup"),
+            "{error:#}"
+        );
+        let run_dir = only_run_dir(&ws);
+        let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert!(std::path::Path::new(&record.worktree).exists());
+        let target = git_stdout(
+            &ws.root,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", record.worktree_branch),
+            ],
+        );
+        let transaction = git_stdout(
+            &ws.root,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/yardlet-txn/{}", record.worktree_branch),
+            ],
+        );
+        assert!(target.is_ok() || transaction.is_ok());
+        assert!(ws.root.join("receipt-owned.txt").exists());
+        assert!(ws.load_git_finish_record(&run_dir).is_err());
+
+        crate::parallel::remove_worktree(
+            &ws.root,
+            std::path::Path::new(&record.worktree),
+            &record.worktree_branch,
+        );
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn no_ready_worker_removes_owned_serial_worktree_and_branch() {
+        let ws = init_test_workspace(
+            "serial-no-ready-cleanup",
+            "schema_version: 1\nrouting: {default_worker: missing}\nworkers:\n  - id: missing\n    invocation: {command: yardlet-definitely-missing-worker-command}\n",
+        );
+        ws.save_queue(&queue(vec![task(
+            "YARD-NO-READY",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        let error = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-NO-READY".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("an unready worker must stop before spawn");
+
+        assert!(error.to_string().contains("no invocable worker"), "{error}");
+        assert_serial_worktree_and_branch_removed(&ws, &only_run_dir(&ws));
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn user_stop_removes_owned_serial_worktree_and_branch() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-serial-user-stop-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let worker = write_worker_script(
+            &source,
+            "stop-worker.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+canonical_runs="$2"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+touch "$canonical_runs/$run_id/cancelled"
+exit 1
+"#,
+        );
+        let ws = init_test_workspace(
+            "serial-user-stop-cleanup",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        write_str(
+            &ws.workers_path(),
+            &format!(
+                "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+                shell_literal(&worker),
+                shell_literal(&ws.runs_dir())
+            ),
+        )
+        .unwrap();
+        ws.save_queue(&queue(vec![task(
+            "YARD-STOP",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-STOP".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::Queued));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Queued);
+        assert_serial_worktree_and_branch_removed(&ws, &report.run_dir);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_worker_uses_owned_worktree_and_main_imports_result() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-serial-worktree-worker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let payload = source.join("payload.txt");
+        write_str(&payload, "worker change\n").unwrap();
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+payload="$2"
+run_id=$(basename "$run_dir")
+cwd=$(pwd)
+cat >/dev/null
+cat "$payload" > owned.txt
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-ISO",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": ["owned.txt"], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "$cwd",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder),
+            shell_literal(&payload)
+        );
+        let ws = init_test_workspace("serial-owned-worktree", &worker_yaml);
+        write_str(&ws.root.join("owned.txt"), "baseline\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws.root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["config", "user.name", "Yardlet Test"]);
+        git(&["config", "user.email", "yardlet@example.test"]);
+        git(&["add", "owned.txt"]);
+        git(&["commit", "-q", "-m", "baseline"]);
+        let mut q = queue(vec![task("YARD-ISO", TaskState::Queued, 10, false)]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let baseline_head = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-ISO".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let result: RunResult = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(record.worktree, ".");
+        assert_eq!(
+            std::fs::canonicalize(&result.compact_summary).unwrap(),
+            std::fs::canonicalize(&record.worktree).unwrap()
+        );
+        assert!(std::fs::canonicalize(&record.worktree)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(ws.agents_dir()).unwrap()));
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("owned.txt")).unwrap(),
+            "baseline\n"
+        );
+        assert!(std::path::Path::new(&record.worktree)
+            .join("owned.txt")
+            .exists());
+        assert!(report.run_dir.join("result.json").exists());
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].id, "YARD-ISO");
+        assert_eq!(
+            git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap().trim(),
+            baseline_head
+        );
+
+        // Explicit opt-in integrates only the isolated diff. A concurrent dirty
+        // edit in the main checkout remains unstaged and unattributed.
+        let retained_default_off = record.worktree.clone();
+        let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+        config.push_str("auto_commit: true\n");
+        write_str(&ws.config_path(), &config).unwrap();
+        write_str(&ws.root.join("fixture.txt"), "user concurrent edit\n").unwrap();
+        let mut q = ws.load_queue().unwrap();
+        q.tasks[0].state = TaskState::Queued;
+        ws.save_queue(&q).unwrap();
+
+        let integrated = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-ISO".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(integrated.result_state, Some(TaskState::Done));
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("owned.txt")).unwrap(),
+            "worker change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("fixture.txt")).unwrap(),
+            "user concurrent edit\n"
+        );
+        assert!(git_stdout(&ws.root, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        let integrated_names =
+            git_stdout(&ws.root, &["diff", "--name-only", "HEAD^1", "HEAD"]).unwrap();
+        assert!(integrated_names.lines().any(|path| path == "owned.txt"));
+        assert!(!integrated_names.lines().any(|path| path == "fixture.txt"));
+        let integrated_record: RunRecord =
+            state::load_yaml(&integrated.run_dir.join("run.yaml")).unwrap();
+        assert_eq!(
+            integrated_record.integration_oid,
+            git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap().trim()
+        );
+        assert_serial_worktree_and_branch_removed(&ws, &integrated.run_dir);
+        assert!(std::path::Path::new(&retained_default_off).exists());
+
+        // An overlapping concurrent main edit is never staged or overwritten.
+        // Git refuses the merge, Yardlet records Partial, and keeps the owned
+        // worktree for inspection.
+        write_str(&payload, "third worker change\n").unwrap();
+        write_str(&ws.root.join("owned.txt"), "user overlapping edit\n").unwrap();
+        let mut q = ws.load_queue().unwrap();
+        q.tasks[0].state = TaskState::Queued;
+        ws.save_queue(&q).unwrap();
+        let conflicted = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-ISO".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(conflicted.result_state, Some(TaskState::Partial));
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("owned.txt")).unwrap(),
+            "user overlapping edit\n"
+        );
+        assert!(git_stdout(&ws.root, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        let conflicted_record: RunRecord =
+            state::load_yaml(&conflicted.run_dir.join("run.yaml")).unwrap();
+        assert!(std::path::Path::new(&conflicted_record.worktree).exists());
+        assert_eq!(
+            std::fs::read_to_string(conflicted.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "merge_conflict"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn run_serial_worker_commit_case(
+        name: &str,
+        task_id: &str,
+        mode: &str,
+        auto_commit: bool,
+    ) -> (Workspace, RunReport, PathBuf) {
+        let source = std::env::temp_dir().join(format!(
+            "yard-serial-worker-commit-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+task_id="$2"
+mode="$3"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+case "$mode" in
+  ordinary)
+    printf "committed deliverable\n" > committed.txt
+    git add -- committed.txt
+    git -c user.name="Worker" -c user.email="worker@example.test" commit -q -m "worker commit"
+    ;;
+  ordinary-detach)
+    printf "committed deliverable\n" > committed.txt
+    git add -- committed.txt
+    git -c user.name="Worker" -c user.email="worker@example.test" commit -q -m "worker commit"
+    git checkout -q --detach HEAD~1
+    ;;
+  canonical)
+    printf "schema_version: 1\nrouting: {default_worker: attacker}\nworkers: []\n" > .agents/workers.yaml
+    git add -- .agents/workers.yaml
+    git -c user.name="Worker" -c user.email="worker@example.test" commit -q -m "worker canonical commit"
+    ;;
+  canonical-detach)
+    printf "schema_version: 1\nsecret_scrub: disabled-by-worker\n" > .agents/tool-policy.yaml
+    git add -- .agents/tool-policy.yaml
+    git -c user.name="Worker" -c user.email="worker@example.test" commit -q -m "worker canonical commit"
+    git checkout -q --detach HEAD~1
+    ;;
+	  committed-and-uncommitted)
+	    printf "committed deliverable\n" > committed.txt
+	    git add -- committed.txt
+	    git -c user.name="Worker" -c user.email="worker@example.test" commit -q -m "worker commit"
+	    printf "schema_version: 1\nid: worker-uncommitted\nsummary: forbidden\nstatus: accepted\n" > .agents/intent-contract.yaml
+	    ;;
+	  harness-asset)
+	    mkdir -p .agents/skills/example
+	    printf '%s\n' '---' 'name: example' 'description: fixture' '---' > .agents/skills/example/SKILL.md
+	    ;;
+	  core-overlay-input|core-overlay-input-tamper-root)
+	    grep -Fxq '# User dirty edit' .agents/rules/tracked-dirty.md || exit 43
+	    printf "worker deliverable\n" > worker-output.txt
+	    ;;
+	  anchor-probe)
+	    test -f "$run_dir/evidence/repo-summary.md" || exit 42
+	    ;;
+esac
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "worker commit case",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}, {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder), task_id, mode
+        );
+        let ws = init_test_workspace(name, &worker_yaml);
+        if mode == "preexisting-learned-rule" {
+            write_str(
+                &ws.agents_dir().join("rules/learned-from-earlier-run.md"),
+                "# Earlier learning\n\nDo not blame the next worker.\n",
+            )
+            .unwrap();
+        }
+        if matches!(
+            mode,
+            "preexisting-dirty-tracked-rule"
+                | "core-overlay-input"
+                | "core-overlay-input-tamper-root"
+        ) {
+            let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+            write_str(&rule, "# Tracked baseline\n").unwrap();
+            git_stdout(&ws.root, &["add", ".agents/rules/tracked-dirty.md"]).unwrap();
+            git_stdout(&ws.root, &["commit", "-q", "-m", "track harness fixture"]).unwrap();
+            write_str(&rule, "# User dirty edit\n").unwrap();
+        }
+        if mode == "canonical-detach" {
+            write_str(
+                &ws.agents_dir().join("tool-policy.yaml"),
+                "schema_version: 1\nsecret_scrub: enabled\n",
+            )
+            .unwrap();
+            for args in [
+                &["add", ".agents/tool-policy.yaml"][..],
+                &["commit", "-q", "-m", "tracked canonical policy baseline"][..],
+            ] {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&ws.root)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {:?}: {}",
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        if auto_commit {
+            let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+            config.push_str("auto_commit: true\n");
+            write_str(&ws.config_path(), &config).unwrap();
+        }
+        let mut queued = task(task_id, TaskState::Queued, 10, false);
+        if matches!(
+            mode,
+            "core-overlay-input" | "core-overlay-input-tamper-root"
+        ) {
+            queued.kind = "implementation".into();
+            let mut validation =
+                "grep -Fxq '# User dirty edit' .agents/rules/tracked-dirty.md".to_string();
+            if mode == "core-overlay-input-tamper-root" {
+                validation.push_str(&format!(
+                    " && printf '# Root changed after validation\\\\n' > {}",
+                    shell_literal(&ws.agents_dir().join("rules/tracked-dirty.md"))
+                ));
+            }
+            queued.validation = Some(
+                crate::yaml::from_str(&format!(
+                    "required: true\ncommands:\n  - {}\n",
+                    serde_json::to_string(&validation).unwrap()
+                ))
+                .unwrap(),
+            );
+        }
+        let mut q = queue(vec![queued]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some(task_id.into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        (ws, report, source)
+    }
+
+    #[test]
+    fn serial_evidence_combines_committed_diff_with_uncommitted_status() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-combined-commit-evidence",
+            "YARD-COMBINED-EVIDENCE",
+            "committed-and-uncommitted",
+            false,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+
+        let evidence = serial_worktree_evidence(&ws, wt, &report.run_dir, &mut None)
+            .unwrap()
+            .paths;
+
+        assert!(
+            evidence.iter().any(|path| path == "committed.txt"),
+            "baseline..run-owned-branch-tip committed paths must be retained: {evidence:?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|path| path == ".agents/intent-contract.yaml"),
+            "uncommitted status paths must remain in the combined evidence: {evidence:?}"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_off_retains_worker_committed_deliverable_as_partial() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-default-off-worker-commit",
+            "YARD-DEFAULT-OFF-COMMIT",
+            "ordinary",
+            false,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert_eq!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "auto_commit_disabled"
+        );
+        assert!(wt.join("committed.txt").is_file());
+        assert!(!ws.root.join("committed.txt").exists());
+        assert!(
+            !git_stdout(&ws.root, &["branch", "--list", &record.worktree_branch])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the worker-owned branch must remain available for manual recovery"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_off_retains_harness_asset_as_partial() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-default-off-harness-asset",
+            "YARD-DEFAULT-OFF-HARNESS",
+            "harness-asset",
+            false,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert_eq!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "auto_commit_disabled"
+        );
+        assert!(wt.join(".agents/skills/example/SKILL.md").is_file());
+        assert!(!ws.root.join(".agents/skills/example/SKILL.md").exists());
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn resolved_dependency_output_fixture(
+        name: &str,
+        auto_commit_on: bool,
+        downstream_validation: Option<&str>,
+    ) -> (Workspace, RunReport, PathBuf, PathBuf) {
+        let source = std::env::temp_dir().join(format!(
+            "yard-resolved-dependency-output-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let spawn_marker = source.join("downstream-spawn.txt");
+        let worker = write_worker_script(
+            &source,
+            "dependency-worker.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+spawn_marker="$2"
+run_id=$(basename "$run_dir")
+packet=$(cat)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+status=done
+created='[]'
+case "$task_id" in
+  YARD-UPSTREAM)
+    printf "resolved dependency bytes\n" > dependency-output.txt
+    mkdir -p .agents/skills/resolved-output
+    printf "resolved harness bytes\n" > .agents/skills/resolved-output/SKILL.md
+    created='["dependency-output.txt", ".agents/skills/resolved-output/SKILL.md"]'
+    ;;
+  YARD-DOWNSTREAM)
+    if test "$(cat dependency-output.txt 2>/dev/null)" = "resolved dependency bytes" \
+       && test "$(cat .agents/skills/resolved-output/SKILL.md 2>/dev/null)" = "resolved harness bytes"
+    then
+      printf "present\n" > "$spawn_marker"
+    else
+      printf "missing\n" > "$spawn_marker"
+      status=failed
+    fi
+    ;;
+esac
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "$status",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": {
+    "files_modified": [],
+    "files_created": $created,
+    "files_deleted": []
+  },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "dependency output fixture",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&spawn_marker)
+        );
+        let ws = init_test_workspace(name, &worker_yaml);
+        let mut downstream = task("YARD-DOWNSTREAM", TaskState::Queued, 20, false);
+        downstream.depends_on = vec!["YARD-UPSTREAM".into()];
+        if let Some(validation) = downstream_validation {
+            downstream.kind = "implementation".into();
+            downstream.validation = Some(
+                crate::yaml::from_str(&format!(
+                    "required: true\ncommands:\n  - {}\n",
+                    serde_json::to_string(validation).unwrap()
+                ))
+                .unwrap(),
+            );
+        }
+        let mut q = queue(vec![
+            task("YARD-UPSTREAM", TaskState::Queued, 10, false),
+            downstream,
+        ]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let upstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-UPSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(upstream.result_state, Some(TaskState::Partial));
+        assert!(!ws.root.join("dependency-output.txt").exists());
+        state::resolve_partial(&ws, "YARD-UPSTREAM", "integrated manually").unwrap();
+
+        if auto_commit_on {
+            let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+            config.push_str("auto_commit: true\n");
+            write_str(&ws.config_path(), &config).unwrap();
+        }
+        (ws, upstream, source, spawn_marker)
+    }
+
+    #[test]
+    fn resolved_auto_commit_off_outputs_reach_dependent_fresh_worktree() {
+        let (ws, _upstream, source, spawn_marker) =
+            resolved_dependency_output_fixture("resolved-dependency-output", true, None);
+        let downstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&spawn_marker).unwrap(),
+            "present\n",
+            "resolved dependency outputs were absent from the downstream fresh worktree before worker spawn"
+        );
+        assert_eq!(downstream.result_state, Some(TaskState::Done));
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("dependency-output.txt")).unwrap(),
+            "resolved dependency bytes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join(".agents/skills/resolved-output/SKILL.md"))
+                .unwrap(),
+            "resolved harness bytes\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_off_consume_only_downstream_stays_done_with_dependency_overlay_receipt() {
+        let (ws, _upstream, source, spawn_marker) =
+            resolved_dependency_output_fixture("resolved-dependency-consume-only", false, None);
+        let downstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&spawn_marker).unwrap(),
+            "present\n",
+            "resolved dependency outputs were absent from the downstream fresh worktree"
+        );
+        assert_eq!(
+            downstream.result_state,
+            Some(TaskState::Done),
+            "materialized upstream bytes alone must not demote a consume-only \
+             downstream under auto_commit=false: {:?}",
+            downstream.lines
+        );
+        assert_eq!(
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.id == "YARD-DOWNSTREAM")
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
+        assert!(!downstream.run_dir.join("partial-reason").exists());
+
+        let expected_overlays = vec![
+            state::DependencyInputOverlay {
+                dependency_task_id: "YARD-UPSTREAM".into(),
+                path: ".agents/skills/resolved-output/SKILL.md".into(),
+                content_digest: state::content_digest(b"resolved harness bytes\n"),
+            },
+            state::DependencyInputOverlay {
+                dependency_task_id: "YARD-UPSTREAM".into(),
+                path: "dependency-output.txt".into(),
+                content_digest: state::content_digest(b"resolved dependency bytes\n"),
+            },
+        ];
+        let receipt = ws
+            .load_serial_integration_receipt(&downstream.run_id)
+            .unwrap();
+        assert_eq!(
+            receipt.dependency_input_overlays, expected_overlays,
+            "materialized dependency outputs must be receipted with their own provenance kind"
+        );
+        let no_change = ws.load_no_change_receipt(&downstream.run_id).unwrap();
+        assert_eq!(
+            no_change.dependency_input_overlays, expected_overlays,
+            "the durable no-change receipt must carry the typed consume-only policy evidence"
+        );
+
+        // Evidence separation: the worker reported no changes, so the advisory
+        // disclosure check only passes when the evaluator saw none either.
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(downstream.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let disclosure = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "diff_matches_report")
+            .unwrap();
+        assert_eq!(
+            disclosure["passed"], true,
+            "upstream-authored bytes must not be attributed to the downstream worker: {disclosure}"
+        );
+
+        let record: RunRecord = state::load_yaml(&downstream.run_dir.join("run.yaml")).unwrap();
+        assert!(
+            !std::path::Path::new(&record.worktree).exists(),
+            "a consume-only no-change run must clean up its worktree"
+        );
+        assert!(
+            !ws.root.join("dependency-output.txt").exists(),
+            "auto_commit=false must keep upstream bytes out of the owning root"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// A worker that declares a repository deliverable but writes it OUTSIDE
+    /// its run-owned worktree leaves that worktree with nothing to integrate.
+    /// Recording "no changes" there reports Done over an uncommitted file
+    /// (issue #55), so both integration protocols must refuse it.
+    fn outside_write_no_change_fixture(name: &str, auto_commit_on: bool) -> (Workspace, PathBuf) {
+        let source = std::env::temp_dir().join(format!(
+            "yard-outside-write-source-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        // init_test_workspace derives the owning root from the same formula, so
+        // the worker can be handed a path that is deliberately not its cwd.
+        let owning_root = std::env::temp_dir().join(format!("yard-{name}-{}", std::process::id()));
+        let worker = write_worker_script(
+            &source,
+            "outside-writer.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+owning_root="$2"
+run_id=$(basename "$run_dir")
+packet=$(cat)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+printf "declared deliverable\n" > "$owning_root/declared-deliverable.txt"
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": {
+    "files_modified": [],
+    "files_created": ["declared-deliverable.txt"],
+    "files_deleted": []
+  },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "wrote its deliverable outside the run-owned worktree",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&owning_root)
+        );
+        let ws = init_test_workspace(name, &worker_yaml);
+        assert_eq!(ws.root, owning_root);
+        if auto_commit_on {
+            let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+            config.push_str("auto_commit: true\n");
+            write_str(&ws.config_path(), &config).unwrap();
+        }
+        let mut q = queue(vec![task("YARD-OUTSIDE", TaskState::Queued, 10, false)]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        (ws, source)
+    }
+
+    fn assert_no_change_refused(ws: &Workspace, report: &RunReport) {
+        assert_eq!(
+            report.result_state,
+            Some(TaskState::Partial),
+            "a declared deliverable the worktree never held must not land Done: {:?}",
+            report.lines
+        );
+        assert_eq!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "no_change_contradicts_declared_outputs"
+        );
+        assert!(
+            ws.load_no_change_receipt(&report.run_id).is_err(),
+            "a refused no-change outcome must not leave a durable receipt recovery would replay"
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        assert!(
+            std::path::Path::new(&record.worktree).exists(),
+            "the worktree must be kept so the operator can inspect the contradiction"
+        );
+        let handoff = std::fs::read_to_string(report.run_dir.join("handoff.md")).unwrap();
+        assert!(
+            handoff.contains("No-change integration refused")
+                && handoff.contains("declared-deliverable.txt"),
+            "the handoff must name the output that was not integrated: {handoff}"
+        );
+        let finish: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("git-finish.json")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            finish["status"], "not_needed",
+            "Git finish must not report 'no changes' over a declared deliverable: {finish}"
+        );
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let presence = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "reported_changes_present")
+            .unwrap();
+        assert_eq!(
+            presence["passed"], false,
+            "the evaluator must say the reported file is absent from the diff: {presence}"
+        );
+    }
+
+    #[test]
+    fn declared_output_written_outside_the_worktree_refuses_no_change_integration() {
+        let (ws, source) = outside_write_no_change_fixture("outside-write-auto-commit", true);
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-OUTSIDE".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_no_change_refused(&ws, &report);
+        assert!(
+            ws.root.join("declared-deliverable.txt").exists(),
+            "the fixture must reproduce the loose file the operator found in the owning root"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn declared_output_written_outside_the_worktree_refuses_no_change_without_auto_commit() {
+        let (ws, source) = outside_write_no_change_fixture("outside-write-no-auto-commit", false);
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-OUTSIDE".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_no_change_refused(&ws, &report);
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// The wiring, not just the helper: a worker that names a deliverable from
+    /// its OWN cwd (the worktree) while actually writing it somewhere Yardlet
+    /// does not integrate must still be caught. Resolving that path against the
+    /// owning root instead lands it under `.agents/worktrees/**`, which the
+    /// allowlist rejects — so the guard goes silent and issue #55 ships again.
+    /// This is the case the review-artifact test cannot see, because a run
+    /// artifact is non-integratable under either root.
+    #[test]
+    fn a_deliverable_named_from_the_worktree_is_still_caught() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-worktree-declared-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let owning_root =
+            std::env::temp_dir().join(format!("yard-worktree-declared-{}", std::process::id()));
+        // The worker declares `<its cwd>/tests/new.rs` but writes the file into
+        // the owning root, so its own worktree diff stays empty.
+        let worker = write_worker_script(
+            &source,
+            "worktree-declaring-worker.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+owning_root="$2"
+run_id=$(basename "$run_dir")
+packet=$(cat)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+mkdir -p "$owning_root/tests"
+printf "// deliverable\n" > "$owning_root/tests/new.rs"
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": {
+    "files_modified": [],
+    "files_created": ["$(pwd)/tests/new.rs"],
+    "files_deleted": []
+  },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "declared from the worktree, written elsewhere",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&owning_root)
+        );
+        let ws = init_test_workspace("worktree-declared", &worker_yaml);
+        assert_eq!(ws.root, owning_root);
+        let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+        config.push_str("auto_commit: true\n");
+        write_str(&ws.config_path(), &config).unwrap();
+        let mut q = queue(vec![task("YARD-WT", TaskState::Queued, 10, false)]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-WT".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.result_state,
+            Some(TaskState::Partial),
+            "a deliverable declared from the worktree must not be dropped into \
+             .agents/worktrees/**: {:?}",
+            report.lines
+        );
+        assert_eq!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "no_change_contradicts_declared_outputs"
+        );
+        let handoff = std::fs::read_to_string(report.run_dir.join("handoff.md")).unwrap();
+        assert!(
+            handoff.contains("tests/new.rs"),
+            "the handoff must name the output, repository-relative: {handoff}"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// A `review` task is REQUIRED by the packet to write `report.md` into its
+    /// run directory, is forbidden to touch code, and is handed that directory
+    /// as an ABSOLUTE path. It therefore finishes with zero repository changes
+    /// while honestly declaring an absolute run-artifact path — the exact shape
+    /// the no-change guard must not mistake for lost output (issue #55
+    /// remediation).
+    #[test]
+    fn a_review_run_declaring_its_own_report_still_lands_done() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-review-artifact-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let worker = write_worker_script(
+            &source,
+            "review-worker.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+packet=$(cat)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+printf "# findings
+" > "$run_dir/report.md"
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": {
+    "files_modified": [],
+    "files_created": ["$run_dir/report.md"],
+    "files_deleted": []
+  },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "review produced findings, no code changes",
+  "verdict": [{ "criterion_id": "AC-001", "pass": true, "evidence": "read the code" }],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff
+" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker)
+        );
+        let ws = init_test_workspace("review-artifact", &worker_yaml);
+        let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+        config.push_str("auto_commit: true\n");
+        write_str(&ws.config_path(), &config).unwrap();
+        let mut review = task("YARD-REVIEW", TaskState::Queued, 10, false);
+        review.kind = "review".into();
+        let mut q = queue(vec![review]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-REVIEW".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.result_state,
+            Some(TaskState::Done),
+            "a review that wrote only its own report must not be refused as a lost deliverable: {:?}",
+            report.lines
+        );
+        assert!(
+            !report.run_dir.join("partial-reason").exists(),
+            "no partial-reason should have been written: {:?}",
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+        );
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let presence = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "reported_changes_present")
+            .unwrap_or_else(|| panic!("the evaluator no longer reports declared-path presence"));
+        assert_eq!(
+            presence["passed"], true,
+            "the run's own artifacts must not read as absent repository output: {presence}"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// A worker must not be able to write the record that decides whether its
+    /// own run may run again. The #19 sandbox work lifts declared `.agents/`
+    /// scope into writable roots, and a review used a worker-proposed follow-up
+    /// to claim `.agents/stopped-runs` that way, then forged an interrupt and
+    /// requeued its own passing task (issue #110).
+    #[test]
+    fn core_only_state_is_never_lifted_into_a_writable_root() {
+        fn scoped_task(scope: &[&str]) -> crate::schemas::Task {
+            let entries = scope
+                .iter()
+                .map(|s| format!("  - \"{s}\""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_yaml_ng::from_str(&format!(
+                "id: YARD-001\ntitle: t\nstate: queued\npriority: 10\nallowed_scope:\n{entries}\n"
+            ))
+            .expect("task fixture")
+        }
+        let root = std::env::temp_dir().join(format!(
+            "yard-core-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for dir in [
+            ".agents/stopped-runs",
+            ".agents/runtime-task-receipts",
+            ".agents/checkpoints",
+            ".agents/telemetry",
+            ".agents/skills/legitimate",
+            ".agents/runs",
+            ".agents/stopped-runs-notes",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+
+        for core in [
+            ".agents/stopped-runs",
+            ".agents/stopped-runs/**",
+            ".agents/runtime-task-receipts/**",
+            ".agents/checkpoints/**",
+            ".agents/telemetry/**",
+            // Run directories: a worker handed the tree wrote `cancelled` into a
+            // sibling's run and had that task stopped and requeued.
+            ".agents/runs/**",
+            // The same directories under equivalent spellings. A prefix test on
+            // the raw string let both of these past.
+            ".agents/skills/../stopped-runs/**",
+            ".agents/Stopped-Runs/**",
+            "./.agents/stopped-runs/**",
+            ".agents/stopped-runs/",
+        ] {
+            assert!(
+                sandbox_writable_roots(&scoped_task(&[core]), &root).is_empty(),
+                "{core} was lifted into a writable root; a worker could then decide \
+                 whether its own run counts as interrupted"
+            );
+        }
+
+        // The legitimate case still works — this must not become a blanket
+        // refusal of `.agents/` scope, which is what #19 was about.
+        assert_eq!(
+            sandbox_writable_roots(&scoped_task(&[".agents/skills/legitimate/**"]), &root),
+            vec![root.join(".agents/skills/legitimate")]
+        );
+        // And a name that merely SHARES A PREFIX with a protected one is not
+        // protected: matching has to be on path boundaries, not on text.
+        assert_eq!(
+            sandbox_writable_roots(&scoped_task(&[".agents/stopped-runs-notes/**"]), &root),
+            vec![root.join(".agents/stopped-runs-notes")]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #110: the interruption verdict has to survive the process that made
+    /// it. `recover` runs later, in a different process where a stop flag no
+    /// longer exists — and it calls the same finalizer, which is how a stopped
+    /// run came to be recorded `done` with no marker anywhere.
+    #[test]
+    fn the_interruption_record_is_core_owned_and_survives_the_process() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-stop-core-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+
+        assert!(ws.run_interruption_cause("run-a").is_none());
+        ws.record_run_interrupted("run-a", "operator_interrupt")
+            .unwrap();
+        assert_eq!(
+            ws.run_interruption_cause("run-a").as_deref(),
+            Some("operator_interrupt"),
+            "a later process must reach the verdict the interrupted one recorded"
+        );
+        // Per-run: one run's verdict says nothing about another. That is what
+        // stops a long-lived TUI condemning its next run, and one stopped worker
+        // in a parallel batch condemning a sibling that finished correctly.
+        assert!(ws.run_interruption_cause("run-b").is_none());
+
+        // The cause is carried, not just the fact, so a `yardlet redirect` stop
+        // can never be read as an operator interrupt.
+        ws.record_run_interrupted("run-c", "redirect").unwrap();
+        assert_eq!(
+            ws.run_interruption_cause("run-c").as_deref(),
+            Some("redirect")
+        );
+
+        // Outside the run directory, which a parallel worker is handed to write
+        // into — a review forged the record when it lived there.
+        assert!(
+            ws.stopped_runs_dir().starts_with(ws.agents_dir())
+                && !ws
+                    .stopped_runs_dir()
+                    .starts_with(ws.agents_dir().join("runs")),
+            "the record must not live where a worker can write"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #117: a serial worker could see its worktree, branch and baseline
+    /// and still not know whether accepted output would be adopted, or into
+    /// what. A preflight task asked to prove the delivery path had nothing to
+    /// read but the prose of the task that asked.
+    #[test]
+    fn the_adoption_projection_answers_where_accepted_output_goes() {
+        for (auto_commit, branch) in [
+            (true, "agent/replan-from-first-principles"),
+            (false, "main"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "yard-adoption-{}-{}-{}",
+                auto_commit,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.name", "fixture"]);
+            git(&["config", "user.email", "fixture@example.invalid"]);
+            std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+            git(&["add", "README.md"]);
+            git(&["commit", "-qm", "base"]);
+            git(&["checkout", "-q", "-b", branch]);
+
+            let ws = Workspace::at(&root);
+            // Written through init so the fixture matches the real schema
+            // rather than a hand-rolled subset that silently fails to parse.
+            crate::init::ensure_initialized(&root).expect("init the fixture workspace");
+            let config_path = ws.agents_dir().join("yardlet.yaml");
+            let config = std::fs::read_to_string(&config_path).unwrap();
+            let config = config
+                .lines()
+                .map(|line| {
+                    if line.starts_with("auto_commit:") {
+                        format!("auto_commit: {auto_commit}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&config_path, format!("{config}\n")).unwrap();
+
+            let policy =
+                adoption_policy_for(&ws).expect("a readable config must yield a projection");
+            assert_eq!(
+                policy.auto_commit, auto_commit,
+                "the projection must carry the spawn-time value, not a default"
+            );
+            assert_eq!(
+                policy.owning_ref,
+                format!("refs/heads/{branch}"),
+                "the owning ref is where integration lands, and a dogfood session is \
+                 routinely not on main"
+            );
+            // An empty push target is not "nowhere to adopt into". Conflating
+            // them is how a worker would read local adoption as disabled.
+            assert!(policy.push_target_ref.is_empty());
+            assert!(!policy.owning_ref.is_empty());
+            if auto_commit {
+                assert!(policy.retention.contains("adopted"));
+            } else {
+                assert!(
+                    policy.retention.contains("retained") && policy.retention.contains("resolve"),
+                    "with adoption off the projection must NAME the manual path: {}",
+                    policy.retention
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Issue #15: a downstream task granted write scope over a path that a
+    /// dependency pins by digest. It passed, integrated, and only a later review
+    /// found the pinned evidence no longer reproduced — two runs spent.
+    #[test]
+    fn a_scope_over_pinned_evidence_is_refused_before_the_worker_starts() {
+        fn scoped_task(scope: &[&str]) -> crate::schemas::Task {
+            let entries = scope
+                .iter()
+                .map(|s| format!("  - \"{s}\""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_yaml_ng::from_str(&format!(
+                "id: YARD-003\ntitle: t\nstate: queued\npriority: 10\nallowed_scope:\n{entries}\n"
+            ))
+            .expect("task fixture")
+        }
+        let dependency = state::DependencyInputOverlay {
+            dependency_task_id: "YARD-001".into(),
+            path: "tests/yard007_tests.gd".into(),
+            content_digest: "0a7f0a8d".into(),
+        };
+        let core = state::SerialInputOverlay {
+            path: ".agents/skills/seeded/SKILL.md".into(),
+            content_digest: "digest".into(),
+        };
+
+        // The reported case: the exact pinned file is in scope.
+        let conflict = scope_conflicts_with_pinned_evidence(
+            &scoped_task(&["tests/yard007_tests.gd"]),
+            &[],
+            std::slice::from_ref(&dependency),
+        )
+        .expect("a scope over a dependency-pinned path must be refused");
+        assert!(
+            conflict.contains("tests/yard007_tests.gd") && conflict.contains("YARD-001"),
+            "the refusal must name both the path and what pins it: {conflict}"
+        );
+
+        // A directory scope covering it counts too — the conflict is the file
+        // being writable, not how the scope spelled it.
+        assert!(scope_conflicts_with_pinned_evidence(
+            &scoped_task(&["tests/**"]),
+            &[],
+            std::slice::from_ref(&dependency),
+        )
+        .is_some());
+
+        // The core seed is pinned for the same reason.
+        assert!(scope_conflicts_with_pinned_evidence(
+            &scoped_task(&[".agents/skills/seeded/**"]),
+            std::slice::from_ref(&core),
+            &[],
+        )
+        .is_some());
+
+        // A neighbouring path is not the pinned one.
+        assert!(scope_conflicts_with_pinned_evidence(
+            &scoped_task(&["tests/yard007_regression.gd"]),
+            &[],
+            std::slice::from_ref(&dependency),
+        )
+        .is_none());
+
+        // Nothing pinned: nothing to conflict with.
+        assert!(
+            scope_conflicts_with_pinned_evidence(&scoped_task(&["tests/**"]), &[], &[]).is_none()
+        );
+    }
+
+    /// Issue #19: a task whose confirmed contract grants it a skill package
+    /// could not write there, because `workspace-write` treats the hidden
+    /// `.agents/` tree as read-only. The worker reported `needs_user` and asked
+    /// the operator to authorize what had already been authorized.
+    #[test]
+    fn sandbox_roots_lift_only_the_agents_scope_the_sandbox_would_refuse() {
+        fn scoped_task(scope: &[&str]) -> crate::schemas::Task {
+            let entries = scope
+                .iter()
+                .map(|s| format!("  - \"{s}\""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_yaml_ng::from_str(&format!(
+                "id: YARD-001\ntitle: t\nstate: queued\npriority: 10\nallowed_scope:\n{entries}\n"
+            ))
+            .expect("task fixture")
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "yard-sandbox-roots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let package = root.join(".agents/skills/route-game-development");
+        std::fs::create_dir_all(package.join("fixtures")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        // The package the contract granted (glob), ordinary workspace content
+        // the sandbox already allows, and a declared path that does not exist.
+        let task = scoped_task(&[
+            ".agents/skills/route-game-development/**",
+            "src/**",
+            ".agents/skills/never-created/**",
+        ]);
+
+        assert_eq!(
+            sandbox_writable_roots(&task, &root),
+            vec![package.clone()],
+            "only the `.agents/` scope that exists may be lifted"
+        );
+
+        // A file entry contributes the directory that holds it — `--add-dir`
+        // takes roots, not files.
+        let task = scoped_task(&[".agents/skills/route-game-development/SKILL.md"]);
+        assert_eq!(sandbox_writable_roots(&task, &root), vec![package]);
+
+        // `.agents` itself is never a root: that would hand the worker the whole
+        // canonical state, which is what the sandbox is protecting.
+        let task = scoped_task(&[".agents/**"]);
+        assert!(sandbox_writable_roots(&task, &root).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #91: SOME of the declared output reaching the commit is not the
+    /// same as all of it. The guard has to split three cases, and the middle one
+    /// is the defect.
+    #[test]
+    fn partial_integration_flags_only_output_that_exists_and_was_not_committed() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-partial-integration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        // Both were written; only one reached the commit.
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("docs/b.md"), "b\n").unwrap();
+
+        let result = RunResult {
+            schema_version: 1,
+            run_id: "run-test".into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: crate::schemas::Changes {
+                files_created: vec![
+                    "src/a.rs".into(),
+                    "docs/b.md".into(),
+                    // Declared but never written: a mis-declaration, which is a
+                    // different fault and must NOT make this run Partial —
+                    // otherwise a worker's typo fails correct work.
+                    "docs/never-written.md".into(),
+                ],
+                files_modified: vec![],
+                files_deleted: vec![],
+            },
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: String::new(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        let worktree = root.join(".agents/worktrees/run-test");
+        let roots = DeclaredPathRoots {
+            worktree: &worktree,
+            workspace: &root,
+        };
+
+        let missing = unintegrated_declared_outputs(
+            &root,
+            &["src/a.rs".to_string()],
+            Some(&result),
+            &roots,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            missing,
+            vec!["docs/b.md".to_string()],
+            "only the declared output that exists on disk and is absent from the \
+             commit may hold the run back"
+        );
+
+        // Everything committed: nothing to hold back.
+        assert!(unintegrated_declared_outputs(
+            &root,
+            &["src/a.rs".to_string(), "docs/b.md".to_string()],
+            Some(&result),
+            &roots,
+            &[],
+            &[],
+        )
+        .is_empty());
+
+        // A committed DIRECTORY covers what is under it.
+        assert!(unintegrated_declared_outputs(
+            &root,
+            &["src/a.rs".to_string(), "docs/b.md/inner".to_string()],
+            Some(&result),
+            &roots,
+            &[],
+            &[],
+        )
+        .is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_change_contradiction_reads_evidence_before_declared_outputs() {
+        let overlay = state::SerialInputOverlay {
+            path: ".agents/skills/seeded/SKILL.md".into(),
+            content_digest: "digest".into(),
+        };
+        let dependency = state::DependencyInputOverlay {
+            dependency_task_id: "YARD-UPSTREAM".into(),
+            path: "dependency-output.txt".into(),
+            content_digest: "digest".into(),
+        };
+        let result = |created: &[&str], modified: &[&str], deleted: &[&str]| RunResult {
+            schema_version: 1,
+            run_id: "run-test".into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: crate::schemas::Changes {
+                files_created: created.iter().map(|p| p.to_string()).collect(),
+                files_modified: modified.iter().map(|p| p.to_string()).collect(),
+                files_deleted: deleted.iter().map(|p| p.to_string()).collect(),
+            },
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: String::new(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+
+        // The worker's cwd IS the worktree, and its run dir is nested inside it,
+        // so both roots have to resolve or an absolutely-declared deliverable
+        // lands under `.agents/worktrees/...` and vanishes from the allowlist.
+        let worktree = std::path::PathBuf::from("/ws/.agents/worktrees/run-test");
+        let roots = DeclaredPathRoots {
+            worktree: &worktree,
+            workspace: std::path::Path::new("/ws"),
+        };
+        let contradiction = |result: &RunResult, evidence: &[String]| {
+            no_change_contradiction(
+                Some(result),
+                Some(evidence),
+                &roots,
+                std::slice::from_ref(&overlay),
+                std::slice::from_ref(&dependency),
+            )
+        };
+
+        // Change evidence outranks the self-report: staging would have committed
+        // this path, so a no-change outcome contradicts Yardlet's own diff.
+        let evidenced = result(&[], &[], &[]);
+        assert_eq!(
+            contradiction(&evidenced, &["src/lib.rs".to_string()]),
+            Some((
+                "no_change_contradicts_change_evidence",
+                vec!["src/lib.rs".to_string()]
+            ))
+        );
+
+        // No evidence, but the worker still claims a repository output.
+        assert_eq!(
+            contradiction(&result(&["./tests/new.rs"], &[], &[]), &[]),
+            Some((
+                "no_change_contradicts_declared_outputs",
+                vec!["tests/new.rs".to_string()]
+            ))
+        );
+        // ...including one it declared as modified rather than created.
+        assert_eq!(
+            contradiction(&result(&[], &["src/lib.rs"], &[]), &[]),
+            Some((
+                "no_change_contradicts_declared_outputs",
+                vec!["src/lib.rs".to_string()]
+            ))
+        );
+        // ...stated as an absolute path inside the workspace...
+        assert_eq!(
+            contradiction(&result(&["/ws/docs/lost.md"], &[], &[]), &[]),
+            Some((
+                "no_change_contradicts_declared_outputs",
+                vec!["docs/lost.md".to_string()]
+            ))
+        );
+        // ...and — the case a workspace-only normalizer silently drops — stated
+        // from the worker's own cwd, which is the worktree.
+        assert_eq!(
+            contradiction(
+                &result(&["/ws/.agents/worktrees/run-test/tests/new.rs"], &[], &[]),
+                &[]
+            ),
+            Some((
+                "no_change_contradicts_declared_outputs",
+                vec!["tests/new.rs".to_string()]
+            )),
+            "a deliverable named from the worktree must not resolve into .agents/worktrees/**"
+        );
+
+        // Core-delivered inputs, canonical/runtime state, and a path the worker
+        // also declared deleted are not missing deliverables.
+        assert_eq!(
+            contradiction(
+                &result(
+                    &[
+                        ".agents/skills/seeded/SKILL.md",
+                        "dependency-output.txt",
+                        ".agents/telemetry/runs.jsonl",
+                        "scratch.txt",
+                    ],
+                    &[],
+                    &["scratch.txt"],
+                ),
+                &[]
+            ),
+            None
+        );
+
+        // The run's OWN artifacts are not repository output. Every
+        // non-implementation task is required to write report.md into its run
+        // directory and forbidden to touch code, and the packet hands it that
+        // directory as an ABSOLUTE path — so a review that behaved perfectly
+        // reports exactly these and must not be flipped to Partial.
+        assert_eq!(
+            contradiction(
+                &result(
+                    &[
+                        "/ws/.agents/worktrees/run-test/.agents/runs/run-test/report.md",
+                        "/ws/.agents/runs/run-test/result.json",
+                        ".agents/runs/run-test/handoff.md",
+                    ],
+                    &[],
+                    &[]
+                ),
+                &[]
+            ),
+            None,
+            "a review run's own artifacts must not read as lost repository output"
+        );
+
+        // A path Yardlet cannot place is not a repository deliverable, so it
+        // must NOT flip a correct run — that would recreate the false positive
+        // this guard was corrected for. It is reported instead, and the two
+        // spellings of "outside" must agree.
+        for outside in ["/elsewhere/other.md", "/ws/../elsewhere/other.md"] {
+            let declared = result(&[outside], &[], &[]);
+            assert_eq!(
+                contradiction(&declared, &[]),
+                None,
+                "{outside} must not flip the run"
+            );
+            assert_eq!(
+                unplaceable_declared_outputs(Some(&declared), &roots),
+                vec!["/elsewhere/other.md".to_string()],
+                "{outside} must be surfaced, in one normalized spelling"
+            );
+        }
+
+        // An absolute `..` that crosses a root boundary still names a real
+        // repository file, so it must gate rather than read as "outside this
+        // workspace". Stripping before resolving would miss it.
+        assert_eq!(
+            contradiction(
+                &result(
+                    &["/ws/.agents/worktrees/run-test/../../../docs/lost.md"],
+                    &[],
+                    &[]
+                ),
+                &[]
+            ),
+            Some((
+                "no_change_contradicts_declared_outputs",
+                vec!["docs/lost.md".to_string()]
+            ))
+        );
+
+        // A root directory itself is neither a deliverable nor a lost output —
+        // including when `..` walks back to it.
+        for root_path in [
+            "/ws",
+            "/ws/.agents/worktrees/run-test",
+            "/ws/",
+            "src/..",
+            "./",
+        ] {
+            let declared = result(&[root_path], &[], &[]);
+            assert_eq!(contradiction(&declared, &[]), None, "{root_path}");
+            assert!(
+                unplaceable_declared_outputs(Some(&declared), &roots).is_empty(),
+                "{root_path} must not be reported as a lost output"
+            );
+        }
+
+        // An interior `..` that still lands INSIDE the repository names a real
+        // file. Treating "contains .." as unplaceable stops it gating, which is
+        // issue #55 re-opened for that spelling — and tells the operator the
+        // path is "outside this workspace", which it is not.
+        for (inside, resolved) in [
+            ("src/../tests/regression.rs", "tests/regression.rs"),
+            (
+                "./crates/a/../tests/regression.rs",
+                "crates/tests/regression.rs",
+            ),
+            ("/ws/src/../tests/regression.rs", "tests/regression.rs"),
+            (
+                "/ws/.agents/worktrees/run-test/src/../tests/regression.rs",
+                "tests/regression.rs",
+            ),
+        ] {
+            assert_eq!(
+                contradiction(&result(&[inside], &[], &[]), &[]),
+                Some((
+                    "no_change_contradicts_declared_outputs",
+                    vec![resolved.to_string()]
+                )),
+                "{inside} resolves inside the repository and must still gate"
+            );
+        }
+
+        // A declared output that is created and then deleted is not left
+        // behind, wherever it lives.
+        let scratch = result(&["/outside/scratch.txt"], &[], &["/outside/scratch.txt"]);
+        assert_eq!(contradiction(&scratch, &[]), None);
+        assert!(
+            unplaceable_declared_outputs(Some(&scratch), &roots).is_empty(),
+            "a created-then-deleted scratch file must not be reported as lost"
+        );
+
+        // A run that genuinely produced nothing stays a clean no-op.
+        assert_eq!(contradiction(&result(&[], &[], &[]), &[]), None);
+
+        // No result.json at all: nothing is declared, so nothing is contradicted.
+        assert_eq!(
+            no_change_contradiction(None, Some(&[]), &roots, &[], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn dependency_overlay_worktree_tamper_blocks_done_with_typed_diagnosis() {
+        let (ws, _upstream, source, spawn_marker) = resolved_dependency_output_fixture(
+            "resolved-dependency-overlay-tamper",
+            false,
+            Some(
+                "grep -Fxq 'resolved dependency bytes' dependency-output.txt && \
+                 printf 'tampered after validation\\n' > dependency-output.txt",
+            ),
+        );
+        let downstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        let record: RunRecord = state::load_yaml(&downstream.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+        let validation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(downstream.run_dir.join("validation.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&spawn_marker).unwrap(), "present\n");
+        assert_eq!(validation["all_passed"], true);
+        assert!(
+            !matches!(downstream.result_state, Some(TaskState::Done)),
+            "a dependency overlay rewritten after validation must not reach Done: {:?}",
+            downstream.result_state
+        );
+        assert!(
+            std::fs::read_to_string(downstream.run_dir.join("partial-reason"))
+                .unwrap()
+                .starts_with(
+                    "dependency_input_overlay_parity_mismatch:path=dependency-output.txt:dependency=YARD-UPSTREAM"
+                ),
+            "the parity failure must name the dependency overlay provenance"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn dependency_output_digest_tamper_blocks_serial_worker_spawn() {
+        let (ws, upstream, source, spawn_marker) =
+            resolved_dependency_output_fixture("resolved-dependency-output-tamper", true, None);
+        let manifest = ws
+            .load_resolved_dependency_outputs(&upstream.run_id)
+            .unwrap();
+        let ordinary = manifest
+            .outputs
+            .iter()
+            .find(|output| output.path == "dependency-output.txt")
+            .unwrap();
+        let snapshot = ws
+            .checkpoints_dir()
+            .join("dependency-outputs")
+            .join(&upstream.run_id)
+            .join("snapshots")
+            .join(&ordinary.snapshot_file);
+        write_str(&snapshot, "tampered dependency bytes\n").unwrap();
+
+        let error = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("digest tamper must block the downstream before spawn");
+        assert!(
+            error.to_string().contains(
+                "dependency_output_digest_mismatch:dependency=YARD-UPSTREAM:path=dependency-output.txt"
+            ),
+            "{error:#}"
+        );
+        assert!(
+            !spawn_marker.exists(),
+            "the downstream worker spawned before dependency digest verification"
+        );
+        assert_eq!(
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.id == "YARD-DOWNSTREAM")
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn no_output_resolved_state_only_partial_unblocks_downstream_without_overlays() {
+        // YARD-014 decision A, process leg: a real worker run that goes Partial
+        // with zero repository outputs has no proof for the default resolve
+        // (fail-closed), while `resolve --no-outputs` records durable absence
+        // and lets the dependent run reach its worker with zero overlays.
+        let source = std::env::temp_dir().join(format!(
+            "yard-no-output-resolve-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let spawn_marker = source.join("downstream-spawn.txt");
+        let worker = write_worker_script(
+            &source,
+            "no-output-worker.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+spawn_marker="$2"
+run_id=$(basename "$run_dir")
+packet=$(cat)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+status=done
+case "$task_id" in
+  YARD-UPSTREAM)
+    status=partial
+    ;;
+  YARD-DOWNSTREAM)
+    printf "spawned\n" > "$spawn_marker"
+    ;;
+esac
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "$status",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "state-only partial fixture",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&worker),
+            shell_literal(&spawn_marker)
+        );
+        let ws = init_test_workspace("no-output-resolve-process", &worker_yaml);
+        let mut downstream = task("YARD-DOWNSTREAM", TaskState::Queued, 20, false);
+        downstream.depends_on = vec!["YARD-UPSTREAM".into()];
+        let mut q = queue(vec![
+            task("YARD-UPSTREAM", TaskState::Queued, 10, false),
+            downstream,
+        ]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let upstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-UPSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(upstream.result_state, Some(TaskState::Partial));
+
+        let error = state::resolve_partial(&ws, "YARD-UPSTREAM", "manual check").unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("dependency_output_proof_missing:dependency=YARD-UPSTREAM"),
+            "{error:#}"
+        );
+        assert_eq!(
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.id == "YARD-UPSTREAM")
+                .unwrap()
+                .state,
+            TaskState::Partial
+        );
+
+        let outcome = state::resolve_partial_no_outputs(
+            &ws,
+            "YARD-UPSTREAM",
+            "state-only partial; nothing to integrate",
+        )
+        .unwrap();
+        assert_eq!(outcome.dependency_outputs, 0);
+        let manifest = ws
+            .load_resolved_dependency_outputs(&upstream.run_id)
+            .unwrap();
+        assert!(
+            manifest.no_outputs_proven(),
+            "the no-output resolve must leave a durable absence proof: {manifest:?}"
+        );
+
+        let downstream = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&spawn_marker).unwrap(),
+            "spawned\n",
+            "a proven no-output dependency must not block the downstream spawn"
+        );
+        assert_eq!(downstream.result_state, Some(TaskState::Done));
+        let receipt = ws
+            .load_serial_integration_receipt(&downstream.run_id)
+            .unwrap();
+        assert!(
+            receipt.dependency_input_overlays.is_empty(),
+            "a proven no-output dependency must contribute zero overlays"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn dependency_output_conflict_blocks_serial_worker_spawn_and_cleans_worktree() {
+        let (ws, _upstream, source, spawn_marker) =
+            resolved_dependency_output_fixture("resolved-dependency-output-conflict", true, None);
+        // Plant a committed file at the manifest path whose digest differs from
+        // the verified snapshot: the fresh serial worktree carries it at HEAD,
+        // so materialization must fail closed instead of clobbering repo bytes.
+        write_str(
+            &ws.root.join("dependency-output.txt"),
+            "conflicting committed bytes\n",
+        )
+        .unwrap();
+        git_stdout(&ws.root, &["add", "dependency-output.txt"]).unwrap();
+        git_stdout(&ws.root, &["commit", "-q", "-m", "conflicting baseline"]).unwrap();
+
+        let error = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-DOWNSTREAM".into()),
+                ..opts()
+            },
+        )
+        .err()
+        .expect("a destination digest conflict must block the downstream before spawn");
+        assert!(
+            error.to_string().contains(&format!(
+                "dependency_output_conflict:dependency=YARD-UPSTREAM:path=dependency-output.txt:existing_digest={}:expected={}",
+                state::content_digest(b"conflicting committed bytes\n"),
+                state::content_digest(b"resolved dependency bytes\n"),
+            )),
+            "{error:#}"
+        );
+        assert!(
+            !spawn_marker.exists(),
+            "the downstream worker spawned despite the dependency output conflict"
+        );
+        assert_eq!(
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.id == "YARD-DOWNSTREAM")
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        let leftover: Vec<PathBuf> = std::fs::read_dir(ws.agents_dir().join("worktrees"))
+            .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "a pre-spawn conflict must clean up the prepared worktree: {leftover:?}"
+        );
+        assert_eq!(
+            git_stdout(&ws.root, &["branch", "--list", "yard/yard-downstream/*"])
+                .unwrap()
+                .trim(),
+            "",
+            "the failed preparation must not leave its run branch behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("dependency-output.txt")).unwrap(),
+            "conflicting committed bytes\n",
+            "fail-closed must leave the committed conflicting bytes untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_on_blocks_worker_committed_canonical_mutation_before_merge() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-worker-canonical-commit",
+            "YARD-CANONICAL-COMMIT",
+            "canonical",
+            true,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let forbidden = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "forbidden_paths_untouched")
+            .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::NeedsUser));
+        assert_eq!(forbidden["passed"], false);
+        assert!(forbidden["note"]
+            .as_str()
+            .unwrap()
+            .contains(".agents/workers.yaml"));
+        assert!(record.integration_oid.is_empty());
+        assert!(wt.exists(), "the rejected worktree must be retained");
+        assert!(std::fs::read_to_string(ws.intent_path())
+            .unwrap()
+            .contains("id: intent-test"));
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_on_integrates_harness_asset() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-auto-commit-harness-asset",
+            "YARD-AUTO-COMMIT-HARNESS",
+            "harness-asset",
+            true,
+        );
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert!(ws.root.join(".agents/skills/example/SKILL.md").is_file());
+        let integrated_names =
+            git_stdout(&ws.root, &["diff", "--name-only", "HEAD^1", "HEAD"]).unwrap();
+        assert!(
+            integrated_names
+                .lines()
+                .any(|path| path == ".agents/skills/example/SKILL.md"),
+            "integrated diff should contain the harness asset: {integrated_names}"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_worker_packet_repo_summary_anchor_exists_before_spawn() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-repo-summary-anchor",
+            "YARD-REPO-SUMMARY-ANCHOR",
+            "anchor-probe",
+            false,
+        );
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert!(report.run_dir.join("evidence/repo-summary.md").is_file());
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_evidence_does_not_attribute_preexisting_learned_rule_to_next_worker() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-preexisting-learned-rule",
+            "YARD-PREEXISTING-LEARNED-RULE",
+            "preexisting-learned-rule",
+            false,
+        );
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let disclosure = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "diff_matches_report")
+            .unwrap();
+        assert_eq!(disclosure["passed"], true);
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_seed_cleanup_preserves_preexisting_dirty_tracked_harness_file() {
+        for (name, auto_commit) in [("off", false), ("on", true)] {
+            let (ws, report, source) = run_serial_worker_commit_case(
+                &format!("serial-dirty-tracked-harness-{name}"),
+                &format!("YARD-DIRTY-TRACKED-HARNESS-{}", name.to_uppercase()),
+                "preexisting-dirty-tracked-rule",
+                auto_commit,
+            );
+
+            assert_eq!(report.result_state, Some(TaskState::Done));
+            assert_eq!(
+                std::fs::read_to_string(ws.agents_dir().join("rules/tracked-dirty.md")).unwrap(),
+                "# User dirty edit\n"
+            );
+            assert!(git_stdout(
+                &ws.root,
+                &[
+                    "diff",
+                    "--name-only",
+                    "--",
+                    ".agents/rules/tracked-dirty.md"
+                ]
+            )
+            .unwrap()
+            .lines()
+            .any(|path| path == ".agents/rules/tracked-dirty.md"));
+
+            let _ = std::fs::remove_dir_all(&source);
+            let _ = std::fs::remove_dir_all(ws.root);
+        }
+    }
+
+    #[test]
+    fn serial_core_overlay_survives_validation_and_retained_worktree() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-core-overlay-retained",
+            "YARD-CORE-OVERLAY-RETAINED",
+            "core-overlay-input",
+            false,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+        let validation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("validation.json")).unwrap(),
+        )
+        .unwrap();
+        let result: crate::schemas::RunResult = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("result.json")).unwrap(),
+        )
+        .unwrap();
+        let receipt = ws.load_serial_integration_receipt(&report.run_id).unwrap();
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let disclosure = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "diff_matches_report")
+            .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(validation["all_passed"], true);
+        assert!(result.changes.files_modified.is_empty());
+        assert!(result.changes.files_created.is_empty());
+        assert_eq!(
+            receipt.core_input_overlays,
+            vec![state::SerialInputOverlay {
+                path: ".agents/rules/tracked-dirty.md".into(),
+                content_digest: state::content_digest(b"# User dirty edit\n"),
+            }]
+        );
+        assert!(wt.exists(), "auto_commit=false must retain worker output");
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "the retained worktree must preserve the exact core-seeded bytes used by validation"
+        );
+        assert!(
+            !disclosure["note"]
+                .as_str()
+                .unwrap()
+                .contains(".agents/rules/tracked-dirty.md"),
+            "the core-seeded input must not be attributed to the worker: {disclosure}"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_core_overlay_is_excluded_from_integration_after_validation() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-core-overlay-integrated",
+            "YARD-CORE-OVERLAY-INTEGRATED",
+            "core-overlay-input",
+            true,
+        );
+        let validation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("validation.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert_eq!(validation["all_passed"], true);
+        assert_eq!(
+            std::fs::read_to_string(ws.agents_dir().join("rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("worker-output.txt")).unwrap(),
+            "worker deliverable\n"
+        );
+        let integrated_names =
+            git_stdout(&ws.root, &["diff", "--name-only", "HEAD^1", "HEAD"]).unwrap();
+        assert!(integrated_names
+            .lines()
+            .any(|path| path == "worker-output.txt"));
+        assert!(
+            !integrated_names
+                .lines()
+                .any(|path| path == ".agents/rules/tracked-dirty.md"),
+            "the core input overlay must stay outside the worker integration allowlist: {integrated_names}"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn serial_core_overlay_destination_mismatch_blocks_done() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-core-overlay-mismatch",
+            "YARD-CORE-OVERLAY-MISMATCH",
+            "core-overlay-input-tamper-root",
+            true,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+        let validation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("validation.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(validation["all_passed"], true);
+        assert!(
+            matches!(
+                report.result_state,
+                Some(TaskState::Partial | TaskState::NeedsUser)
+            ),
+            "the typed parity failure must prevent Done: {:?}",
+            report.result_state
+        );
+        assert!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .starts_with(
+                    "serial_input_overlay_parity_mismatch:path=.agents/rules/tracked-dirty.md"
+                )
+        );
+        assert!(
+            !ws.root.join("worker-output.txt").exists(),
+            "a parity mismatch must block integration before Done"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "the validated worktree must be retained without reverting the overlay"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_on_blocks_detached_head_canonical_commit_before_merge() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-worker-canonical-detached-head",
+            "YARD-CANONICAL-DETACHED-HEAD",
+            "canonical-detach",
+            true,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let forbidden = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "forbidden_paths_untouched")
+            .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::NeedsUser));
+        assert_eq!(forbidden["passed"], false);
+        assert!(forbidden["note"]
+            .as_str()
+            .unwrap()
+            .contains(".agents/tool-policy.yaml"));
+        assert!(record.integration_oid.is_empty());
+        assert!(wt.exists(), "the rejected worktree must be retained");
+        assert_eq!(
+            git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap().trim(),
+            record.baseline_oid,
+            "main must remain at the pre-worker baseline"
+        );
+        assert!(
+            std::fs::read_to_string(ws.agents_dir().join("tool-policy.yaml"))
+                .unwrap()
+                .contains("secret_scrub: enabled")
+        );
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn auto_commit_off_retains_detached_head_branch_commit_as_partial() {
+        let (ws, report, source) = run_serial_worker_commit_case(
+            "serial-default-off-detached-head",
+            "YARD-DEFAULT-OFF-DETACHED-HEAD",
+            "ordinary-detach",
+            false,
+        );
+        let record: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        let wt = std::path::Path::new(&record.worktree);
+
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert_eq!(
+            std::fs::read_to_string(report.run_dir.join("partial-reason"))
+                .unwrap()
+                .trim(),
+            "auto_commit_disabled"
+        );
+        assert!(wt.exists(), "the detached worktree must be retained");
+        assert!(
+            !git_stdout(&ws.root, &["branch", "--list", &record.worktree_branch])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the run-owned branch must remain available for manual recovery"
+        );
+        assert!(!ws.root.join("committed.txt").exists());
+
+        crate::parallel::remove_worktree(&ws.root, wt, &record.worktree_branch);
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn live_serial_evidence_ignores_clean_seed_but_flags_worker_mutation() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-live-serial-seed-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+task_id="$2"
+mutate_seed="$3"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+if [ "$mutate_seed" = "yes" ]; then
+  printf "schema_version: 1\nid: worker-mutated\nsummary: forbidden\nstatus: accepted\n" > "$run_dir/../../intent-contract.yaml"
+fi
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "serial seed case",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+"##,
+        );
+        let run_case = |name: &str, task_id: &str, mutate_seed: &str| {
+            let worker_yaml = format!(
+                "schema_version: 1\nrouting:\n  default_worker: builder\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}, {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+                shell_literal(&builder), task_id, mutate_seed
+            );
+            let ws = init_test_workspace(name, &worker_yaml);
+            let mut q = queue(vec![task(task_id, TaskState::Queued, 10, false)]);
+            q.intent_id = "intent-test".into();
+            ws.save_queue(&q).unwrap();
+            let report = run_next(
+                &ws,
+                &RunOptions {
+                    execute: true,
+                    target: Some(task_id.into()),
+                    ..opts()
+                },
+            )
+            .unwrap();
+            (ws, report)
+        };
+
+        let (clean_ws, clean) = run_case("live-serial-clean-seed", "YARD-CLEAN-SEED", "no");
+        assert_eq!(
+            clean.result_state,
+            Some(TaskState::Done),
+            "the exact main-owned seed copies are not worker mutations: {:?}",
+            clean.lines
+        );
+        assert!(!clean.run_dir.join("feedback.json").exists());
+        let _ = std::fs::remove_dir_all(clean_ws.root);
+
+        let (mutated_ws, mutated) =
+            run_case("live-serial-mutated-seed", "YARD-MUTATED-SEED", "yes");
+        assert_eq!(
+            mutated.result_state,
+            Some(TaskState::NeedsUser),
+            "a live serial canonical mutation must fail the forbidden gate: {:?}",
+            mutated.lines
+        );
+        let evaluation: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mutated.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let forbidden = evaluation["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "forbidden_paths_untouched")
+            .unwrap();
+        assert_eq!(forbidden["passed"], false);
+        assert!(forbidden["note"]
+            .as_str()
+            .unwrap()
+            .contains(".agents/intent-contract.yaml"));
+        assert!(std::fs::read_to_string(mutated_ws.intent_path())
+            .unwrap()
+            .contains("id: intent-test"));
+        let record: RunRecord = state::load_yaml(&mutated.run_dir.join("run.yaml")).unwrap();
+        assert!(std::path::Path::new(&record.worktree).exists());
+        crate::parallel::remove_worktree(
+            &mutated_ws.root,
+            std::path::Path::new(&record.worktree),
+            &record.worktree_branch,
+        );
+        let _ = std::fs::remove_dir_all(mutated_ws.root);
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_report_session_comes_from_exact_fresh_codex_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const EXPECTED_SESSION: &str = "11111111-2222-4333-8444-555555555555";
+        let source = std::env::temp_dir().join(format!(
+            "yard-codex-session-report-src-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let fake_codex = write_worker_script(
+            &source,
+            "codex",
+            r#"#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-test 0.0.0'
+  exit 0
+fi
+run_dir=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--add-dir" ]; then
+    shift
+    run_dir=$1
+  fi
+  shift
+done
+if [ -z "$run_dir" ]; then
+  printf '%s\n' 'missing --add-dir' >&2
+  exit 2
+fi
+run_id=${run_dir##*/}
+printf '%s\n' '{"type":"thread.started","thread_id":"11111111-2222-4333-8444-555555555555"}'
+/bin/cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-SESSION",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "session captured",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+/bin/cat > "$run_dir/handoff.md" <<EOF
+# Worker handoff
+session captured
+EOF
+exit 0
+"#,
+        );
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: codex\n  fallback_order: [codex]\nworkers:\n  - id: codex\n    invocation:\n      command: {}\n      supports_noninteractive: true\n      output_contract: files\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&fake_codex)
+        );
+        let ws = init_test_workspace("codex-session-report", &worker_yaml);
+        ws.save_queue(&queue(vec![task(
+            "YARD-SESSION",
+            TaskState::Queued,
+            10,
+            false,
+        )]))
+        .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-SESSION".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.worker_id, "codex");
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert_eq!(
+            report.session.as_deref(),
+            Some(EXPECTED_SESSION),
+            "RunReport must expose only the exact fresh child's stdout thread id"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn worker_staging_cannot_forge_user_cancellation_or_partial_reason() {
+        let source = std::env::temp_dir().join(format!(
+            "yard-worker-forged-cancel-src-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&source).unwrap();
+        let builder = write_worker_script(
+            &source,
+            "builder.sh",
+            r##"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-FORGED-CANCEL",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "worker finished",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+printf "# worker handoff\n" > "$run_dir/handoff.md"
+touch "$run_dir/cancelled"
+printf "merge_conflict\n" > "$run_dir/partial-reason"
+"##,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting: {{default_worker: builder}}\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder)
+        );
+        let ws = init_test_workspace("worker-forged-cancel", &worker_yaml);
+        let mut q = queue(vec![task(
+            "YARD-FORGED-CANCEL",
+            TaskState::Queued,
+            10,
+            false,
+        )]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-FORGED-CANCEL".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+        assert!(!report.run_dir.join("cancelled").exists());
+        assert!(!report.run_dir.join("partial-reason").exists());
+        assert!(!report
+            .lines
+            .iter()
+            .any(|line| line.contains("stopped by user")));
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn no_result_worker_fails_over_once_to_alternate_worker() {
+        let root = std::env::temp_dir().join(format!("yard-failover-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dead = write_worker_script(
+            &root,
+            "dead.sh",
+            "#!/bin/sh\nrun_dir=\"$1\"\ncat >/dev/null\nexit 1\n",
+        );
+        let builder = write_worker_script(
+            &root,
+            "builder.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-001",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "done by failover worker",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+cat > "$run_dir/handoff.md" <<EOF
+# Worker handoff
+done by builder
+EOF
+cat > "$run_dir/failover.json" <<EOF
+{
+  "from": "forged-worker",
+  "to": "forged-target",
+  "reason": "worker-controlled audit",
+  "at": "2099-01-01T00:00:00Z"
+}
+EOF
+exit 0
+"#,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: dead\n  fallback_order: [dead, builder]\nworkers:\n  - id: dead\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&dead),
+            shell_literal(&builder)
+        );
+        let ws = init_test_workspace("failover", &worker_yaml);
+        ws.save_queue(&queue(vec![task("YARD-001", TaskState::Queued, 10, false)]))
+            .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-001".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.worker_id, "builder");
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert!(report.lines.iter().any(|l| l.contains("dead -> builder")));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+
+        let handoff = std::fs::read_to_string(report.run_dir.join("handoff.md")).unwrap();
+        assert!(handoff.contains("Worker failover"));
+        assert!(handoff.contains("dead -> builder"));
+        let failover_packet =
+            std::fs::read_to_string(workers::packet_path(&report.run_dir)).unwrap();
+        assert!(failover_packet.contains("previous worker exited without writing result.json"));
+        assert!(failover_packet.contains("result.json matches the packet schema exactly"));
+        let rec: RunRecord = state::load_yaml(&report.run_dir.join("run.yaml")).unwrap();
+        assert_eq!(rec.worker, "builder");
+        let failover: RunFailover = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("failover.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failover.from, "dead");
+        assert_eq!(failover.to, "builder");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn approval_gate_blocks_unapproved_and_grant_is_single_use() {
+        // Security: run_next is the single choke-point for approval. An
+        // approval_required task spawns a worker ONLY with a valid grant, the
+        // grant is consumed on execution, and a retry after consumption STOPS
+        // unless re-approved. The worker increments an on-disk attempt counter so
+        // the assertions can prove it did / did not actually run — the failover,
+        // checkpoint-retry, and recover paths all re-enter through this gate.
+        let root =
+            std::env::temp_dir().join(format!("yard-approval-gate-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let attempts = root.join("attempts");
+        let builder = write_worker_script(
+            &root,
+            "builder.sh",
+            &format!(
+                r#"#!/bin/sh
+run_dir="$1"
+attempts={}
+run_id=$(basename "$run_dir")
+cat >/dev/null
+if [ -f "$attempts" ]; then count=$(cat "$attempts"); else count=0; fi
+count=$((count + 1))
+printf "%s" "$count" > "$attempts"
+cat > "$run_dir/result.json" <<EOF
+{{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "YARD-APV",
+  "status": "done",
+  "intent_adherence": {{ "drift_detected": false, "notes": "" }},
+  "changes": {{ "files_modified": [], "files_created": [], "files_deleted": [] }},
+  "validation": {{ "commands_run": [], "passed": true, "failures": [] }},
+  "question_for_user": null,
+  "compact_summary": "승인된 실행 완료",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}}
+EOF
+cat > "$run_dir/handoff.md" <<EOF
+# Worker handoff
+
+승인된 실행 완료
+EOF
+exit 0
+"#,
+                shell_literal(&attempts)
+            ),
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\n  fallback_order: [builder]\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder)
+        );
+        let ws = init_test_workspace("approval-gate", &worker_yaml);
+        ws.save_queue(&queue(vec![task("YARD-APV", TaskState::Queued, 10, true)]))
+            .unwrap();
+
+        let run = |ws: &Workspace| {
+            run_next(
+                ws,
+                &RunOptions {
+                    execute: true,
+                    target: Some("YARD-APV".into()),
+                    ..opts()
+                },
+            )
+        };
+
+        // 1) No grant: the gate refuses and the worker never spawns.
+        let err = run(&ws).err().expect("gate must refuse an ungranted task");
+        assert!(err.to_string().contains("requires approval"), "{err}");
+        assert!(!attempts.exists(), "worker must not run without a grant");
+        assert!(!crate::approvals::is_granted(&ws, "YARD-APV"));
+        assert_serial_worktree_and_branch_removed(&ws, &only_run_dir(&ws));
+
+        // 2) Grant once, run: the task executes and the grant is CONSUMED.
+        crate::approvals::grant(&ws, "YARD-APV").unwrap();
+        assert!(crate::approvals::is_granted(&ws, "YARD-APV"));
+        let report = run(&ws).unwrap();
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert_eq!(std::fs::read_to_string(&attempts).unwrap(), "1");
+        assert!(report.lines.iter().any(|l| l.contains("approval consumed")));
+        assert!(
+            !crate::approvals::is_granted(&ws, "YARD-APV"),
+            "grant must be single-use"
+        );
+
+        // 3) Retry after consumption WITHOUT re-approval: the gate stops it and
+        //    the worker is NOT re-invoked (the counter stays at 1). This is the
+        //    property the failover / checkpoint-retry / recover paths rely on —
+        //    every re-execution re-enters this gate and needs a fresh grant.
+        let mut q = ws.load_queue().unwrap();
+        q.tasks[0].state = TaskState::Queued; // simulate a retry re-selecting it
+        ws.save_queue(&q).unwrap();
+        let err = run(&ws)
+            .err()
+            .expect("gate must refuse a retry after the grant was consumed");
+        assert!(err.to_string().contains("requires approval"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&attempts).unwrap(),
+            "1",
+            "no re-run without a fresh grant"
+        );
+
+        // 4) A fresh grant re-enables exactly one more execution.
+        crate::approvals::grant(&ws, "YARD-APV").unwrap();
+        let report = run(&ws).unwrap();
+        assert_eq!(report.result_state, Some(TaskState::Done));
+        assert_eq!(std::fs::read_to_string(&attempts).unwrap(), "2");
+        assert!(!crate::approvals::is_granted(&ws, "YARD-APV"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn run_auto_skips_unapproved_retry_and_continues_ready_work() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-auto-approval-retry-src-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let attempts_dir = root.join("attempts");
+        std::fs::create_dir_all(&attempts_dir).unwrap();
+        let builder = write_worker_script(
+            &root,
+            "builder.sh",
+            &format!(
+                r#"#!/bin/sh
+run_dir="$1"
+attempts_dir={}
+run_id=$(basename "$run_dir")
+task_id=$(sed -n 's/^task_id: //p' "$run_dir/run.yaml" | head -n 1)
+cat >/dev/null
+counter="$attempts_dir/$task_id"
+if [ -f "$counter" ]; then count=$(cat "$counter"); else count=0; fi
+count=$((count + 1))
+printf "%s" "$count" > "$counter"
+cat > "$run_dir/result.json" <<EOF
+{{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "$task_id",
+  "status": "done",
+  "intent_adherence": {{ "drift_detected": false, "notes": "" }},
+  "changes": {{ "files_modified": [], "files_created": [], "files_deleted": [] }},
+  "validation": {{ "commands_run": [], "passed": true, "failures": [] }},
+  "question_for_user": null,
+  "compact_summary": "done",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}}
+EOF
+cat > "$run_dir/handoff.md" <<EOF
+# Worker handoff
+
+done
+EOF
+exit 0
+"#,
+                shell_literal(&attempts_dir)
+            ),
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: builder\n  fallback_order: [builder]\nworkers:\n  - id: builder\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&builder)
+        );
+        let ws = init_test_workspace("auto-approval-retry", &worker_yaml);
+        ws.save_queue(&queue(vec![
+            task("YARD-APV", TaskState::Queued, 10, true),
+            task("YARD-NEXT", TaskState::Queued, 20, false),
+        ]))
+        .unwrap();
+
+        crate::approvals::grant(&ws, "YARD-APV").unwrap();
+        let first = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-APV".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.result_state, Some(TaskState::Done));
+        assert_eq!(
+            std::fs::read_to_string(attempts_dir.join("YARD-APV")).unwrap(),
+            "1"
+        );
+        assert!(!crate::approvals::is_granted(&ws, "YARD-APV"));
+
+        let mut q = ws.load_queue().unwrap();
+        q.tasks[0].state = TaskState::Failed;
+        q.tasks[1].state = TaskState::Queued;
+        ws.save_queue(&q).unwrap();
+
+        let events = run_auto(&ws, false, None, Some(1), true, |_| {}).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("YARD-APV requires approval; skipped retry")),
+            "{events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(attempts_dir.join("YARD-APV")).unwrap(),
+            "1",
+            "approval retry must not spawn a worker without a fresh grant"
+        );
+        assert_eq!(
+            std::fs::read_to_string(attempts_dir.join("YARD-NEXT")).unwrap(),
+            "1",
+            "independent ready work should keep draining"
+        );
+
+        let q = ws.load_queue().unwrap();
+        let apv = q.tasks.iter().find(|t| t.id == "YARD-APV").unwrap();
+        let next = q.tasks.iter().find(|t| t.id == "YARD-NEXT").unwrap();
+        assert_eq!(apv.state, TaskState::NeedsUser);
+        assert_eq!(next.state, TaskState::Done);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn result_file_evaluation_failure_does_not_failover() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-no-failover-result-src-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bad = write_worker_script(
+            &root,
+            "bad.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+run_id=$(basename "$run_dir")
+cat >/dev/null
+cat > "$run_dir/result.json" <<EOF
+{
+  "schema_version": 1,
+  "run_id": "$run_id",
+  "task_id": "OTHER",
+  "status": "done",
+  "intent_adherence": { "drift_detected": false, "notes": "" },
+  "changes": { "files_modified": [], "files_created": [], "files_deleted": [] },
+  "validation": { "commands_run": [], "passed": true, "failures": [] },
+  "question_for_user": null,
+  "compact_summary": "bad ids",
+  "verdict": [],
+  "harness_suggestions": [],
+  "follow_up_tasks": []
+}
+EOF
+cat > "$run_dir/handoff.md" <<EOF
+# Worker handoff
+bad ids
+EOF
+exit 0
+"#,
+        );
+        let marker = root.join("fallback-ran");
+        let fallback = write_worker_script(
+            &root,
+            "fallback.sh",
+            &format!(
+                "#!/bin/sh\nrun_dir=\"$1\"\nmarker={}\ncat >/dev/null\ntouch \"$marker\"\nexit 0\n",
+                shell_literal(&marker)
+            ),
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: bad-result\n  fallback_order: [bad-result, fallback]\nworkers:\n  - id: bad-result\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n  - id: fallback\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\"]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&bad),
+            shell_literal(&fallback)
+        );
+        let ws = init_test_workspace("no-failover-result", &worker_yaml);
+        ws.save_queue(&queue(vec![task("YARD-001", TaskState::Queued, 10, false)]))
+            .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-001".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.worker_id, "bad-result");
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert!(
+            !marker.exists(),
+            "fallback worker must not run when result.json exists"
+        );
+        assert!(!report.lines.iter().any(|l| l.contains("worker failover")));
+        let handoff = std::fs::read_to_string(report.run_dir.join("handoff.md")).unwrap();
+        assert!(!handoff.contains("Worker failover"));
+        assert_eq!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Partial,
+            "output-contract failure becomes bounded feedback, without failover"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn failover_unready_alternate_does_not_fall_back_to_failed_worker() {
+        let root =
+            std::env::temp_dir().join(format!("yard-failover-unready-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let attempts = root.join("dead-attempts");
+        let dead = write_worker_script(
+            &root,
+            "dead.sh",
+            r#"#!/bin/sh
+run_dir="$1"
+attempts="$2"
+cat >/dev/null
+if [ -f "$attempts" ]; then
+  count=$(cat "$attempts")
+else
+  count=0
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$attempts"
+exit 1
+"#,
+        );
+        let worker_yaml = format!(
+            "schema_version: 1\nrouting:\n  default_worker: dead\n  fallback_order: [dead, missing]\nworkers:\n  - id: dead\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n  - id: missing\n    invocation:\n      command: yardlet-definitely-missing-worker-command\n      supports_noninteractive: true\n      output_contract: files\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            shell_literal(&dead),
+            shell_literal(&attempts)
+        );
+        let ws = init_test_workspace("failover-unready", &worker_yaml);
+        ws.save_queue(&queue(vec![task("YARD-004", TaskState::Queued, 10, false)]))
+            .unwrap();
+
+        let report = run_next(
+            &ws,
+            &RunOptions {
+                execute: true,
+                target: Some("YARD-004".into()),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.worker_id, "dead");
+        assert_eq!(report.result_state, Some(TaskState::Partial));
+        assert_eq!(
+            std::fs::read_to_string(&attempts).unwrap(),
+            "1",
+            "failed worker must not be selected again during failover readiness fallback"
+        );
+        assert!(report.lines.iter().any(|l| {
+            l.contains("worker failover unavailable")
+                && l.contains("no invocable worker among")
+                && l.contains("missing")
+                && !l.contains("\"dead\"")
+        }));
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert!(!report.run_dir.join("failover.json").exists());
+
+        let eval: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let checks = eval["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|c| {
+            c["name"] == "result_file_present" && c["passed"] == false && c["fatal"] == true
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn decision_follow_up_seeds_question_and_resolves_on_answer() {
+        // End-to-end of the human-decision path: a worker-proposed DECISION
+        // follow-up parks NeedsUser (capability dropped), its question is seeded
+        // into the conversation so `status` surfaces it, and it stops being a
+        // pending question once the user answers.
+        use crate::schemas::{ConversationTurn, FollowUpTask, TurnRole};
+        let root = std::env::temp_dir().join(format!("yard-decision-fu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        let mut q = queue(vec![task("YARD-001", TaskState::Done, 10, false)]);
+
+        let ingested = crate::planner::ingest_follow_ups(
+            &mut q,
+            &[],
+            &[FollowUpTask {
+                title: "pick a signature character".into(),
+                reason: "creative A/B choice".into(),
+                required_capabilities: vec!["user-creative-direction-approval".into()],
+                decision_question: "Option A or B?".into(),
+                ..Default::default()
+            }],
+            Some(&ws),
+        );
+        let id = ingested.first().expect("one follow-up ingested").clone();
+        crate::planner::persist_ingested_decision_questions(&ws, &q, &ingested).unwrap();
+
+        let t = q.tasks.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(t.state, TaskState::NeedsUser);
+        assert!(t.required_capabilities.is_empty());
+        assert_eq!(
+            latest_question_for(&ws, &id).as_deref(),
+            Some("Option A or B?"),
+            "seeded question must surface as the pending question"
+        );
+
+        crate::state::append_conversation_turn(
+            &ws,
+            &q.intent_id,
+            &id,
+            ConversationTurn {
+                role: TurnRole::User,
+                text: "A".into(),
+                run_id: String::new(),
+                ts: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            latest_question_for(&ws, &id),
+            None,
+            "an answered decision is no longer a pending question"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recover_requeues_needs_user_task_stranded_by_an_abandoned_run() {
+        // An answer-triggered run died before finalize without persisting Running:
+        // the task stays NeedsUser while its run.yaml is stuck `running` with no
+        // result. recover must seal the abandoned run and requeue the task, and
+        // not re-detect it on a later pass.
+        let root = std::env::temp_dir().join(format!("yard-abandoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        ws.save_queue(&queue(vec![task(
+            "YARD-020",
+            TaskState::NeedsUser,
+            50,
+            false,
+        )]))
+        .unwrap();
+
+        let run_dir = ws.runs_dir().join("run-20260701-034822");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            "schema_version: 1\nrun_id: run-20260701-034822\ntask_id: YARD-020\nworker: codex\nstate: running\nworktree: .\n",
+        )
+        .unwrap();
+
+        let msgs = recover_orphans(&ws);
+
+        let t = ws
+            .load_queue()
+            .unwrap()
+            .tasks
+            .into_iter()
+            .find(|t| t.id == "YARD-020")
+            .unwrap();
+        assert_eq!(
+            t.state,
+            TaskState::Queued,
+            "a NeedsUser task stranded by an abandoned run must be requeued"
+        );
+        let rec: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert_eq!(rec.state, "failed", "the abandoned run must be sealed");
+        assert!(rec.completed_at.is_some());
+        assert!(
+            msgs.iter().any(|m| m.contains("YARD-020")),
+            "recovery must report the requeue"
+        );
+
+        // Idempotent: the sealed run is not re-detected on a second pass.
+        assert!(
+            recover_orphans(&ws).is_empty(),
+            "a sealed run must not re-trigger recovery"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn requeue_review_soft_sequences_behind_fix_then_needs_user() {
+        // 1c: a failed review with a proposed fix is re-queued to run AFTER it by
+        // PRIORITY (no hard depends_on edge — that deadlocks if the fix never
+        // reaches Done); with no fix it goes to needs_user.
+        let root = std::env::temp_dir().join(format!("yard-requeue-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        ws.save_queue(&queue(vec![
+            task("REV", TaskState::Failed, 50, false),
+            task("FIX", TaskState::Queued, 60, false),
+        ]))
+        .unwrap();
+        let mut fallback = ws.load_queue().unwrap();
+
+        // Remediation proposed: review -> Queued, sequenced behind the fix.
+        requeue_review(
+            &ws,
+            &mut fallback,
+            "REV",
+            TaskState::Queued,
+            &["FIX".into()],
+        )
+        .unwrap();
+        let find = |ws: &Workspace, id: &str| {
+            ws.load_queue()
+                .unwrap()
+                .tasks
+                .into_iter()
+                .find(|t| t.id == id)
+                .unwrap()
+        };
+        let r = find(&ws, "REV");
+        let f = find(&ws, "FIX");
+        assert_eq!(r.state, TaskState::Queued);
+        assert!(r.depends_on.is_empty(), "no hard dependency edge");
+        assert!(
+            f.remediates_review("REV"),
+            "the soft barrier relation must survive in the queue"
+        );
+        // Lower priority runs first: the fix outranks the re-queued review.
+        assert!(
+            f.priority < r.priority,
+            "fix ({}) must sequence before the review ({})",
+            f.priority,
+            r.priority
+        );
+
+        // The no-fix path surfaces to the user and leaves no dependency behind.
+        requeue_review(&ws, &mut fallback, "REV", TaskState::NeedsUser, &[]).unwrap();
+        let r = find(&ws, "REV");
+        assert_eq!(r.state, TaskState::NeedsUser);
+        assert!(r.depends_on.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejected_review_requeue_writes_no_phantom_transition() {
+        let ws = crate::snapshot::corrupt_activated_state_fixture(
+            "review-requeue-no-phantom-transition",
+        );
+        let lock = ws.acquire_planning_lock().unwrap();
+        let mut fallback = ws.load_queue().unwrap();
+
+        let error = requeue_review_locked(
+            &ws,
+            &lock,
+            &mut fallback,
+            "YARD-001",
+            TaskState::NeedsUser,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("active_runtime_envelope_mismatch"),
+            "{error}"
+        );
+        assert!(
+            !ws.transition_path("YARD-001").exists(),
+            "a rejected queue CAS must not leave a phantom transition"
+        );
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&ws.root);
+    }
+
+    #[test]
+    fn schedulable_remediation_ids_excludes_blocked_deferred_and_dep_gated() {
+        // 1c: a failed review is soft-sequenced behind fixes that belong to the
+        // current runnable graph. Approval-gated Queued fixes count because the
+        // review must wait for their decision; Blocked, Deferred, or dep-gated
+        // fixes do not count because those terminal/unresolved branches would
+        // otherwise strand the review.
+        let mut q = queue(vec![
+            task("FIXA", TaskState::Queued, 10, false),   // runnable
+            task("FIXB", TaskState::Blocked, 20, false),  // off-vocab parked
+            task("FIXC", TaskState::Deferred, 30, false), // set aside
+            task("FIXD", TaskState::Queued, 40, false),   // gated by an unmet dep
+            task("DEP", TaskState::Queued, 50, false),    // not Done -> gates FIXD
+            task("FIXE", TaskState::Queued, 60, true),    // approval-gated but schedulable
+        ]);
+        q.tasks
+            .iter_mut()
+            .find(|t| t.id == "FIXD")
+            .unwrap()
+            .depends_on = vec!["DEP".into()];
+        let ingested = vec![
+            "FIXA".to_string(),
+            "FIXB".to_string(),
+            "FIXC".to_string(),
+            "FIXD".to_string(),
+            "FIXE".to_string(),
+        ];
+        assert_eq!(
+            schedulable_remediation_ids(&q, &ingested),
+            vec!["FIXA".to_string(), "FIXE".to_string()]
+        );
+    }
+
+    #[test]
+    fn repeated_review_fix_title_is_not_enqueued_twice() {
+        let mut prior = task("FIX", TaskState::Done, 10, false);
+        prior.title = "Repair parser acceptance".into();
+        let q = queue(vec![prior]);
+        let mut follow_ups = vec![
+            crate::schemas::FollowUpTask {
+                title: "repair parser acceptance".into(),
+                reason: "same failed review proposed it again".into(),
+                ..Default::default()
+            },
+            crate::schemas::FollowUpTask {
+                title: "Repair a distinct serializer failure".into(),
+                reason: "new failed evidence".into(),
+                ..Default::default()
+            },
+        ];
+
+        dedup_review_follow_ups(&mut follow_ups, &q);
+        assert_eq!(follow_ups.len(), 1);
+        assert_eq!(follow_ups[0].title, "Repair a distinct serializer failure");
+    }
+
+    #[test]
+    fn serial_auto_commit_guidance_fires_only_on_integratable_changes() {
+        // 1d worktree-only interim: a serial run never auto-commits, but it points
+        // an opted-in user at a manual commit ONLY when the worker produced real
+        // deliverable changes — not on a no-op Done or a .agents-only write.
+        let agents_only = [".agents/work-queue.yaml".to_string(), ".agents".to_string()];
+        let with_work = [
+            ".agents/work-queue.yaml".to_string(),
+            "src/feature.rs".to_string(),
+        ];
+        assert!(!worker_changed_integratable_path(None)); // no git signal
+        assert!(!worker_changed_integratable_path(Some(&[]))); // nothing changed
+        assert!(!worker_changed_integratable_path(Some(&agents_only))); // state-only
+        assert!(!worker_changed_integratable_path(Some(&[
+            "./.agents/telemetry/runs.jsonl".to_string()
+        ]))); // ./-prefixed state still recognized
+        assert!(worker_changed_integratable_path(Some(&with_work))); // real deliverable
+        assert!(worker_changed_integratable_path(Some(&[
+            "./README.md".to_string()
+        ])));
+        assert!(worker_changed_integratable_path(Some(&[
+            ".agents/skills/example/SKILL.md".to_string()
+        ])));
+    }
+
+    #[test]
+    fn isolated_serial_finalize_keeps_the_full_serial_feature_surface() {
+        let flags = FinalizeFlags::serial();
+        assert!(flags.post_hooks);
+        assert!(flags.validation);
+        assert!(flags.conversation);
+        assert!(flags.learned);
+        assert!(flags.artifacts);
+        assert!(flags.telemetry);
+        assert!(flags.follow_ups);
+        assert!(!flags.git_finish_recovery);
+    }
+
+    #[test]
+    fn picks_lowest_priority_queued() {
+        let q = queue(vec![
+            task("A", TaskState::Queued, 30, false),
+            task("B", TaskState::Queued, 10, false),
+            task("C", TaskState::Queued, 20, false),
+        ]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1)); // B, priority 10
+    }
+
+    #[test]
+    fn sort_for_display_puts_active_on_top_done_at_bottom() {
+        // Active work rises to the top, done work sinks to the bottom, and within
+        // a group it is priority order: RUN (pri 200) outranks the queued tasks
+        // despite a higher number, and done1 (pri 10) sinks below them.
+        let mut q = queue(vec![
+            task("done1", TaskState::Done, 10, false),
+            task("B", TaskState::Queued, 120, false),
+            task("RUN", TaskState::Running, 200, false),
+            task("A", TaskState::Queued, 110, false),
+            // Deferred is resolved-not-pending: it sinks below queued but stays
+            // above done (a decision, not finished work).
+            task("DEF", TaskState::Deferred, 5, false),
+        ]);
+        q.sort_for_display();
+        let ids: Vec<&str> = q.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["RUN", "A", "B", "DEF", "done1"]);
+    }
+
+    #[test]
+    fn drain_skips_needs_user_for_independent_ready_work() {
+        // A task waiting on the user must not block independent ready work:
+        // select_next skips the NeedsUser task even though it is lower priority.
+        let q = queue(vec![
+            task("stuck", TaskState::NeedsUser, 10, false),
+            task("ready", TaskState::Queued, 20, false),
+        ]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1)); // ready, not stuck
+    }
+
+    #[test]
+    fn drain_does_not_run_a_dependent_of_a_needs_user_task() {
+        // The safety side of skipping: a task depending on the stuck one stays
+        // gated (deps_met requires Done), so the drain cannot leap ahead of it.
+        let mut dependent = task("dep", TaskState::Queued, 5, false);
+        dependent.depends_on = vec!["stuck".into()];
+        let q = queue(vec![
+            task("stuck", TaskState::NeedsUser, 10, false),
+            dependent,
+        ]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_new_needs_user_result_does_not_stop_the_independent_drain() {
+        assert!(continues_auto_drain(TaskState::NeedsUser));
+        assert!(continues_auto_drain(TaskState::Done));
+        assert!(!continues_auto_drain(TaskState::Blocked));
+        assert!(!continues_auto_drain(TaskState::Running));
+    }
+
+    #[test]
+    fn explicit_continuation_packet_is_bounded_and_causally_exact() {
+        let context = (1..=25)
+            .map(|seq| (seq, format!("message-{seq}")))
+            .collect::<Vec<_>>();
+        let packet = explicit_continuation_packet(
+            "att-next",
+            Some("evt-answer"),
+            Some("act-answer"),
+            &context,
+            Some("checkpoint text"),
+        );
+        assert!(!packet.contains("message-5\n"));
+        assert!(packet.contains("message-6"));
+        assert!(packet.contains("message-25"));
+        assert!(packet.contains("caused_by_event_id: evt-answer"));
+        assert!(packet.contains("caused_by_action_id: act-answer"));
+        assert!(packet.contains("checkpoint text"));
+    }
+
+    #[test]
+    fn skips_non_queued_and_approval_required() {
+        let q = queue(vec![
+            task("done", TaskState::Done, 5, false),
+            task("gated", TaskState::Queued, 1, true), // skipped: needs approval
+            task("ready", TaskState::Queued, 40, false),
+        ]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(2)); // ready
+    }
+
+    #[test]
+    fn none_when_no_eligible() {
+        let q = queue(vec![
+            task("a", TaskState::Done, 1, false),
+            task("b", TaskState::Blocked, 2, false),
+        ]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_reconciles_refs_after_worktree_removal_crash() {
+        let ws = init_test_workspace(
+            "integrated-cleanup-recovery",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let run_id = "run-20990101-000000-cleanup";
+        let task_id = "YARD-CLEANUP";
+        let branch = format!("yard/{}/{}", task_id.to_lowercase(), run_id);
+        let wt = ws.agents_dir().join("worktrees").join(run_id);
+        let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+        write_str(&rule, "# Tracked baseline\n").unwrap();
+        git_stdout(&ws.root, &["add", ".agents/rules/tracked-dirty.md"]).unwrap();
+        git_stdout(&ws.root, &["commit", "-q", "-m", "track cleanup input"]).unwrap();
+        write_str(&rule, "# User dirty edit\n").unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::parallel::create_worktree(&ws.root, &wt, &branch).unwrap();
+        write_str(
+            &wt.join(".agents/rules/tracked-dirty.md"),
+            "# User dirty edit\n",
+        )
+        .unwrap();
+        write_str(&wt.join("owned.txt"), "owned\n").unwrap();
+        git_stdout(&wt, &["add", "owned.txt"]).unwrap();
+        git_stdout(&wt, &["commit", "-q", "-m", "owned worker commit"]).unwrap();
+        let worker_oid = git_stdout(&wt, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git_stdout(
+            &ws.root,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "owned integration",
+                &worker_oid,
+            ],
+        )
+        .unwrap();
+        let integration_oid = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git_stdout(
+            &ws.root,
+            &[
+                "update-ref",
+                &format!("refs/heads/yardlet-txn/{branch}"),
+                &worker_oid,
+                "",
+            ],
+        )
+        .unwrap();
+
+        let mut q = queue(vec![task(task_id, TaskState::Done, 10, false)]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let overlay = state::SerialInputOverlay {
+            path: ".agents/rules/tracked-dirty.md".into(),
+            content_digest: state::content_digest(b"# User dirty edit\n"),
+        };
+        ws.save_serial_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: vec![overlay.clone()],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        ws.save_integrated_cleanup_receipt(&state::IntegratedCleanupReceipt {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            intent_id: "intent-test".into(),
+            worker: "builder".into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            integration_base_oid: baseline.clone(),
+            integration_worker_oid: worker_oid.clone(),
+            integration_oid: integration_oid.clone(),
+            provenance: IntegrationProvenance::SerialCoreStaged,
+            owned_oids: vec![worker_oid.clone(), integration_oid.clone()],
+            core_input_overlays: vec![overlay],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "done".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: Some(Local::now().to_rfc3339()),
+                worktree: wt.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline.clone(),
+                worktree_branch: branch.clone(),
+                integration_oid: integration_oid.clone(),
+                integration_base_oid: baseline,
+                integration_worker_oid: worker_oid.clone(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                integration_cleanup_complete: false,
+                owned_oids: vec![worker_oid.clone(), integration_oid.clone()],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+
+        write_str(&rule, "# Root changed after integration\n").unwrap();
+        let mut parity_messages = Vec::new();
+        reconcile_integrated_cleanups(&ws, &mut parity_messages);
+        assert!(parity_messages.iter().any(|message| {
+            message.contains(
+                "serial_input_overlay_parity_mismatch:path=.agents/rules/tracked-dirty.md",
+            )
+        }));
+        assert!(
+            wt.exists(),
+            "cleanup recovery must retain the validated worktree on parity mismatch"
+        );
+        assert!(!git_stdout(&ws.root, &["branch", "--list", &branch])
+            .unwrap()
+            .trim()
+            .is_empty());
+        write_str(&rule, "# User dirty edit\n").unwrap();
+
+        // Exact crash window: Git removed the worktree, but Yardlet had not yet
+        // deleted the owned target/transaction refs or marked cleanup complete.
+        git_stdout(
+            &ws.root,
+            &["worktree", "remove", "--force", &wt.display().to_string()],
+        )
+        .unwrap();
+        assert!(!wt.exists());
+        write_str(&run_dir.join("run.yaml"), "not: [valid yaml").unwrap();
+        assert!(!git_stdout(&ws.root, &["branch", "--list", &branch])
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        let messages = recover_orphans(&ws);
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("reconciled integrated worktree cleanup")));
+        assert!(git_stdout(&ws.root, &["branch", "--list", &branch])
+            .unwrap()
+            .trim()
+            .is_empty());
+        assert!(git_stdout(
+            &ws.root,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/yardlet-txn/{branch}")
+            ]
+        )
+        .is_err());
+        assert_eq!(
+            git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap().trim(),
+            integration_oid
+        );
+        let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert!(record.integration_cleanup_complete);
+        assert!(!recover_orphans(&ws)
+            .iter()
+            .any(|message| message.contains("reconciled integrated worktree cleanup")));
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn recovery_never_cleans_a_forged_run_projection_without_core_receipt() {
+        let ws = init_test_workspace(
+            "forged-cleanup-projection",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let run_id = "run-20990101-000000-forged-cleanup";
+        let task_id = "YARD-FORGED-CLEANUP";
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let worktree = ws.agents_dir().join("worktrees").join(run_id);
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::parallel::create_worktree(&ws.root, &worktree, &branch).unwrap();
+        write_str(&worktree.join("owned.txt"), "worker commit\n").unwrap();
+        git_stdout(&worktree, &["add", "owned.txt"]).unwrap();
+        git_stdout(&worktree, &["commit", "-q", "-m", "worker commit"]).unwrap();
+        let worker_oid = git_stdout(&worktree, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut q = queue(vec![task(task_id, TaskState::Done, 10, false)]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "codex".into(),
+                state: "done".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: Some(Local::now().to_rfc3339()),
+                worktree: worktree.display().to_string(),
+                baseline_oid: baseline.clone(),
+                worktree_branch: branch.clone(),
+                integration_oid: baseline.clone(),
+                integration_base_oid: baseline,
+                integration_worker_oid: worker_oid.clone(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                owned_oids: vec![worker_oid.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let messages = recover_orphans(&ws);
+
+        assert!(worktree.exists());
+        assert_eq!(
+            git_stdout(&ws.root, &["rev-parse", &format!("refs/heads/{branch}")])
+                .unwrap()
+                .trim(),
+            worker_oid
+        );
+        assert!(!messages
+            .iter()
+            .any(|message| message.contains("reconciled integrated worktree cleanup")));
+
+        crate::parallel::remove_worktree(&ws.root, &worktree, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn no_change_core_receipt_recovers_before_and_after_cleanup() {
+        for cleanup_before_recovery in [false, true] {
+            let name = if cleanup_before_recovery {
+                "nochange-after-cleanup"
+            } else {
+                "nochange-before-cleanup"
+            };
+            let ws = init_test_workspace(
+                name,
+                "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+            );
+            let mut config = ws.load_config().unwrap();
+            config.git_finish.auto_push = true;
+            state::save_yaml(&ws.config_path(), &config).unwrap();
+            let run_id = format!("run-20990101-000000-{name}");
+            let task_id = "YARD-NOCHANGE-RECOVERY";
+            let mut queued = task(task_id, TaskState::Running, 10, false);
+            queued.kind = "implementation".into();
+            let mut q = queue(vec![queued]);
+            q.intent_id = "intent-test".into();
+            ws.save_queue(&q).unwrap();
+            let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+            let worktree = ws.agents_dir().join("worktrees").join(&run_id);
+            let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string();
+            crate::parallel::create_worktree(&ws.root, &worktree, &branch).unwrap();
+            let run_dir = ws.runs_dir().join(&run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let result = crate::schemas::RunResult {
+                schema_version: 1,
+                run_id: run_id.clone(),
+                task_id: task_id.into(),
+                status: "done".into(),
+                intent_adherence: Default::default(),
+                changes: Default::default(),
+                validation: Default::default(),
+                question_for_user: None,
+                compact_summary: "no changes".into(),
+                verdict: vec![],
+                harness_suggestions: vec![],
+                follow_up_tasks: vec![],
+                artifacts: vec![],
+                resources: vec![],
+            };
+            write_str(
+                &run_dir.join("result.json"),
+                &serde_json::to_string(&result).unwrap(),
+            )
+            .unwrap();
+            write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+            if cleanup_before_recovery {
+                state::save_yaml(
+                    &run_dir.join("run.yaml"),
+                    &RunRecord {
+                        schema_version: 999,
+                        run_id: "run-worker-retargeted".into(),
+                        task_id: "WORKER-RETARGETED".into(),
+                        intent_id: "worker-retargeted".into(),
+                        worker: "worker-retargeted".into(),
+                        state: "running".into(),
+                        started_at: "2099-01-01T00:00:00+00:00".into(),
+                        worktree: "/tmp/worker-retargeted".into(),
+                        worktree_branch: "worker/retargeted".into(),
+                        baseline_oid: "worker-retargeted".into(),
+                        integration_oid: "worker-retargeted".into(),
+                        owned_oids: vec!["worker-retargeted".into()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            } else {
+                write_str(&run_dir.join("run.yaml"), ": malformed\n").unwrap();
+            }
+            ws.save_no_change_receipt(&state::NoChangeReceipt {
+                schema_version: 1,
+                run_id: run_id.clone(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "codex".into(),
+                worktree: worktree.display().to_string(),
+                branch: branch.clone(),
+                baseline_oid: baseline.clone(),
+                worker_oid: baseline.clone(),
+                provenance: IntegrationProvenance::ParallelWorkerDirect,
+                core_input_overlays: vec![],
+                dependency_input_overlays: vec![],
+            })
+            .unwrap();
+            if cleanup_before_recovery {
+                let cleanup = crate::parallel::cleanup_integrated_worktree(
+                    &ws.root,
+                    &worktree,
+                    &branch,
+                    &baseline,
+                    IntegrationProvenance::ParallelWorkerDirect,
+                );
+                assert!(cleanup.complete, "{:?}", cleanup.warnings);
+            }
+
+            let messages = recover_orphans(&ws);
+
+            assert!(!worktree.exists(), "{messages:?}");
+            assert!(git_stdout(&ws.root, &["branch", "--list", &branch])
+                .unwrap()
+                .trim()
+                .is_empty());
+            let finish = ws.load_git_finish_record(&run_dir).unwrap();
+            assert_eq!(finish.status, crate::git_finish::GitFinishStatus::NotNeeded);
+            assert!(!finish.push_invoked);
+            assert_eq!(
+                ws.load_queue().unwrap().tasks[0].state,
+                TaskState::Done,
+                "{messages:?}"
+            );
+            let projected: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+            assert_eq!(projected.schema_version, 1);
+            assert_eq!(projected.run_id, run_id);
+            assert_eq!(projected.task_id, task_id);
+            assert_eq!(projected.intent_id, "intent-test");
+            assert_eq!(projected.worker, "codex");
+            assert_eq!(projected.worktree, worktree.display().to_string());
+            assert_eq!(projected.worktree_branch, branch);
+            assert_eq!(projected.baseline_oid, baseline);
+            assert!(projected.integration_oid.is_empty());
+            assert!(projected.owned_oids.is_empty());
+            assert!(projected.integration_cleanup_complete);
+            assert!(projected.completed_at.is_some());
+
+            let second = recover_orphans(&ws);
+            assert!(
+                second.is_empty(),
+                "second recovery was not inert: {second:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(ws.root);
+        }
+    }
+
+    /// Startup reconcile cost must track OUTSTANDING work, not the number of
+    /// runs a workspace has ever completed. Every settled receipt left in the
+    /// scanned directory is several git subprocesses re-spent on every launch,
+    /// which is what made startup 11s on a workspace with a few hundred runs
+    /// (issue #43). Once a receipt is settled it leaves that directory, while
+    /// staying loadable by run id as ownership and overlay evidence.
+    #[test]
+    fn startup_reconcile_retires_settled_receipts_from_the_scanned_set() {
+        let ws = init_test_workspace(
+            "reconcile-hot-set",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let mut config = ws.load_config().unwrap();
+        config.git_finish.auto_push = true;
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+
+        // A run whose integration merged and whose worktree and branch are
+        // already gone: cleanup has nothing left to do, forever.
+        let merged_run = "run-20990101-000001-merged";
+        let merged_task = "YARD-MERGED";
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_str(&ws.root.join("merged.txt"), "merged\n").unwrap();
+        git_stdout(&ws.root, &["add", "merged.txt"]).unwrap();
+        let tree = git_stdout(&ws.root, &["write-tree"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let worker_oid = git_stdout(
+            &ws.root,
+            &["commit-tree", &tree, "-p", &baseline, "-m", "worker"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let integration_oid = git_stdout(
+            &ws.root,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &baseline,
+                "-p",
+                &worker_oid,
+                "-m",
+                "integration",
+            ],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git_stdout(&ws.root, &["reset", "-q", "--hard", &integration_oid]).unwrap();
+        let merged_run_dir = ws.runs_dir().join(merged_run);
+        std::fs::create_dir_all(&merged_run_dir).unwrap();
+        ws.save_integrated_cleanup_receipt(&state::IntegratedCleanupReceipt {
+            schema_version: 1,
+            run_id: merged_run.into(),
+            task_id: merged_task.into(),
+            intent_id: "intent-test".into(),
+            worker: "codex".into(),
+            worktree: ws
+                .agents_dir()
+                .join("worktrees")
+                .join(merged_run)
+                .display()
+                .to_string(),
+            branch: format!("yard/{}/{merged_run}", merged_task.to_lowercase()),
+            baseline_oid: baseline.clone(),
+            integration_base_oid: baseline.clone(),
+            integration_worker_oid: worker_oid.clone(),
+            integration_oid: integration_oid.clone(),
+            provenance: IntegrationProvenance::ParallelWorkerDirect,
+            owned_oids: vec![worker_oid, integration_oid],
+            core_input_overlays: vec![],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+
+        // A no-op run whose cleanup and `not_needed` finish both settle during
+        // this very recovery pass.
+        let no_change_run = "run-20990101-000002-nochange";
+        let no_change_task = "YARD-NOCHANGE";
+        let branch = format!("yard/{}/{no_change_run}", no_change_task.to_lowercase());
+        let worktree = ws.agents_dir().join("worktrees").join(no_change_run);
+        crate::parallel::create_worktree(&ws.root, &worktree, &branch).unwrap();
+        let no_change_run_dir = ws.runs_dir().join(no_change_run);
+        std::fs::create_dir_all(&no_change_run_dir).unwrap();
+        write_str(
+            &no_change_run_dir.join("result.json"),
+            &serde_json::to_string(&RunResult {
+                schema_version: 1,
+                run_id: no_change_run.into(),
+                task_id: no_change_task.into(),
+                status: "done".into(),
+                intent_adherence: Default::default(),
+                changes: Default::default(),
+                validation: Default::default(),
+                question_for_user: None,
+                compact_summary: "no changes".into(),
+                verdict: vec![],
+                harness_suggestions: vec![],
+                follow_up_tasks: vec![],
+                artifacts: vec![],
+                resources: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write_str(&no_change_run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        let head = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        ws.save_no_change_receipt(&state::NoChangeReceipt {
+            schema_version: 1,
+            run_id: no_change_run.into(),
+            task_id: no_change_task.into(),
+            intent_id: "intent-test".into(),
+            worker: "codex".into(),
+            worktree: worktree.display().to_string(),
+            branch,
+            baseline_oid: head.clone(),
+            worker_oid: head,
+            provenance: IntegrationProvenance::ParallelWorkerDirect,
+            core_input_overlays: vec![],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+
+        let mut running = task(no_change_task, TaskState::Running, 10, false);
+        running.kind = "implementation".into();
+        let mut q = queue(vec![running]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        assert_eq!(ws.load_integrated_cleanup_receipts().unwrap().len(), 1);
+        assert_eq!(ws.load_no_change_receipts().unwrap().len(), 1);
+
+        let first = recover_orphans(&ws);
+
+        assert!(
+            ws.load_integrated_cleanup_receipts().unwrap().is_empty(),
+            "a reconciled cleanup receipt must leave the scanned set: {first:?}"
+        );
+        assert!(
+            ws.load_no_change_receipts().unwrap().is_empty(),
+            "a settled no-change receipt must leave the scanned set: {first:?}"
+        );
+        // Retired, not discarded: both stay addressable as ownership evidence.
+        assert_eq!(
+            ws.load_integrated_cleanup_receipt(merged_run)
+                .unwrap()
+                .task_id,
+            merged_task
+        );
+        assert_eq!(
+            ws.load_no_change_receipt(no_change_run).unwrap().task_id,
+            no_change_task
+        );
+        assert_eq!(
+            ws.load_git_finish_record(&no_change_run_dir)
+                .unwrap()
+                .status,
+            crate::git_finish::GitFinishStatus::NotNeeded
+        );
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+
+        let second = recover_orphans(&ws);
+        assert!(
+            second.is_empty(),
+            "second recovery was not inert: {second:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn seal_run_record_overwrites_worker_forged_identity_and_merge_location() {
+        let root = std::env::temp_dir().join(format!("yard-seal-forged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let run_dir = root.join("run-trusted");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                schema_version: 999,
+                run_id: "run-forged".into(),
+                task_id: "TASK-FORGED".into(),
+                intent_id: "intent-forged".into(),
+                worker: "worker-forged".into(),
+                state: "running".into(),
+                started_at: "2099-01-01T00:00:00+00:00".into(),
+                worktree: "/tmp/forged".into(),
+                serial_isolated: false,
+                baseline_oid: "forged-baseline".into(),
+                worktree_branch: "forged/branch".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let trusted_worktree = root.join("trusted-worktree");
+        let trusted_task = task("YARD-TRUSTED", TaskState::Running, 10, false);
+        seal_run_record(
+            &run_dir,
+            "run-trusted",
+            &trusted_task,
+            "intent-trusted",
+            "codex",
+            TaskState::Partial,
+            Some(&MergeBack {
+                wt_path: &trusted_worktree,
+                branch: "yard/yard-trusted/run-trusted",
+                baseline_oid: "trusted-baseline",
+                expected_tip_oid: None,
+                core_input_overlays: &[],
+                dependency_input_overlays: &[],
+                provenance: IntegrationProvenance::SerialCoreStaged,
+                auto_commit: true,
+            }),
+        );
+
+        let projected: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert_eq!(projected.schema_version, 1);
+        assert_eq!(projected.run_id, "run-trusted");
+        assert_eq!(projected.task_id, "YARD-TRUSTED");
+        assert_eq!(projected.intent_id, "intent-trusted");
+        assert_eq!(projected.worker, "codex");
+        assert_eq!(projected.state, "partial");
+        assert_eq!(projected.worktree, trusted_worktree.display().to_string());
+        assert_eq!(projected.worktree_branch, "yard/yard-trusted/run-trusted");
+        assert_eq!(projected.baseline_oid, "trusted-baseline");
+        assert!(projected.serial_isolated);
+        assert_eq!(
+            projected.integration_provenance,
+            IntegrationProvenance::SerialCoreStaged
+        );
+        assert!(projected.completed_at.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_merges_a_finished_orphaned_worktree_run() {
+        // A parallel worktree run finished (result.json written) but Yardlet died
+        // before integrating. Recovery must merge the work back, not just mark
+        // the task Done with its changes stranded in the worktree.
+        let root = std::env::temp_dir().join(format!("yard-orphan-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        sh(&["init", "-q"]);
+        // The worktree integration commit inherits the repository's identity;
+        // configure one locally so the test passes on runners with no global
+        // git config.
+        sh(&["config", "user.name", "t"]);
+        sh(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        sh(&["add", "base.txt"]);
+        sh(&["commit", "-q", "-m", "init"]);
+
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Running, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t.clone()])).unwrap();
+
+        // The orphaned run: a result the evaluator will accept, plus a run.yaml
+        // pointing at a live worktree with an unintegrated change.
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let branch = format!("yard/yard-001/{run_id}");
+        let wt = ws.agents_dir().join("worktrees").join(run_id);
+        let baseline = git_stdout(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::parallel::create_worktree(&root, &wt, &branch).unwrap();
+        std::fs::write(wt.join("feature.txt"), "from worker\n").unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: "YARD-001".into(),
+                worker: "codex".into(),
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                worktree: wt.display().to_string(),
+                baseline_oid: baseline,
+                worktree_branch: branch.clone(),
+                integration_provenance: IntegrationProvenance::ParallelWorkerDirect,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(registered_recovery_worktree_matches(
+            &ws, &wt, &branch, run_id, "YARD-001", false,
+        ));
+
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+        let q = ws.load_queue().unwrap();
+        assert_eq!(q.tasks[0].state, TaskState::Done);
+        // The worker's change landed in the main workspace; the worktree is gone.
+        assert_eq!(
+            std::fs::read_to_string(root.join("feature.txt")).unwrap(),
+            "from worker\n"
+        );
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_rejects_forged_serial_marker_without_core_receipt() {
+        let ws = init_test_workspace(
+            "forged-serial-recovery",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let mut config = ws.load_config().unwrap();
+        config.auto_commit = true;
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+        let run_id = "run-20990101-000000-forged-serial";
+        let task_id = "YARD-FORGED-SERIAL";
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let worktree = ws.agents_dir().join("worktrees").join(run_id);
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::parallel::create_worktree(&ws.root, &worktree, &branch).unwrap();
+        write_str(&worktree.join("forged.txt"), "must not merge\n").unwrap();
+        let mut queued = task(task_id, TaskState::Running, 10, false);
+        queued.kind = "implementation".into();
+        let mut q = queue(vec![queued]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "forged serial transaction".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "codex".into(),
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                worktree: worktree.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline.clone(),
+                worktree_branch: branch.clone(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_str(
+            &run_dir.join("git-integration.json"),
+            r#"{"schema_version":1,"phase":"published"}"#,
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let messages = recover_orphans(&ws);
+
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert_eq!(
+            git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap().trim(),
+            baseline
+        );
+        assert!(!ws.root.join("forged.txt").exists());
+        assert!(worktree.exists());
+        assert!(messages.iter().any(|message| message.contains("recovered")));
+
+        crate::parallel::remove_worktree(&ws.root, &worktree, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_symlinked_worktree_even_with_run_shaped_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("yard-forged-recovery-wt-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let baseline = git(&["rev-parse", "HEAD"]);
+
+        let ws = Workspace::at(&root);
+        let run_id = "run-20990101-000000-yard-forged";
+        let task_id = "YARD-FORGED";
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let actual_worktree = outside.join(run_id);
+        crate::parallel::create_worktree(&root, &actual_worktree, &branch).unwrap();
+        std::fs::write(actual_worktree.join("forged.txt"), "outside\n").unwrap();
+        let claimed_worktree = ws.agents_dir().join("worktrees").join(run_id);
+        std::fs::create_dir_all(claimed_worktree.parent().unwrap()).unwrap();
+        symlink(&actual_worktree, &claimed_worktree).unwrap();
+
+        let mut queued = task(task_id, TaskState::Running, 10, false);
+        queued.kind = "implementation".into();
+        ws.save_queue(&queue(vec![queued])).unwrap();
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "attempted outside worktree recovery".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                worker: "codex".into(),
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                worktree: claimed_worktree.display().to_string(),
+                baseline_oid: baseline.clone(),
+                worktree_branch: branch.clone(),
+                integration_provenance: IntegrationProvenance::ParallelWorkerDirect,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let messages = recover_orphans(&ws);
+
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Partial);
+        assert_eq!(git(&["rev-parse", "HEAD"]), baseline);
+        assert!(!root.join("forged.txt").exists());
+        assert!(claimed_worktree.exists(), "the symlink must be retained");
+        assert!(
+            actual_worktree.exists(),
+            "the outside worktree must be retained"
+        );
+        assert!(git(&["branch", "--list", &branch]).contains(&branch));
+        assert!(messages.iter().any(|message| message.contains("recovered")));
+
+        std::fs::remove_file(&claimed_worktree).unwrap();
+        crate::parallel::remove_worktree(&root, &actual_worktree, &branch);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn recovery_imports_staged_serial_result_before_deciding_to_rerun() {
+        let ws = init_test_workspace(
+            "serial-staged-recovery",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+        config.push_str("auto_commit: true\n");
+        write_str(&ws.config_path(), &config).unwrap();
+        let mut t = task("YARD-STAGED", TaskState::Running, 10, false);
+        t.kind = "implementation".into();
+        let mut q = queue(vec![t]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let run_id = "run-20990101-000000-yard-staged";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"]).unwrap();
+        let baseline = baseline.trim().to_string();
+        let branch = "yard/yard-staged/run-20990101-000000-yard-staged";
+        let wt = ws.agents_dir().join("worktrees").join(run_id);
+        crate::parallel::create_worktree(&ws.root, &wt, branch).unwrap();
+        ws.save_serial_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-STAGED".into(),
+            worktree: wt.display().to_string(),
+            branch: branch.into(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: vec![],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        std::fs::write(wt.join("staged.txt"), "worker completed\n").unwrap();
+        let staged_run_dir = wt.join(".agents/runs").join(run_id);
+        for directory in [
+            staged_run_dir.join("evidence"),
+            staged_run_dir.join("hooks/pre-run"),
+            run_dir.join("evidence"),
+            run_dir.join("hooks/pre-run"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-STAGED".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "worker already completed".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &staged_run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&staged_run_dir.join("handoff.md"), "# staged handoff\n").unwrap();
+        for path in [
+            staged_run_dir.join("cancelled"),
+            staged_run_dir.join("partial-reason"),
+            staged_run_dir.join("failover.json"),
+            staged_run_dir.join("evaluation.json"),
+            staged_run_dir.join("validation.json"),
+            staged_run_dir.join("validation-0.log"),
+        ] {
+            write_str(&path, "worker forged recovery artifact\n").unwrap();
+        }
+        write_str(
+            &staged_run_dir.join("evidence/repo-summary.md"),
+            "worker forged evidence\n",
+        )
+        .unwrap();
+        write_str(
+            &staged_run_dir.join("hooks/pre-run/check.log"),
+            "worker forged hook\n",
+        )
+        .unwrap();
+        write_str(
+            &staged_run_dir.join("validation.log"),
+            "worker validation allowed\n",
+        )
+        .unwrap();
+        write_str(
+            &staged_run_dir.join("checkpoint.md"),
+            "worker checkpoint allowed\n",
+        )
+        .unwrap();
+        for path in [
+            run_dir.join("failover.json"),
+            run_dir.join("evaluation.json"),
+            run_dir.join("validation.json"),
+            run_dir.join("validation-0.log"),
+        ] {
+            write_str(&path, "main recovery artifact\n").unwrap();
+        }
+        write_str(
+            &run_dir.join("evidence/repo-summary.md"),
+            "main recovery evidence\n",
+        )
+        .unwrap();
+        write_str(
+            &run_dir.join("hooks/pre-run/check.log"),
+            "main recovery hook\n",
+        )
+        .unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: "YARD-STAGED".into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: None,
+                worktree: wt.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline,
+                worktree_branch: branch.into(),
+                integration_oid: String::new(),
+                integration_base_oid: String::new(),
+                integration_worker_oid: String::new(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                integration_cleanup_complete: false,
+                owned_oids: vec![],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let messages = recover_orphans(&ws);
+
+        assert!(run_dir.join("result.json").exists());
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("staged.txt")).unwrap(),
+            "worker completed\n"
+        );
+        assert!(messages.iter().any(|message| message.contains("recovered")));
+        assert!(!run_dir.join("cancelled").exists());
+        assert!(!run_dir.join("partial-reason").exists());
+        for path in [
+            run_dir.join("failover.json"),
+            run_dir.join("evaluation.json"),
+            run_dir.join("validation.json"),
+            run_dir.join("validation-0.log"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "main recovery artifact\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("evidence/repo-summary.md")).unwrap(),
+            "main recovery evidence\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("hooks/pre-run/check.log")).unwrap(),
+            "main recovery hook\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("validation.log")).unwrap(),
+            "worker validation allowed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("checkpoint.md")).unwrap(),
+            "worker checkpoint allowed\n"
+        );
+        let record: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert!(!record.integration_oid.is_empty());
+        assert!(!wt.exists());
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn finished_orphaned_serial_worktree(
+        name: &str,
+        mutate_seeded_intent: bool,
+    ) -> (Workspace, PathBuf, PathBuf, String) {
+        let ws = init_test_workspace(
+            name,
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let task_id = "YARD-RECOVERY-SEED";
+        let run_id = format!("run-20990101-000000-{name}");
+        let mut queued_task = task(task_id, TaskState::Queued, 10, false);
+        queued_task.kind = "implementation".into();
+        let mut q = queue(vec![queued_task]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let run_dir = ws.runs_dir().join(&run_id);
+        std::fs::create_dir_all(run_dir.join("evidence/canonical-state-seed")).unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let branch = format!("yard/yard-recovery-seed/{run_id}");
+        let wt = ws.agents_dir().join("worktrees").join(&run_id);
+        crate::parallel::create_worktree(&ws.root, &wt, &branch).unwrap();
+        std::fs::create_dir_all(wt.join(".agents")).unwrap();
+        for name in ["intent-contract.yaml", "work-queue.yaml"] {
+            let source = ws.agents_dir().join(name);
+            std::fs::copy(&source, wt.join(".agents").join(name)).unwrap();
+            std::fs::copy(
+                &source,
+                run_dir.join("evidence/canonical-state-seed").join(name),
+            )
+            .unwrap();
+        }
+        if mutate_seeded_intent {
+            write_str(
+                &wt.join(".agents/intent-contract.yaml"),
+                "schema_version: 1\nid: worker-mutated\nsummary: forbidden\nstatus: accepted\n",
+            )
+            .unwrap();
+        }
+
+        q.tasks[0].state = TaskState::Running;
+        ws.save_queue(&q).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "worker finished before the orchestrator crashed".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# orphan handoff\n").unwrap();
+        ws.save_serial_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: vec![],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id,
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: None,
+                worktree: wt.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline,
+                worktree_branch: branch.clone(),
+                integration_oid: String::new(),
+                integration_base_oid: String::new(),
+                integration_worker_oid: String::new(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                integration_cleanup_complete: false,
+                owned_oids: vec![],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        (ws, run_dir, wt, branch)
+    }
+
+    #[test]
+    fn recovery_ignores_unchanged_seeded_canonical_state_in_orphan_worktree() {
+        let (ws, run_dir, wt, _) =
+            finished_orphaned_serial_worktree("seeded-canonical-recovery", false);
+
+        let messages = recover_orphans(&ws);
+
+        assert_eq!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "Yardlet-seeded canonical copies are not worker changes: {messages:?}"
+        );
+        assert!(
+            !run_dir.join("feedback.json").exists(),
+            "a clean canonical seed must pass the forbidden-path gate"
+        );
+        assert!(!wt.exists(), "a clean recovered worktree should be removed");
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn recovery_reuses_serial_core_overlay_parity_and_keeps_validated_bytes() {
+        let ws = init_test_workspace(
+            "serial-overlay-recovery-parity",
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let mut config = std::fs::read_to_string(ws.config_path()).unwrap();
+        config.push_str("auto_commit: true\n");
+        write_str(&ws.config_path(), &config).unwrap();
+        let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+        write_str(&rule, "# Tracked baseline\n").unwrap();
+        git_stdout(&ws.root, &["add", ".agents/rules/tracked-dirty.md"]).unwrap();
+        git_stdout(&ws.root, &["commit", "-q", "-m", "track recovery input"]).unwrap();
+        write_str(&rule, "# User dirty edit\n").unwrap();
+
+        let task_id = "YARD-RECOVERY-OVERLAY";
+        let run_id = "run-20990101-000000-recovery-overlay";
+        let mut queued_task = task(task_id, TaskState::Running, 10, false);
+        queued_task.kind = "implementation".into();
+        let mut q = queue(vec![queued_task]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let run_dir = ws.runs_dir().join(run_id);
+        let canonical_seed = run_dir.join(SERIAL_CANONICAL_SEED_DIR);
+        let harness_seed = run_dir.join(HARNESS_SEED_DIR);
+        std::fs::create_dir_all(&canonical_seed).unwrap();
+        std::fs::create_dir_all(harness_seed.join("rules")).unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let wt = ws.agents_dir().join("worktrees").join(run_id);
+        crate::parallel::create_worktree(&ws.root, &wt, &branch).unwrap();
+        std::fs::create_dir_all(wt.join(".agents/rules")).unwrap();
+        for name in ["intent-contract.yaml", "work-queue.yaml"] {
+            let source = ws.agents_dir().join(name);
+            std::fs::copy(&source, wt.join(".agents").join(name)).unwrap();
+            std::fs::copy(&source, canonical_seed.join(name)).unwrap();
+        }
+        std::fs::copy(&rule, wt.join(".agents/rules/tracked-dirty.md")).unwrap();
+        std::fs::copy(&rule, harness_seed.join("rules/tracked-dirty.md")).unwrap();
+        write_str(&wt.join("worker-output.txt"), "recovered worker output\n").unwrap();
+        let overlay = state::SerialInputOverlay {
+            path: ".agents/rules/tracked-dirty.md".into(),
+            content_digest: state::content_digest(b"# User dirty edit\n"),
+        };
+        ws.save_serial_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: vec![overlay],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "recover overlay parity".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# recovery overlay\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: None,
+                worktree: wt.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline,
+                worktree_branch: branch.clone(),
+                integration_oid: String::new(),
+                integration_base_oid: String::new(),
+                integration_worker_oid: String::new(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                integration_cleanup_complete: false,
+                owned_oids: vec![],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        write_str(&rule, "# Root changed before recovery\n").unwrap();
+        let messages = recover_orphans(&ws);
+
+        assert_ne!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+        assert!(messages.iter().any(|message| message.contains("recovered")));
+        assert!(std::fs::read_to_string(run_dir.join("partial-reason"))
+            .unwrap()
+            .starts_with(
+                "serial_input_overlay_parity_mismatch:path=.agents/rules/tracked-dirty.md"
+            ));
+        assert!(!ws.root.join("worker-output.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n"
+        );
+
+        let second = recover_orphans(&ws);
+        assert!(
+            second
+                .iter()
+                .all(|message| !message.contains("recovered YARD-RECOVERY-OVERLAY")),
+            "the finalized recovery must not be re-applied: {second:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "a repeated recovery pass must not revert the retained overlay"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// Build a stranded parallel run whose worktree carries a dispatcher-owned
+    /// dirty tracked harness copy, receipted (or mis-receipted) in the
+    /// checkpoints/parallel-integration store exactly as run_batch records it.
+    fn orphaned_parallel_overlay_run(
+        name: &str,
+        task_id: &str,
+        receipt_digest: String,
+    ) -> (Workspace, PathBuf, PathBuf, String, String) {
+        let ws = init_test_workspace(
+            name,
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+        write_str(&rule, "# Tracked baseline\n").unwrap();
+        git_stdout(&ws.root, &["add", ".agents/rules/tracked-dirty.md"]).unwrap();
+        git_stdout(&ws.root, &["commit", "-q", "-m", "track recovery input"]).unwrap();
+        write_str(&rule, "# User dirty edit\n").unwrap();
+
+        let run_id = format!("run-20990101-000000-{name}");
+        let mut queued_task = task(task_id, TaskState::Running, 10, false);
+        queued_task.kind = "implementation".into();
+        let mut q = queue(vec![queued_task]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let run_dir = ws.runs_dir().join(&run_id);
+        let harness_seed = run_dir.join(HARNESS_SEED_DIR);
+        std::fs::create_dir_all(harness_seed.join("rules")).unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let wt = ws.agents_dir().join("worktrees").join(&run_id);
+        crate::parallel::create_worktree(&ws.root, &wt, &branch).unwrap();
+        std::fs::create_dir_all(wt.join(".agents/rules")).unwrap();
+        for name in ["intent-contract.yaml", "work-queue.yaml"] {
+            let source = ws.agents_dir().join(name);
+            std::fs::copy(&source, wt.join(".agents").join(name)).unwrap();
+        }
+        std::fs::copy(&rule, wt.join(".agents/rules/tracked-dirty.md")).unwrap();
+        std::fs::copy(&rule, harness_seed.join("rules/tracked-dirty.md")).unwrap();
+        write_str(&wt.join("worker-output.txt"), "recovered worker output\n").unwrap();
+        ws.save_parallel_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: vec![state::SerialInputOverlay {
+                path: ".agents/rules/tracked-dirty.md".into(),
+                content_digest: receipt_digest,
+            }],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        assert!(
+            ws.load_serial_integration_receipt(&run_id).is_err(),
+            "the parallel run must not own a serial-integration receipt; recovery \
+             provenance classification depends on that store staying empty"
+        );
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "recover parallel overlay parity".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# recovery parallel overlay\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.clone(),
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: None,
+                worktree: wt.display().to_string(),
+                serial_isolated: false,
+                baseline_oid: baseline,
+                worktree_branch: branch.clone(),
+                integration_oid: String::new(),
+                integration_base_oid: String::new(),
+                integration_worker_oid: String::new(),
+                integration_provenance: IntegrationProvenance::ParallelWorkerDirect,
+                integration_cleanup_complete: false,
+                owned_oids: vec![],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+        (ws, run_dir, wt, branch, run_id)
+    }
+
+    #[test]
+    fn recovery_reuses_parallel_core_overlay_parity_and_keeps_validated_bytes() {
+        let task_id = "YARD-PARALLEL-RECOVERY-OVERLAY";
+        let (ws, run_dir, wt, branch, _run_id) = orphaned_parallel_overlay_run(
+            "parallel-overlay-recovery-parity",
+            task_id,
+            state::content_digest(b"# User dirty edit\n"),
+        );
+        let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+
+        write_str(&rule, "# Root changed before recovery\n").unwrap();
+        let messages = recover_orphans(&ws);
+
+        assert_ne!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "{messages:?}"
+        );
+        assert!(messages.iter().any(|message| message.contains("recovered")));
+        assert!(
+            std::fs::read_to_string(run_dir.join("partial-reason"))
+                .unwrap()
+                .starts_with(
+                    "serial_input_overlay_parity_mismatch:path=.agents/rules/tracked-dirty.md"
+                ),
+            "{messages:?}"
+        );
+        assert!(!ws.root.join("worker-output.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n"
+        );
+
+        let second = recover_orphans(&ws);
+        assert!(
+            second
+                .iter()
+                .all(|message| !message.contains("recovered YARD-PARALLEL-RECOVERY-OVERLAY")),
+            "the finalized recovery must not be re-applied: {second:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "a repeated recovery pass must not revert the retained overlay"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn recovery_blocks_done_when_parallel_overlay_receipt_digest_mismatches() {
+        let task_id = "YARD-PARALLEL-RECOVERY-FORGED";
+        let (ws, run_dir, wt, branch, _run_id) = orphaned_parallel_overlay_run(
+            "parallel-overlay-recovery-forged",
+            task_id,
+            state::content_digest(b"# Receipt forged\n"),
+        );
+
+        let messages = recover_orphans(&ws);
+
+        assert_ne!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "a seeded copy without a matching receipt digest has no provenance \
+             and must block Done: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("change evidence unavailable")),
+            "{messages:?}"
+        );
+        let feedback: FeedbackRecord =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("feedback.json")).unwrap())
+                .unwrap();
+        assert!(
+            feedback
+                .failures
+                .iter()
+                .any(|failure| failure.contains("forbidden_paths_untouched")),
+            "recovery must fail closed with the typed no-evidence diagnosis: {:?}",
+            feedback.failures
+        );
+        assert!(!ws.root.join("worker-output.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "fail-closed recovery must not rewrite the owning root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".agents/rules/tracked-dirty.md")).unwrap(),
+            "# User dirty edit\n",
+            "fail-closed recovery must not rewrite the retained worktree"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    /// Finished orphan serial run whose harness seed carries one core-seeded
+    /// dirty input, with the receipt's `core_input_overlays` supplied by the
+    /// caller so a tampered or missing entry exercises the overlay-provenance
+    /// failure inside evidence collection.
+    fn orphaned_serial_worktree_with_overlay_receipt(
+        name: &str,
+        receipt_overlays: Vec<state::SerialInputOverlay>,
+    ) -> (Workspace, PathBuf, PathBuf, String) {
+        let ws = init_test_workspace(
+            name,
+            "schema_version: 1\nrouting: {default_worker: builder}\nworkers: []\n",
+        );
+        let rule = ws.agents_dir().join("rules/tracked-dirty.md");
+        write_str(&rule, "# Tracked baseline\n").unwrap();
+        git_stdout(&ws.root, &["add", ".agents/rules/tracked-dirty.md"]).unwrap();
+        git_stdout(
+            &ws.root,
+            &["commit", "-q", "-m", "track overlay evidence input"],
+        )
+        .unwrap();
+        write_str(&rule, "# User dirty edit\n").unwrap();
+
+        let task_id = "YARD-OVERLAY-EVIDENCE";
+        let run_id = format!("run-20990101-000000-{name}");
+        let mut queued_task = task(task_id, TaskState::Running, 10, false);
+        queued_task.kind = "implementation".into();
+        let mut q = queue(vec![queued_task]);
+        q.intent_id = "intent-test".into();
+        ws.save_queue(&q).unwrap();
+
+        let run_dir = ws.runs_dir().join(&run_id);
+        let canonical_seed = run_dir.join(SERIAL_CANONICAL_SEED_DIR);
+        let harness_seed = run_dir.join(HARNESS_SEED_DIR);
+        std::fs::create_dir_all(&canonical_seed).unwrap();
+        std::fs::create_dir_all(harness_seed.join("rules")).unwrap();
+        let baseline = git_stdout(&ws.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let wt = ws.agents_dir().join("worktrees").join(&run_id);
+        crate::parallel::create_worktree(&ws.root, &wt, &branch).unwrap();
+        std::fs::create_dir_all(wt.join(".agents/rules")).unwrap();
+        for name in ["intent-contract.yaml", "work-queue.yaml"] {
+            let source = ws.agents_dir().join(name);
+            std::fs::copy(&source, wt.join(".agents").join(name)).unwrap();
+            std::fs::copy(&source, canonical_seed.join(name)).unwrap();
+        }
+        std::fs::copy(&rule, wt.join(".agents/rules/tracked-dirty.md")).unwrap();
+        std::fs::copy(&rule, harness_seed.join("rules/tracked-dirty.md")).unwrap();
+        write_str(&wt.join("worker-output.txt"), "orphan worker output\n").unwrap();
+        ws.save_serial_integration_receipt(&state::SerialIntegrationReceipt {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            worktree: wt.display().to_string(),
+            branch: branch.clone(),
+            baseline_oid: baseline.clone(),
+            core_input_overlays: receipt_overlays,
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "overlay evidence diagnostic fixture".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# overlay evidence fixture\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id,
+                task_id: task_id.into(),
+                intent_id: "intent-test".into(),
+                worker: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: None,
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                completed_at: None,
+                worktree: wt.display().to_string(),
+                serial_isolated: true,
+                baseline_oid: baseline,
+                worktree_branch: branch.clone(),
+                integration_oid: String::new(),
+                integration_base_oid: String::new(),
+                integration_worker_oid: String::new(),
+                integration_provenance: IntegrationProvenance::SerialCoreStaged,
+                integration_cleanup_complete: false,
+                owned_oids: vec![],
+                output_contract_incident: None,
+                result_recovered_from_stdout: None,
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        (ws, run_dir, wt, branch)
+    }
+
+    #[test]
+    fn overlay_digest_mismatch_fails_evidence_with_path_specific_diagnostic() {
+        let (ws, run_dir, wt, branch) = orphaned_serial_worktree_with_overlay_receipt(
+            "overlay-evidence-digest-mismatch",
+            vec![state::SerialInputOverlay {
+                path: ".agents/rules/tracked-dirty.md".into(),
+                content_digest: state::content_digest(b"# Receipt recorded other bytes\n"),
+            }],
+        );
+
+        let mut overlay_failure = None;
+        assert!(
+            serial_worktree_evidence(&ws, &wt, &run_dir, &mut overlay_failure).is_none(),
+            "a receipt digest mismatch must keep failing closed"
+        );
+        let reason =
+            overlay_failure.expect("the evidence failure must carry an overlay diagnostic");
+        assert!(
+            reason.starts_with(
+                "serial_input_overlay_digest_mismatch:path=.agents/rules/tracked-dirty.md:expected="
+            ),
+            "{reason}"
+        );
+
+        let messages = recover_orphans(&ws);
+        assert_ne!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "evidence-less recovery must not reach Done: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "serial_input_overlay_digest_mismatch:path=.agents/rules/tracked-dirty.md"
+            )),
+            "recovery lines must carry the overlay-specific diagnostic: {messages:?}"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn overlay_receipt_entry_missing_fails_evidence_with_path_specific_diagnostic() {
+        let (ws, run_dir, wt, branch) =
+            orphaned_serial_worktree_with_overlay_receipt("overlay-evidence-entry-missing", vec![]);
+
+        let mut overlay_failure = None;
+        assert!(
+            serial_worktree_evidence(&ws, &wt, &run_dir, &mut overlay_failure).is_none(),
+            "a missing receipt entry must keep failing closed"
+        );
+        assert_eq!(
+            overlay_failure.as_deref(),
+            Some("serial_input_overlay_receipt_missing:path=.agents/rules/tracked-dirty.md")
+        );
+
+        let messages = recover_orphans(&ws);
+        assert_ne!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "evidence-less recovery must not reach Done: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "serial_input_overlay_receipt_missing:path=.agents/rules/tracked-dirty.md"
+            )),
+            "recovery lines must carry the overlay-specific diagnostic: {messages:?}"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn recovery_flags_worker_modified_seeded_canonical_state_in_orphan_worktree() {
+        let (ws, run_dir, wt, branch) =
+            finished_orphaned_serial_worktree("mutated-canonical-recovery", true);
+
+        let messages = recover_orphans(&ws);
+
+        assert_eq!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::NeedsUser,
+            "a worker canonical-state write must remain forbidden: {messages:?}"
+        );
+        let feedback: FeedbackRecord =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("feedback.json")).unwrap())
+                .unwrap();
+        assert!(
+            feedback.failures.iter().any(|failure| {
+                failure.contains("forbidden_paths_untouched")
+                    && failure.contains(".agents/intent-contract.yaml")
+            }),
+            "the actual canonical mutation must be named in the gate evidence: {feedback:?}"
+        );
+        assert!(
+            wt.exists(),
+            "a forbidden run keeps its worktree for inspection"
+        );
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn assert_worker_staged_seed_cannot_hide_recovery_canonical_mutation(
+        workspace_tag: &str,
+        seed_name: &str,
+    ) {
+        let (ws, run_dir, wt, branch) = finished_orphaned_serial_worktree(
+            &format!("staged-seed-recovery-{workspace_tag}"),
+            true,
+        );
+        let staged = wt
+            .join(".agents/runs")
+            .join(run_dir.file_name().unwrap())
+            .join("evidence")
+            .join(seed_name);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::copy(
+            wt.join(".agents/intent-contract.yaml"),
+            staged.join("intent-contract.yaml"),
+        )
+        .unwrap();
+
+        import_worker_run_artifacts(staged.parent().unwrap().parent().unwrap(), &run_dir).unwrap();
+        let messages = recover_orphans(&ws);
+
+        assert_eq!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::NeedsUser,
+            "a staging seed copy must not redefine the main-owned comparison seed: {messages:?}"
+        );
+        let feedback: FeedbackRecord =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("feedback.json")).unwrap())
+                .unwrap();
+        assert!(feedback.failures.iter().any(|failure| {
+            failure.contains("forbidden_paths_untouched")
+                && failure.contains(".agents/intent-contract.yaml")
+        }));
+        assert!(wt.exists(), "the rejected worktree must be retained");
+
+        crate::parallel::remove_worktree(&ws.root, &wt, &branch);
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn worker_staged_seed_cannot_hide_recovery_canonical_mutation() {
+        assert_worker_staged_seed_cannot_hide_recovery_canonical_mutation(
+            "exact-lowercase",
+            "canonical-state-seed",
+        );
+    }
+
+    #[test]
+    fn worker_case_variant_staged_seed_cannot_hide_recovery_canonical_mutation() {
+        assert_worker_staged_seed_cannot_hide_recovery_canonical_mutation(
+            "case-variant",
+            "CANONICAL-STATE-SEED",
+        );
+    }
+
+    #[test]
+    fn worker_unicode_alias_staged_seed_cannot_hide_recovery_canonical_mutation() {
+        assert_worker_staged_seed_cannot_hide_recovery_canonical_mutation(
+            "unicode-alias",
+            "canonical-ſtate-seed",
+        );
+    }
+
+    #[test]
+    fn recovery_adopts_a_live_orphaned_worker() {
+        // Quit-and-restart while a worker runs: the worker survives (it is a
+        // separate process). Recovery must keep the task Running — adopting
+        // the original session — not requeue it into a duplicate worker.
+        let root = std::env::temp_dir().join(format!("yard-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        ws.save_queue(&queue(vec![task(
+            "YARD-001",
+            TaskState::Running,
+            10,
+            false,
+        )]))
+        .unwrap();
+        let run_dir = ws.runs_dir().join("run-20990101-000000-yard-001");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let run_id = run_dir.file_name().unwrap().to_str().unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: YARD-001\nintent_id: intent-test\nworker: builder\nstate: running\n"
+            ),
+        )
+        .unwrap();
+        // Use our own pid and exact start marker: definitely alive and
+        // provenance-matched.
+        write_str(&run_dir.join("worker.pid"), &std::process::id().to_string()).unwrap();
+        state::save_yaml(
+            &run_dir.join(workers::WORKER_PROCESS_PROVENANCE_FILE),
+            &workers::WorkerProcessProvenance {
+                schema_version: 1,
+                run_id: run_id.to_string(),
+                attempt_id: "att-live".into(),
+                worker_id: "builder".into(),
+                model: String::new(),
+                fallback_enabled: false,
+                routing_provenance: Default::default(),
+                pid: std::process::id(),
+                process_start_marker: workers::process_start_marker(std::process::id()).unwrap(),
+                state: "running".into(),
+                completed_at: None,
+            },
+        )
+        .unwrap();
+
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.starts_with("adopted:")), "{msgs:?}");
+        let q = ws.load_queue().unwrap();
+        assert_eq!(q.tasks[0].state, TaskState::Running); // not requeued
+
+        // A reused/decoy live pid with a different process identity must never
+        // be adopted or signalled.
+        let mut provenance = workers::load_worker_process_provenance(&run_dir).unwrap();
+        provenance.process_start_marker = "different process identity".into();
+        state::save_yaml(
+            &run_dir.join(workers::WORKER_PROCESS_PROVENANCE_FILE),
+            &provenance,
+        )
+        .unwrap();
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("requeued")), "{msgs:?}");
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Queued);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_salvages_a_failed_task_whose_orphan_run_actually_finished() {
+        // The reported gap: a task got stuck Failed because the orchestrator
+        // died after the worker finished but before evaluating it. The run's
+        // worker.pid is still on disk (dead) and a clean result was written.
+        // Recovery re-evaluates that stranded result (instead of a full re-run)
+        // against the workspace's real git status (not the worker's self-report);
+        // with no forbidden path in the diff it salvages to Done.
+        let root = std::env::temp_dir().join(format!("yard-salvage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Failed, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\n"),
+        )
+        .unwrap();
+        // The orphan marker: a pid file left behind for a process that is gone.
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+        // Salvaged to Done from real git evidence (not a full re-run).
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+        // Finalized: the pid file is cleared so a later pass is a no-op.
+        assert!(!run_dir.join("worker.pid").exists());
+        let again = recover_orphans(&ws);
+        assert!(
+            !again.iter().any(|m| m.contains("recovered")),
+            "second pass should not re-recover: {again:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_emits_attributed_salvage_telemetry() {
+        // The trust report reads telemetry; a run salvaged by recovery must still
+        // land there — labeled reason=recovery, attributed to its run.yaml worker
+        // — or every recovered task is invisible to trust accounting.
+        let root = std::env::temp_dir().join(format!("yard-rectel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Failed, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        // run.yaml carries the worker so the salvage telemetry is attributable.
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\nworker: codex\n"),
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        assert!(telemetry::read_runs(&ws).is_empty());
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+
+        // One telemetry row for the salvaged outcome, attributed + labeled.
+        let runs = telemetry::read_runs(&ws);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].task_id, "YARD-001");
+        assert_eq!(runs[0].worker, "codex");
+        assert_eq!(runs[0].chosen_reason, "recovery");
+        assert_eq!(runs[0].eval_state, "Done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_does_not_ingest_followups() {
+        // Recovery (follow_ups flag off) must only finalize the stranded run, not
+        // mutate the queue graph: a follow-up proposed in the stranded result is
+        // NOT ingested on recovery (that would resurrect work during a crash pass).
+        let root = std::env::temp_dir().join(format!("yard-recnoing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Failed, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![crate::schemas::FollowUpTask {
+                title: "a follow-up the crash pass must not ingest".into(),
+                reason: String::new(),
+                kind: "implementation".into(),
+                risk: String::new(),
+                allowed_scope: vec![],
+                acceptance: vec![],
+                skills: vec![],
+                depends_on: vec![],
+                preferred_worker: String::new(),
+                model: String::new(),
+                fallback_enabled: None,
+                required_capabilities: vec![],
+                decision_question: String::new(),
+                worker_rationale: None,
+                insert: String::new(),
+                runs_before: vec![],
+            }],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\nworker: codex\n"),
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+        let q = ws.load_queue().unwrap();
+        // Salvaged to Done, and the proposed follow-up was NOT ingested.
+        assert_eq!(
+            q.tasks.len(),
+            1,
+            "no follow-up should be ingested on recovery"
+        );
+        assert_eq!(q.tasks[0].state, TaskState::Done);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conflicting_follow_up_does_not_erase_governing_task_state_transition() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-follow-up-conflict-finalize-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+        let mut governing_task = task("YARD-001", TaskState::Running, 10, false);
+        governing_task.preferred_worker = "codex".into();
+        governing_task.model = "gpt-5.6-sol".into();
+        governing_task.fallback_enabled = Some(false);
+        let initial = queue(vec![governing_task]);
+        ws.save_queue(&initial).unwrap();
+
+        let governing = crate::schemas::ResolvedWorkerSelection {
+            worker_id: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+            fallback_enabled: false,
+            routing_provenance: crate::schemas::RoutingProvenance {
+                governing_task_id: "YARD-001".into(),
+                governing_worker_id: "codex".into(),
+                governing_model: "gpt-5.6-sol".into(),
+                governing_fallback_enabled: false,
+                ..Default::default()
+            },
+        };
+        let conflicting = crate::schemas::FollowUpTask {
+            title: "conflicting worker follow-up".into(),
+            preferred_worker: "claude-code".into(),
+            ..Default::default()
+        };
+        let lock = ws.acquire_planning_lock().unwrap();
+        let mut fallback_queue = initial;
+        let error = finalize_on_latest_queue_locked(
+            &ws,
+            &lock,
+            &mut fallback_queue,
+            "YARD-001",
+            TaskState::Done,
+            &[],
+            &[conflicting],
+            Some(&governing),
+            None,
+            None,
+            TransitionCause::RunOutcome,
+            "worker evaluated task as done",
+            TransitionActor::Worker("run-conflicting-follow-up".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("governing worker"), "{error:#}");
+        let persisted = ws.load_queue().unwrap();
+        assert_eq!(persisted.tasks.len(), 1, "conflict must stay fail-closed");
+        assert_eq!(persisted.tasks[0].state, TaskState::Done);
+        assert_eq!(fallback_queue.tasks[0].state, TaskState::Done);
+        let transition = ws.latest_transition("YARD-001").unwrap();
+        assert_eq!(transition.from, TaskState::Running);
+        assert_eq!(transition.to, TaskState::Done);
+        assert_eq!(transition.cause, TransitionCause::RunOutcome);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn needs_user_origin_for_finalize_types_feedback_terminal_apart_from_worker_questions() {
+        use crate::schemas::{EventActorKind, NeedsUserOrigin};
+        // A worker-authored question is answer-only, even when the feedback
+        // loop also went terminal on the same run.
+        assert_eq!(
+            needs_user_origin_for_finalize(EventActorKind::Worker, true),
+            Some(NeedsUserOrigin::WorkerQuestion)
+        );
+        assert_eq!(
+            needs_user_origin_for_finalize(EventActorKind::Worker, false),
+            Some(NeedsUserOrigin::WorkerQuestion)
+        );
+        // The goal-feedback loop exhausted its retries and synthesized the
+        // question itself: the approach failed, typed for the replan gate.
+        assert_eq!(
+            needs_user_origin_for_finalize(EventActorKind::System, true),
+            Some(NeedsUserOrigin::GoalFeedbackExhausted)
+        );
+        // Other system pauses (provider refusal, fallback question) stay
+        // untyped and therefore answer-only.
+        assert_eq!(
+            needs_user_origin_for_finalize(EventActorKind::System, false),
+            None
+        );
+    }
+
+    #[test]
+    fn finalize_persists_and_clears_the_needs_user_origin_marker() {
+        use crate::schemas::NeedsUserOrigin;
+        let root = std::env::temp_dir().join(format!(
+            "yard-needs-user-origin-finalize-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+        let initial = queue(vec![task("YARD-001", TaskState::Running, 10, false)]);
+        ws.save_queue(&initial).unwrap();
+
+        let lock = ws.acquire_planning_lock().unwrap();
+        let mut fallback_queue = initial;
+        finalize_on_latest_queue_locked(
+            &ws,
+            &lock,
+            &mut fallback_queue,
+            "YARD-001",
+            TaskState::NeedsUser,
+            &[],
+            &[],
+            None,
+            None,
+            Some(NeedsUserOrigin::GoalFeedbackExhausted),
+            TransitionCause::RunOutcome,
+            "feedback stopped: feedback retry cap exceeded (2)",
+            TransitionActor::System,
+        )
+        .unwrap();
+        let persisted = ws.load_queue().unwrap();
+        assert_eq!(persisted.tasks[0].state, TaskState::NeedsUser);
+        assert_eq!(
+            persisted.tasks[0].needs_user_origin(),
+            Some(NeedsUserOrigin::GoalFeedbackExhausted)
+        );
+
+        // Leaving NeedsUser clears the marker so a later, unrelated pause is
+        // never misread as feedback-exhausted.
+        finalize_on_latest_queue_locked(
+            &ws,
+            &lock,
+            &mut fallback_queue,
+            "YARD-001",
+            TaskState::Queued,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            TransitionCause::RunOutcome,
+            "answered; task requeued",
+            TransitionActor::System,
+        )
+        .unwrap();
+        let persisted = ws.load_queue().unwrap();
+        assert_eq!(persisted.tasks[0].state, TaskState::Queued);
+        assert_eq!(persisted.tasks[0].needs_user_origin(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn done_with_nonblocking_followups_records_notes_and_leaves_queue_runnable() {
+        let root = std::env::temp_dir().join(format!("yard-done-fu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Running, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t.clone()])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "acceptance met; optional cleanup remains".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![crate::schemas::FollowUpTask {
+                title: "Tidy optional documentation".into(),
+                reason: "Useful cleanup, but not required for the accepted task".into(),
+                kind: "implementation".into(),
+                risk: "low".into(),
+                ..Default::default()
+            }],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Worker handoff\n").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\nworker: codex\n"),
+        )
+        .unwrap();
+
+        let billing = crate::schemas::BillingPolicy::default();
+        let mut q = ws.load_queue().unwrap();
+        let report = finalize_run(FinalizeInput {
+            ws: &ws,
+            run_dir: &run_dir,
+            run_id,
+            task: &t,
+            evidence: Some(vec![]),
+            worker_id: "codex",
+            reason: "serial",
+            wall_seconds: 0,
+            user_override: None,
+            intent_summary: "core acceptance met",
+            billing: &billing,
+            queue: &mut q,
+            flags: FinalizeFlags::serial(),
+            merge: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.next_state, TaskState::Done);
+        let q = ws.load_queue().unwrap();
+        assert_eq!(q.tasks[0].state, TaskState::Done);
+        assert_eq!(q.tasks[1].state, TaskState::Queued);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1));
+
+        let checkpoint = std::fs::read_to_string(run_dir.join("checkpoint.md")).unwrap();
+        let handoff = std::fs::read_to_string(run_dir.join("handoff.md")).unwrap();
+        for text in [checkpoint, handoff] {
+            assert!(text.contains("Non-blocking follow-up notes"));
+            assert!(text.contains("Tidy optional documentation"));
+            assert!(text.contains("not required for the accepted task"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn done_with_question_preserves_question_in_run_artifacts() {
+        let root = std::env::temp_dir().join(format!("yard-done-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Running, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t.clone()])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let question = "Should this optional cleanup become a later task?";
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: Some(question.into()),
+            compact_summary: "acceptance met; optional question preserved".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Worker handoff\n").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\nworker: codex\n"),
+        )
+        .unwrap();
+
+        let billing = crate::schemas::BillingPolicy::default();
+        let mut q = ws.load_queue().unwrap();
+        let report = finalize_run(FinalizeInput {
+            ws: &ws,
+            run_dir: &run_dir,
+            run_id,
+            task: &t,
+            evidence: Some(vec![]),
+            worker_id: "codex",
+            reason: "serial",
+            wall_seconds: 0,
+            user_override: None,
+            intent_summary: "core acceptance met",
+            billing: &billing,
+            queue: &mut q,
+            flags: FinalizeFlags::serial(),
+            merge: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.next_state, TaskState::Done);
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Done);
+
+        let eval: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("evaluation.json")).unwrap(),
+        )
+        .unwrap();
+        let checks = eval["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|c| {
+            c["name"] == "done_status_has_question" && c["fatal"] == false && c["passed"] == false
+        }));
+
+        let checkpoint = std::fs::read_to_string(run_dir.join("checkpoint.md")).unwrap();
+        let evaluator_summary =
+            std::fs::read_to_string(run_dir.join("evaluator-summary.md")).unwrap();
+        let handoff = std::fs::read_to_string(run_dir.join("handoff.md")).unwrap();
+        for text in [checkpoint, evaluator_summary] {
+            assert!(text.contains(question));
+        }
+        assert_eq!(handoff, "# Worker handoff\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalize_seals_run_record_to_terminal_outcome() {
+        // run.yaml is written "running" at spawn and was never updated, so every
+        // record looked in-flight forever — a Trust Report / run-dir scan could
+        // not tell a finished run from a stranded one. finalize_run (here via
+        // recovery) must seal it to the real terminal state + a completed_at,
+        // while preserving the spawn-time started_at.
+        let root = std::env::temp_dir().join(format!("yard-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output();
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Failed, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t])).unwrap();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        // A full spawn-time record: in-flight "running" with a started_at to keep.
+        let started = "2099-01-01T00:00:00+00:00";
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: "YARD-001".into(),
+                intent_id: String::new(),
+                worker: "codex".into(),
+                state: "running".into(),
+                started_at: started.into(),
+                completed_at: None,
+                worktree: ".".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_str(&run_dir.join("worker.pid"), "2147483647").unwrap();
+
+        let msgs = recover_orphans(&ws);
+        assert!(msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+
+        // Sealed: terminal state, a completed_at, original started_at preserved.
+        let sealed: RunRecord = state::load_yaml(&run_dir.join("run.yaml")).unwrap();
+        assert_eq!(sealed.state, "done");
+        assert!(sealed.completed_at.is_some());
+        assert_eq!(sealed.started_at, started);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parallel_finalize_merges_a_done_worktree() {
+        // The parallel path finalizes a worktree run through finalize_run and, on
+        // a Done outcome, merges the worktree back into the workspace. (Validation
+        // is intentionally OFF for parallel — the pre-merge worktree lacks the
+        // workspace build env — so this exercises the merge, not validation.)
+        let root = std::env::temp_dir().join(format!("yard-pval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        // The worktree integration commit inherits the repository's identity;
+        // configure one locally so the test passes on runners with no global
+        // git config.
+        sh(&["config", "user.name", "t"]);
+        sh(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        sh(&["add", "base.txt"]);
+        sh(&["commit", "-q", "-m", "init"]);
+
+        let remote = root.with_extension("bare.git");
+        let _ = std::fs::remove_dir_all(&remote);
+        sh(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+        sh(&["remote", "add", "fixture", remote.to_str().unwrap()]);
+        sh(&["push", "-q", "fixture", "HEAD:refs/heads/main"]);
+        crate::init::init(&root, false).unwrap();
+        let ws = Workspace::at(&root);
+        let mut config = ws.load_config().unwrap();
+        config.git_finish = crate::schemas::GitFinishPolicy {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: "refs/heads/main".into(),
+            pre_push_checks: vec![crate::schemas::GitFinishCheck {
+                name: "owned-change-present".into(),
+                command: "test -f feature.txt".into(),
+            }],
+        };
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+        let mut t = task("YARD-001", TaskState::Running, 10, false);
+        t.kind = "implementation".into();
+
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let wt = ws.agents_dir().join("worktrees").join("yard-001");
+        let baseline_oid = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let baseline_oid = String::from_utf8_lossy(&baseline_oid.stdout)
+            .trim()
+            .to_string();
+        sh(&[
+            "worktree",
+            "add",
+            &wt.display().to_string(),
+            "-b",
+            "yard/yard-001",
+        ]);
+        std::fs::write(wt.join("feature.txt"), "from worker\n").unwrap();
+
+        let result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: "YARD-001".into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "ok".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!(
+                "run_id: {run_id}\ntask_id: YARD-001\nworktree: {}\n",
+                wt.display()
+            ),
+        )
+        .unwrap();
+
+        let billing = crate::schemas::BillingPolicy::default();
+        let mut q = queue(vec![t.clone()]);
+        let report = finalize_run(FinalizeInput {
+            ws: &ws,
+            run_dir: &run_dir,
+            run_id,
+            task: &t,
+            evidence: Some(vec!["feature.txt".into()]),
+            worker_id: "codex",
+            reason: "parallel",
+            wall_seconds: 0,
+            user_override: None,
+            intent_summary: "",
+            billing: &billing,
+            queue: &mut q,
+            flags: FinalizeFlags::parallel(),
+            merge: Some(MergeBack {
+                wt_path: &wt,
+                branch: "yard/yard-001",
+                baseline_oid: &baseline_oid,
+                expected_tip_oid: None,
+                core_input_overlays: &[],
+                dependency_input_overlays: &[],
+                provenance: IntegrationProvenance::ParallelWorkerDirect,
+                auto_commit: true,
+            }),
+        })
+        .unwrap();
+
+        // Done -> the worktree merged back into the workspace.
+        assert_eq!(report.next_state, TaskState::Done, "{:?}", report.lines);
+        assert!(
+            root.join("feature.txt").exists(),
+            "worktree change should have merged into the workspace"
+        );
+        let finish: crate::git_finish::GitFinishRecord = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("git-finish.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(finish.status, crate::git_finish::GitFinishStatus::Pushed);
+        assert_eq!(finish.expected_oid, finish.remote_oid);
+        let remote_head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-remote", "--refs", "fixture", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert!(remote_head.status.success());
+        assert!(String::from_utf8_lossy(&remote_head.stdout)
+            .starts_with(finish.expected_oid.as_deref().unwrap()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn no_change_finalize_ignores_forged_finish_and_never_pushes_unrelated_head() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-nochange-forged-finish-{}",
+            std::process::id()
+        ));
+        let remote = root.with_extension("bare.git");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let remote_baseline = git(&["rev-parse", "HEAD"]);
+        git(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&["remote", "add", "fixture", remote.to_str().unwrap()]);
+        git(&["push", "-q", "fixture", "HEAD:refs/heads/main"]);
+        std::fs::write(root.join("unrelated.txt"), "pre-existing local work\n").unwrap();
+        git(&["add", "unrelated.txt"]);
+        git(&["commit", "-q", "-m", "unrelated local commit"]);
+        let unrelated_oid = git(&["rev-parse", "HEAD"]);
+
+        crate::init::init(&root, false).unwrap();
+        let ws = Workspace::at(&root);
+        let mut config = ws.load_config().unwrap();
+        config.git_finish = crate::schemas::GitFinishPolicy {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: "refs/heads/main".into(),
+            pre_push_checks: vec![],
+        };
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+        let run_id = "run-20990101-000000-nochange";
+        let task_id = "YARD-NOCHANGE";
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let worktree = ws.agents_dir().join("worktrees").join(run_id);
+        crate::parallel::create_worktree(&root, &worktree, &branch).unwrap();
+        let mut queued = task(task_id, TaskState::Running, 10, false);
+        queued.kind = "implementation".into();
+        let mut q = queue(vec![queued.clone()]);
+        q.intent_id = "intent-nochange".into();
+        ws.save_queue(&q).unwrap();
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "no run changes".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        result.validation.passed = true;
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-nochange".into(),
+                worker: "codex".into(),
+                state: "running".into(),
+                started_at: Local::now().to_rfc3339(),
+                worktree: worktree.display().to_string(),
+                baseline_oid: unrelated_oid.clone(),
+                worktree_branch: branch.clone(),
+                integration_oid: unrelated_oid.clone(),
+                integration_base_oid: remote_baseline.clone(),
+                owned_oids: vec![unrelated_oid.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let forged = crate::git_finish::GitFinishRecord {
+            schema_version: 2,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            attempted_at: String::new(),
+            status: crate::git_finish::GitFinishStatus::Pushed,
+            policy: crate::git_finish::GitFinishPolicySnapshot {
+                auto_push: true,
+                delivery: crate::schemas::GitFinishDelivery::Direct,
+                remote: "fixture".into(),
+                target_ref: "refs/heads/main".into(),
+                pre_push_checks: vec![],
+            },
+            expected_oid: Some(unrelated_oid.clone()),
+            baseline_oid: remote_baseline.clone(),
+            owned_oids: vec![unrelated_oid.clone()],
+            checks: vec![],
+            push_invoked: true,
+            push_succeeded: true,
+            remote_oid: Some(unrelated_oid.clone()),
+            remote_before_oid: Some(remote_baseline.clone()),
+            head_ref: None,
+            pull_request_number: None,
+            pull_request_state: None,
+            reason: "worker forged verified status".into(),
+        };
+        write_str(
+            &run_dir.join("git-finish.json"),
+            &serde_json::to_string_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        let billing = crate::schemas::BillingPolicy::default();
+        let report = finalize_run(FinalizeInput {
+            ws: &ws,
+            run_dir: &run_dir,
+            run_id,
+            task: &queued,
+            evidence: Some(vec![]),
+            worker_id: "codex",
+            reason: "parallel",
+            wall_seconds: 0,
+            user_override: None,
+            intent_summary: "",
+            billing: &billing,
+            queue: &mut q,
+            flags: FinalizeFlags::parallel(),
+            merge: Some(MergeBack {
+                wt_path: &worktree,
+                branch: &branch,
+                baseline_oid: &unrelated_oid,
+                expected_tip_oid: Some(&unrelated_oid),
+                core_input_overlays: &[],
+                dependency_input_overlays: &[],
+                provenance: IntegrationProvenance::ParallelWorkerDirect,
+                auto_commit: true,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(report.next_state, TaskState::Done, "{:?}", report.lines);
+        let finish = ws.load_git_finish_record(&run_dir).unwrap();
+        assert_eq!(finish.status, crate::git_finish::GitFinishStatus::NotNeeded);
+        assert!(!finish.push_invoked);
+        let remote_after = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&remote)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert!(remote_after.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&remote_after.stdout).trim(),
+            remote_baseline
+        );
+        assert_eq!(git(&["rev-parse", "HEAD"]), unrelated_oid);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    fn assert_verified_external_finish_recovers_partial_projection(
+        sensitive_uncommitted_file: bool,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "yard-verified-finish-projection-{}-{}",
+            if sensitive_uncommitted_file {
+                "sensitive"
+            } else {
+                "clean"
+            },
+            std::process::id()
+        ));
+        let remote = root.with_extension("bare.git");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let baseline_oid = git(&["rev-parse", "HEAD"]);
+        git(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&["remote", "add", "fixture", remote.to_str().unwrap()]);
+        git(&["push", "-q", "fixture", "HEAD:refs/heads/main"]);
+
+        git(&["checkout", "-q", "-b", "fixture-worker"]);
+        std::fs::write(root.join("owned.txt"), "owned\n").unwrap();
+        git(&["add", "owned.txt"]);
+        git(&["commit", "-q", "-m", "owned worker commit"]);
+        let worker_oid = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "owned integration",
+            "fixture-worker",
+        ]);
+        let integration_oid = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "push",
+            "-q",
+            "fixture",
+            &format!("{integration_oid}:refs/heads/main"),
+        ]);
+
+        crate::init::init(&root, false).unwrap();
+        let ws = Workspace::at(&root);
+        let mut config = ws.load_config().unwrap();
+        config.git_finish = crate::schemas::GitFinishPolicy {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: "refs/heads/main".into(),
+            pre_push_checks: vec![],
+        };
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+
+        let run_id = "run-20990101-000000-verified-projection";
+        let task_id = "YARD-VERIFIED-PROJECTION";
+        let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+        let worktree = ws.agents_dir().join("worktrees").join(run_id);
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut queued = task(task_id, TaskState::Done, 10, false);
+        queued.kind = "implementation".into();
+        let mut q = queue(vec![queued]);
+        q.intent_id = "intent-verified-projection".into();
+        ws.save_queue(&q).unwrap();
+
+        let mut result = crate::schemas::RunResult {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            status: "done".into(),
+            intent_adherence: Default::default(),
+            changes: Default::default(),
+            validation: Default::default(),
+            question_for_user: None,
+            compact_summary: "already integrated".into(),
+            verdict: vec![],
+            harness_suggestions: vec![],
+            follow_up_tasks: vec![],
+            artifacts: vec![],
+            resources: vec![],
+        };
+        result.validation.passed = true;
+        write_str(
+            &run_dir.join("result.json"),
+            &serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        state::save_yaml(
+            &run_dir.join("run.yaml"),
+            &RunRecord {
+                adoption: None,
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                intent_id: "intent-verified-projection".into(),
+                worker: "codex".into(),
+                state: "partial".into(),
+                started_at: "2099-01-01T00:00:00+00:00".into(),
+                completed_at: Some("2099-01-01T00:00:01+00:00".into()),
+                worktree: worktree.display().to_string(),
+                worktree_branch: branch.clone(),
+                baseline_oid: baseline_oid.clone(),
+                integration_oid: integration_oid.clone(),
+                integration_base_oid: baseline_oid.clone(),
+                integration_worker_oid: worker_oid.clone(),
+                integration_provenance: IntegrationProvenance::ParallelWorkerDirect,
+                integration_cleanup_complete: true,
+                owned_oids: vec![worker_oid.clone(), integration_oid.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ws.save_integrated_cleanup_receipt(&state::IntegratedCleanupReceipt {
+            schema_version: 1,
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            intent_id: "intent-verified-projection".into(),
+            worker: "codex".into(),
+            worktree: worktree.display().to_string(),
+            branch,
+            baseline_oid: baseline_oid.clone(),
+            integration_base_oid: baseline_oid.clone(),
+            integration_worker_oid: worker_oid.clone(),
+            integration_oid: integration_oid.clone(),
+            provenance: IntegrationProvenance::ParallelWorkerDirect,
+            owned_oids: vec![worker_oid.clone(), integration_oid.clone()],
+            core_input_overlays: vec![],
+            dependency_input_overlays: vec![],
+        })
+        .unwrap();
+
+        // Reproduce the post-push crash boundary: the authoritative checkpoint
+        // and queue state are durable, but the completed run projection is
+        // still Partial.
+        std::fs::create_dir_all(run_dir.join("git-finish.json")).unwrap();
+        let projection_error = ws
+            .save_git_finish_record(
+                &run_dir,
+                &crate::git_finish::GitFinishRecord {
+                    schema_version: 2,
+                    run_id: run_id.into(),
+                    task_id: task_id.into(),
+                    attempted_at: "2099-01-01T00:00:01+00:00".into(),
+                    status: crate::git_finish::GitFinishStatus::Pushed,
+                    policy: crate::git_finish::GitFinishPolicySnapshot {
+                        auto_push: true,
+                        delivery: crate::schemas::GitFinishDelivery::Direct,
+                        remote: "fixture".into(),
+                        target_ref: "refs/heads/main".into(),
+                        pre_push_checks: vec![],
+                    },
+                    expected_oid: Some(integration_oid.clone()),
+                    baseline_oid: baseline_oid.clone(),
+                    owned_oids: vec![worker_oid, integration_oid.clone()],
+                    checks: vec![],
+                    push_invoked: true,
+                    push_succeeded: true,
+                    remote_oid: Some(integration_oid.clone()),
+                    remote_before_oid: Some(baseline_oid),
+                    head_ref: None,
+                    pull_request_number: None,
+                    pull_request_state: None,
+                    reason: "remote_verified".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(projection_error.to_string().contains("git-finish.json"));
+        assert_eq!(
+            ws.load_git_finish_record(&run_dir).unwrap().status,
+            crate::git_finish::GitFinishStatus::Pushed
+        );
+        std::fs::remove_dir_all(run_dir.join("git-finish.json")).unwrap();
+        if sensitive_uncommitted_file {
+            std::fs::write(root.join(".env.recovery-secret"), "must remain untouched\n").unwrap();
+        }
+
+        let messages = recover_orphans(&ws);
+        assert_eq!(
+            ws.load_queue().unwrap().tasks[0].state,
+            TaskState::Done,
+            "{messages:?}"
+        );
+        let finish = ws.load_git_finish_record(&run_dir).unwrap();
+        if sensitive_uncommitted_file {
+            assert_eq!(finish.status, crate::git_finish::GitFinishStatus::Pushed);
+            assert_eq!(finish.reason, "remote_verified");
+            assert_eq!(finish.attempted_at, "2099-01-01T00:00:01+00:00");
+        } else {
+            assert_eq!(
+                finish.status,
+                crate::git_finish::GitFinishStatus::AlreadyApplied
+            );
+            assert!(!finish.push_invoked, "recovery must not repeat the push");
+        }
+        assert!(finish.status.verified_complete());
+        assert_eq!(finish.remote_oid.as_deref(), Some(integration_oid.as_str()));
+        let sealed = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")).unwrap();
+        assert_eq!(sealed.state, "done");
+        assert!(sealed.completed_at.is_some());
+        assert_eq!(
+            git(&["ls-remote", "--refs", "fixture", "refs/heads/main"]),
+            format!("{integration_oid}\trefs/heads/main")
+        );
+        if sensitive_uncommitted_file {
+            assert_eq!(
+                std::fs::read_to_string(root.join(".env.recovery-secret")).unwrap(),
+                "must remain untouched\n"
+            );
+        }
+
+        let second = recover_orphans(&ws);
+        assert!(
+            second.is_empty(),
+            "second recovery was not inert: {second:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn verified_external_finish_recovers_partial_projection_without_duplicate_push() {
+        assert_verified_external_finish_recovers_partial_projection(false);
+    }
+
+    #[test]
+    fn done_projection_recovery_preserves_verified_finish_with_sensitive_uncommitted_file() {
+        assert_verified_external_finish_recovers_partial_projection(true);
+    }
+
+    #[test]
+    fn recovery_projects_accumulated_finishes_in_integration_order() {
+        let root =
+            std::env::temp_dir().join(format!("yard-accumulated-recovery-{}", std::process::id()));
+        let remote = root.with_extension("bare.git");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Yardlet Test"]);
+        git(&["config", "user.email", "yardlet@example.test"]);
+        std::fs::write(root.join("owned.txt"), "seed\n").unwrap();
+        git(&["add", "owned.txt"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let baseline = git(&["rev-parse", "HEAD"]);
+        git(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&["remote", "add", "fixture", remote.to_str().unwrap()]);
+        git(&["push", "-q", "fixture", "HEAD:refs/heads/main"]);
+        crate::init::init(&root, false).unwrap();
+        let ws = Workspace::at(&root);
+        let mut config = ws.load_config().unwrap();
+        config.git_finish = crate::schemas::GitFinishPolicy {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: "refs/heads/main".into(),
+            pre_push_checks: vec![],
+        };
+        state::save_yaml(&ws.config_path(), &config).unwrap();
+
+        git(&["checkout", "-q", "-b", "fixture-worker-1"]);
+        std::fs::write(root.join("owned.txt"), "first\n").unwrap();
+        git(&["add", "owned.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+        let first_worker_oid = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "first integration",
+            "fixture-worker-1",
+        ]);
+        let first_oid = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "fixture-worker-2"]);
+        std::fs::write(root.join("owned.txt"), "second\n").unwrap();
+        git(&["add", "owned.txt"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let second_worker_oid = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "second integration",
+            "fixture-worker-2",
+        ]);
+        let second_oid = git(&["rev-parse", "HEAD"]);
+
+        let mut first_task = task("YARD-001", TaskState::Partial, 10, false);
+        first_task.kind = "implementation".into();
+        let mut second_task = task("YARD-002", TaskState::Partial, 20, false);
+        second_task.kind = "implementation".into();
+        let mut q = queue(vec![first_task, second_task]);
+        q.intent_id = "intent-accumulated".into();
+        ws.save_queue(&q).unwrap();
+
+        let policy_snapshot = crate::git_finish::GitFinishPolicySnapshot {
+            auto_push: true,
+            delivery: crate::schemas::GitFinishDelivery::Direct,
+            remote: "fixture".into(),
+            target_ref: "refs/heads/main".into(),
+            pre_push_checks: vec![],
+        };
+        for (index, task_id, base_oid, worker_oid, expected_oid, status) in [
+            (
+                1,
+                "YARD-001",
+                baseline.as_str(),
+                first_worker_oid.as_str(),
+                first_oid.as_str(),
+                crate::git_finish::GitFinishStatus::CheckBlocked,
+            ),
+            (
+                2,
+                "YARD-002",
+                first_oid.as_str(),
+                second_worker_oid.as_str(),
+                second_oid.as_str(),
+                crate::git_finish::GitFinishStatus::SafetyBlocked,
+            ),
+        ] {
+            let run_id = format!("run-20990101-00000{index}-{task_id}");
+            let run_dir = ws.runs_dir().join(&run_id);
+            let worktree = ws.agents_dir().join("worktrees").join(&run_id);
+            let branch = format!("yard/{}/{run_id}", task_id.to_lowercase());
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let mut result = crate::schemas::RunResult {
+                schema_version: 1,
+                run_id: run_id.clone(),
+                task_id: task_id.into(),
+                status: "done".into(),
+                intent_adherence: Default::default(),
+                changes: Default::default(),
+                validation: Default::default(),
+                question_for_user: None,
+                compact_summary: "integrated before Git finish".into(),
+                verdict: vec![],
+                harness_suggestions: vec![],
+                follow_up_tasks: vec![],
+                artifacts: vec![],
+                resources: vec![],
+            };
+            result.validation.passed = true;
+            write_str(
+                &run_dir.join("result.json"),
+                &serde_json::to_string(&result).unwrap(),
+            )
+            .unwrap();
+            write_str(&run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+            state::save_yaml(
+                &run_dir.join("run.yaml"),
+                &RunRecord {
+                    adoption: None,
+                    schema_version: 1,
+                    run_id: run_id.clone(),
+                    task_id: task_id.into(),
+                    intent_id: "intent-accumulated".into(),
+                    worker: "codex".into(),
+                    state: "partial".into(),
+                    started_at: format!("2099-01-01T00:00:0{index}+00:00"),
+                    completed_at: Some(format!("2099-01-01T00:00:1{index}+00:00")),
+                    worktree: worktree.display().to_string(),
+                    baseline_oid: base_oid.into(),
+                    worktree_branch: branch.clone(),
+                    integration_oid: expected_oid.into(),
+                    integration_base_oid: base_oid.into(),
+                    integration_worker_oid: worker_oid.into(),
+                    integration_provenance: IntegrationProvenance::ParallelWorkerDirect,
+                    owned_oids: vec![worker_oid.into(), expected_oid.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            ws.save_integrated_cleanup_receipt(&state::IntegratedCleanupReceipt {
+                schema_version: 1,
+                run_id: run_id.clone(),
+                task_id: task_id.into(),
+                intent_id: "intent-accumulated".into(),
+                worker: "codex".into(),
+                worktree: worktree.display().to_string(),
+                branch,
+                baseline_oid: base_oid.into(),
+                integration_base_oid: base_oid.into(),
+                integration_worker_oid: worker_oid.into(),
+                integration_oid: expected_oid.into(),
+                provenance: IntegrationProvenance::ParallelWorkerDirect,
+                owned_oids: vec![worker_oid.into(), expected_oid.into()],
+                core_input_overlays: vec![],
+                dependency_input_overlays: vec![],
+            })
+            .unwrap();
+            ws.save_git_finish_record(
+                &run_dir,
+                &crate::git_finish::GitFinishRecord {
+                    schema_version: 2,
+                    run_id: run_id.clone(),
+                    task_id: task_id.into(),
+                    attempted_at: String::new(),
+                    status,
+                    policy: policy_snapshot.clone(),
+                    expected_oid: Some(expected_oid.into()),
+                    baseline_oid: base_oid.into(),
+                    owned_oids: vec![worker_oid.into(), expected_oid.into()],
+                    checks: vec![],
+                    push_invoked: false,
+                    push_succeeded: false,
+                    remote_oid: None,
+                    remote_before_oid: Some(baseline.clone()),
+                    head_ref: None,
+                    pull_request_number: None,
+                    pull_request_state: None,
+                    reason: "pre_recovery".into(),
+                },
+            )
+            .unwrap();
+            telemetry::append_run(
+                &ws,
+                &telemetry::RunTelemetry {
+                    ts: format!("2099-01-01T00:00:2{index}+00:00"),
+                    run_id,
+                    task_id: task_id.into(),
+                    intent_id: "intent-accumulated".into(),
+                    kind: "implementation".into(),
+                    risk: String::new(),
+                    worker: "codex".into(),
+                    chosen_reason: "parallel".into(),
+                    result_status: "done".into(),
+                    eval_state: "Partial".into(),
+                    wall_seconds: 0,
+                    user_override: None,
+                    skills: vec![],
+                    verdict_pass: None,
+                    feedback_cycle: 0,
+                    max_feedback_cycles: 0,
+                    feedback_retryable: false,
+                    git_finish_status: status.as_str().into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let messages = recover_orphans(&ws);
+
+        assert!(
+            messages.iter().any(|line| line.contains("recovered")),
+            "{messages:?}"
+        );
+        assert!(ws
+            .load_queue()
+            .unwrap()
+            .tasks
+            .iter()
+            .all(|task| task.state == TaskState::Done));
+        let runs = telemetry::read_runs(&ws);
+        assert_eq!(
+            runs.len(),
+            2,
+            "recovery corrections must not double-count runs"
+        );
+        assert!(runs.iter().all(|run| {
+            run.eval_state == "Done"
+                && matches!(run.git_finish_status.as_str(), "pushed" | "already_applied")
+        }));
+        let first_finish = ws
+            .load_git_finish_record(&ws.runs_dir().join("run-20990101-000001-YARD-001"))
+            .unwrap();
+        let second_finish = ws
+            .load_git_finish_record(&ws.runs_dir().join("run-20990101-000002-YARD-002"))
+            .unwrap();
+        assert_eq!(
+            first_finish.remote_before_oid.as_deref(),
+            Some(baseline.as_str())
+        );
+        assert_eq!(
+            second_finish.remote_before_oid.as_deref(),
+            Some(first_oid.as_str())
+        );
+        assert_eq!(
+            second_finish.remote_oid.as_deref(),
+            Some(second_oid.as_str())
+        );
+        let final_report = crate::report::build_final_report(&ws).unwrap();
+        assert!(final_report.contains("2/2 tasks done"));
+        assert_eq!(final_report.matches("pushed and verified").count(), 2);
+        assert!(
+            recover_orphans(&ws).is_empty(),
+            "repeated recovery must be inert"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn recovery_leaves_a_genuinely_failed_task_alone() {
+        // A task that was actually evaluated and failed (no orphan pid file on
+        // its run) must NOT be resurrected — its result is not stranded, the
+        // evaluator already judged it. Recovery skips it.
+        let root = std::env::temp_dir().join(format!("yard-realfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        let mut t = task("YARD-001", TaskState::Failed, 10, false);
+        t.kind = "implementation".into();
+        ws.save_queue(&queue(vec![t])).unwrap();
+        let run_id = "run-20990101-000000-yard-001";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        write_str(&run_dir.join("result.json"), "{\"status\":\"done\"}").unwrap();
+        write_str(
+            &run_dir.join("run.yaml"),
+            &format!("run_id: {run_id}\ntask_id: YARD-001\n"),
+        )
+        .unwrap();
+        // No worker.pid file => the run was finalized; not an orphan.
+        let msgs = recover_orphans(&ws);
+        assert!(!msgs.iter().any(|m| m.contains("recovered")), "{msgs:?}");
+        assert_eq!(ws.load_queue().unwrap().tasks[0].state, TaskState::Failed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn final_state_update_preserves_tasks_added_during_run() {
+        let root =
+            std::env::temp_dir().join(format!("yard-preserve-queue-edits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+
+        let mut stale = queue(vec![task("YARD-010", TaskState::Running, 10, false)]);
+        ws.save_queue(&queue(vec![
+            task("YARD-010", TaskState::Done, 10, false),
+            task("YARD-011", TaskState::Queued, 20, false),
+        ]))
+        .unwrap();
+
+        save_task_state_on_latest_queue(
+            &ws,
+            &mut stale,
+            "YARD-010",
+            TaskState::Partial,
+            TransitionCause::RunOutcome,
+            "test final state update",
+            TransitionActor::System,
+        )
+        .unwrap();
+
+        let q = ws.load_queue().unwrap();
+        assert_eq!(q.tasks.len(), 2);
+        assert_eq!(q.tasks[0].id, "YARD-010");
+        assert_eq!(q.tasks[0].state, TaskState::Partial);
+        assert_eq!(q.tasks[1].id, "YARD-011");
+        assert_eq!(q.tasks[1].state, TaskState::Queued);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skips_tasks_with_unmet_dependencies() {
+        let mut a = task("A", TaskState::Queued, 10, false);
+        let mut b = task("B", TaskState::Queued, 20, false);
+        b.depends_on = vec!["A".into()];
+        // B is ineligible while A is queued, even though both are queued.
+        let q = queue(vec![a.clone(), b.clone()]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(0));
+        // Once A is done, B becomes eligible.
+        a.state = TaskState::Done;
+        let q = queue(vec![a, b.clone()]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1));
+        // A dependency id that does not exist is treated as met (no deadlock).
+        b.depends_on = vec!["GHOST".into()];
+        let q = queue(vec![b]);
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn sequential_selector_runs_builder_before_final_review() {
+        let mut review = task("REVIEW", TaskState::Queued, 10, false);
+        review.kind = "review".into();
+        let mut follow_up = task("FIX", TaskState::Queued, 20, false);
+        follow_up.kind = "implementation".into();
+        follow_up.provenance = "worker-proposed".into();
+        let mut q = queue(vec![review, follow_up]);
+
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1));
+
+        q.tasks[1].state = TaskState::Deferred;
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(0));
+
+        q.tasks[1].state = TaskState::Queued;
+        q.tasks[1].approval = Some(crate::yaml::from_str("required: true").unwrap());
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(0));
+
+        q.tasks[1].approval = None;
+        q.tasks[1].kind = "research".into();
+        assert_eq!(select_next(&q, &opts()).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn sequential_review_barrier_waits_for_linked_approval_then_releases() {
+        let mut review = task("REVIEW", TaskState::Queued, 10, false);
+        review.kind = "review".into();
+        let mut remediation = task("FIX", TaskState::Queued, 20, true);
+        remediation.kind = "implementation".into();
+        remediation.add_remediation_for("REVIEW");
+        let unrelated = task("QUESTION", TaskState::NeedsUser, 1, false);
+        let mut q = queue(vec![review, remediation, unrelated]);
+        let caps = std::collections::BTreeSet::new();
+
+        assert_eq!(
+            select_next_ready(&q, &caps, |_| false).unwrap(),
+            None,
+            "an unapproved linked remediation must hold the review"
+        );
+        assert_eq!(
+            select_next_ready(&q, &caps, |id| id == "FIX").unwrap(),
+            Some(1),
+            "approval makes the remediation, not the review, run next"
+        );
+
+        q.tasks[1].state = TaskState::Running;
+        assert_eq!(select_next_ready(&q, &caps, |_| false).unwrap(), None);
+
+        q.tasks[1].state = TaskState::Done;
+        assert_eq!(
+            select_next_ready(&q, &caps, |_| false).unwrap(),
+            Some(0),
+            "terminal remediation and unrelated NeedsUser release the review"
+        );
+
+        q.tasks[1].state = TaskState::NeedsUser;
+        assert_eq!(
+            select_next_ready(&q, &caps, |_| false).unwrap(),
+            Some(0),
+            "a terminal remediation human hold must not deadlock re-review"
+        );
+    }
+}

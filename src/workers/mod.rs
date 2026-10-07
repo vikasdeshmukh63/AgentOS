@@ -1,0 +1,3817 @@
+//! Worker engines.
+//!
+//! Workers are interchangeable CLI engines behind one contract:
+//!
+//! ```text
+//! task packet in -> worker subprocess -> structured result files out
+//! ```
+//!
+//! Yardlet treats Codex CLI and Claude Code CLI as hidden, subscription-backed
+//! workers. The exact CLI flags are adapter-owned here so business logic does
+//! not hard-code brittle host assumptions.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+use crate::guard;
+use crate::schemas::{
+    ChannelEventType, Invocation, OutputContractCause, RawEventRef, ResolvedWorkerSelection,
+    RoutingProvenance, WorkerOutputLogSpan, WorkerProfile,
+};
+
+/// Tail of a resultless attempt's log span that output-contract classification
+/// reads. Bounds the work; the causes it looks for are terminal events.
+pub const MAX_OUTPUT_CONTRACT_SCAN_BYTES: u64 = 256 * 1024;
+
+pub(crate) const WORKER_PROCESS_PROVENANCE_FILE: &str = "worker-process.yaml";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkerProcessProvenance {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub fallback_enabled: bool,
+    #[serde(default)]
+    pub routing_provenance: RoutingProvenance,
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub process_start_marker: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+pub(crate) fn process_start_marker(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let marker = String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!marker.is_empty()).then_some(marker)
+}
+
+pub(crate) fn load_worker_process_provenance(run_dir: &Path) -> Result<WorkerProcessProvenance> {
+    crate::state::load_yaml(&run_dir.join(WORKER_PROCESS_PROVENANCE_FILE))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawStreamKind {
+    Stdout,
+    Stderr,
+}
+
+impl RawStreamKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedWorkerEvent {
+    pub event_type: ChannelEventType,
+    pub payload: serde_json::Value,
+    pub raw_ref: RawEventRef,
+}
+
+pub type AttemptEventSink =
+    std::sync::Arc<dyn Fn(NormalizedWorkerEvent) -> std::result::Result<(), String> + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct AttemptCapture {
+    pub combined_log: PathBuf,
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
+}
+
+/// Classify only the public-log bytes appended by one resultless attempt.
+/// Patterns are bounded, case-insensitive literals rather than regexes so a
+/// user-owned profile cannot introduce unbounded matching work.
+///
+/// A real attempt log runs to hundreds of kilobytes or more, so a span larger
+/// than the scan budget is the normal case, not an error: both classified
+/// causes are terminal events (a provider's refusal reply, a session teardown
+/// killing background tasks) and therefore land at the END of the span. The
+/// scan reads the last `MAX_OUTPUT_CONTRACT_SCAN_BYTES` of the span. Spans that
+/// are structurally invalid (inverted, or past the end of the file) are still
+/// errors.
+pub fn classify_output_contract_cause(
+    profile: &WorkerProfile,
+    result_path: &Path,
+    output_log: &Path,
+    span: &WorkerOutputLogSpan,
+) -> Result<Option<OutputContractCause>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if result_path.is_file()
+        || (profile.provider_response_refusal_patterns.is_empty()
+            && profile.background_deferral_patterns.is_empty())
+    {
+        return Ok(None);
+    }
+    if span.byte_end < span.byte_start {
+        anyhow::bail!("worker output log span ends before it starts");
+    }
+    let mut file = std::fs::File::open(output_log)
+        .with_context(|| format!("opening bounded worker output {}", output_log.display()))?;
+    let file_len = file.metadata()?.len();
+    if span.byte_end > file_len {
+        anyhow::bail!(
+            "worker output log span {}..{} exceeds file length {}",
+            span.byte_start,
+            span.byte_end,
+            file_len
+        );
+    }
+    let scan_start = span
+        .byte_end
+        .saturating_sub(MAX_OUTPUT_CONTRACT_SCAN_BYTES)
+        .max(span.byte_start);
+    file.seek(SeekFrom::Start(scan_start))?;
+    let mut bytes = vec![0; (span.byte_end - scan_start) as usize];
+    file.read_exact(&mut bytes)?;
+    let haystack = String::from_utf8_lossy(&bytes).to_lowercase();
+    let matches = |patterns: &[String]| {
+        patterns
+            .iter()
+            .any(|pattern| haystack.contains(&pattern.to_lowercase()))
+    };
+    // A refusal explains why no work happened at all; a background deferral only
+    // explains missing artifacts. Classify the stronger cause first.
+    if matches(&profile.provider_response_refusal_patterns) {
+        return Ok(Some(OutputContractCause::ProviderResponseRefused));
+    }
+    Ok(matches(&profile.background_deferral_patterns)
+        .then_some(OutputContractCause::WorkerDeferredToBackgroundTask))
+}
+
+fn normalized_event(
+    event_type: ChannelEventType,
+    payload: serde_json::Value,
+    artifact_id: &str,
+    stream: RawStreamKind,
+    byte_start: usize,
+    byte_end: usize,
+) -> NormalizedWorkerEvent {
+    NormalizedWorkerEvent {
+        event_type,
+        payload,
+        raw_ref: RawEventRef {
+            artifact_id: artifact_id.to_string(),
+            stream: stream.as_str().to_string(),
+            byte_start: byte_start as u64,
+            byte_end: byte_end as u64,
+        },
+    }
+}
+
+fn text_event(
+    text: &str,
+    artifact_id: &str,
+    stream: RawStreamKind,
+    start: usize,
+    end: usize,
+) -> Option<NormalizedWorkerEvent> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| {
+        normalized_event(
+            ChannelEventType::WorkerMessage,
+            serde_json::json!({"text": text}),
+            artifact_id,
+            stream,
+            start,
+            end,
+        )
+    })
+}
+
+fn normalize_codex_json(
+    value: &serde_json::Value,
+    artifact_id: &str,
+    stream: RawStreamKind,
+    start: usize,
+    end: usize,
+) -> Vec<NormalizedWorkerEvent> {
+    let Some(kind) = value.get("type").and_then(|value| value.as_str()) else {
+        return Vec::new();
+    };
+    let item = value.get("item").unwrap_or(value);
+    let item_type = item.get("type").and_then(|value| value.as_str());
+    if matches!(item_type, Some("reasoning" | "thinking" | "analysis")) {
+        return Vec::new();
+    }
+    match (kind, item_type) {
+        ("item.started", Some("command_execution" | "tool_call")) => vec![normalized_event(
+            ChannelEventType::ToolStarted,
+            serde_json::json!({
+                "name": item.get("name").and_then(|value| value.as_str()).unwrap_or("command"),
+                "command": item.get("command").and_then(|value| value.as_str()).unwrap_or("")
+            }),
+            artifact_id,
+            stream,
+            start,
+            end,
+        )],
+        ("item.completed", Some("command_execution" | "tool_call")) => {
+            vec![normalized_event(
+                ChannelEventType::ToolCompleted,
+                serde_json::json!({
+                    "name": item.get("name").and_then(|value| value.as_str()).unwrap_or("command"),
+                    "command": item.get("command").and_then(|value| value.as_str()).unwrap_or(""),
+                    "exit_code": item.get("exit_code").cloned().unwrap_or(serde_json::Value::Null)
+                }),
+                artifact_id,
+                stream,
+                start,
+                end,
+            )]
+        }
+        ("item.started", Some("file_change")) => vec![normalized_event(
+            ChannelEventType::ToolStarted,
+            serde_json::json!({
+                "name": "file_change",
+                "change_count": item
+                    .get("changes")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, Vec::len),
+                "status": item.get("status").cloned().unwrap_or(serde_json::Value::Null)
+            }),
+            artifact_id,
+            stream,
+            start,
+            end,
+        )],
+        ("item.completed", Some("file_change")) => vec![normalized_event(
+            ChannelEventType::ToolCompleted,
+            serde_json::json!({
+                "name": "file_change",
+                "change_count": item
+                    .get("changes")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, Vec::len),
+                "status": item.get("status").cloned().unwrap_or(serde_json::Value::Null)
+            }),
+            artifact_id,
+            stream,
+            start,
+            end,
+        )],
+        ("item.completed", Some("agent_message" | "message")) => item
+            .get("text")
+            .and_then(|value| value.as_str())
+            .and_then(|text| text_event(text, artifact_id, stream, start, end))
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_claude_json(
+    value: &serde_json::Value,
+    artifact_id: &str,
+    stream: RawStreamKind,
+    start: usize,
+    end: usize,
+) -> Vec<NormalizedWorkerEvent> {
+    let mut out = Vec::new();
+    if value.get("type").and_then(|value| value.as_str()) == Some("content_block_start") {
+        let block = &value["content_block"];
+        if block.get("type").and_then(|value| value.as_str()) == Some("tool_use") {
+            out.push(normalized_event(
+                ChannelEventType::ToolStarted,
+                serde_json::json!({
+                    "name": block.get("name").and_then(|value| value.as_str()).unwrap_or("tool")
+                }),
+                artifact_id,
+                stream,
+                start,
+                end,
+            ));
+        }
+        return out;
+    }
+    let content = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array());
+    if let Some(content) = content {
+        for block in content {
+            match block.get("type").and_then(|value| value.as_str()) {
+                Some("text") => {
+                    if let Some(event) = block
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .and_then(|text| text_event(text, artifact_id, stream, start, end))
+                    {
+                        out.push(event);
+                    }
+                }
+                Some("tool_use") => out.push(normalized_event(
+                    ChannelEventType::ToolStarted,
+                    serde_json::json!({
+                        "name": block.get("name").and_then(|value| value.as_str()).unwrap_or("tool")
+                    }),
+                    artifact_id,
+                    stream,
+                    start,
+                    end,
+                )),
+                Some("thinking" | "reasoning" | "analysis") => {}
+                _ => {}
+            }
+        }
+    } else if value.get("type").and_then(|value| value.as_str()) == Some("result") {
+        if let Some(event) = value
+            .get("result")
+            .and_then(|value| value.as_str())
+            .and_then(|text| text_event(text, artifact_id, stream, start, end))
+        {
+            out.push(event);
+        }
+    }
+    out
+}
+
+/// The stdout shape a worker's output is normalized against.
+///
+/// The two built-in adapters keep their own vendor profiles: those normalizers
+/// are core-owned, so a profile cannot redefine them. Everything else is a
+/// user declaration (`invocation.output_format`), defaulting to line-per-event
+/// text — exactly the fallback every non-built-in worker had before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOutputFormat {
+    /// Codex CLI's stream-json profile.
+    CodexStreamJson,
+    /// Claude Code CLI's stream-json profile.
+    ClaudeStreamJson,
+    /// One public message per non-empty line, verbatim.
+    Text,
+    /// One JSON document per attempt; the rest of the stream is text.
+    Json,
+    /// One JSON object per line; unparseable lines degrade to text.
+    StreamJson,
+}
+
+impl WorkerOutputFormat {
+    /// Whether the streaming publisher can normalize this format line by line.
+    ///
+    /// A `json` worker emits ONE document that may span many lines, so its
+    /// events can only be derived once the whole attempt stream is on disk.
+    /// Publishing per line there would record a different event for the same
+    /// bytes than the end-of-attempt replay does, and those two must agree.
+    pub fn streams_line_by_line(self) -> bool {
+        !matches!(self, Self::Json)
+    }
+}
+
+/// Parse a declared `output_format`. Unknown values are rejected by the guard,
+/// never guessed at.
+pub fn parse_output_format(declared: &str) -> Option<WorkerOutputFormat> {
+    match declared.trim() {
+        "text" => Some(WorkerOutputFormat::Text),
+        "json" => Some(WorkerOutputFormat::Json),
+        "stream-json" => Some(WorkerOutputFormat::StreamJson),
+        _ => None,
+    }
+}
+
+/// Deterministic normalizer selection: a built-in adapter's vendor profile is
+/// core-owned and wins over any declaration; a generic worker uses its own
+/// declaration and falls back to text when it has none.
+pub fn resolve_output_format(worker_id: &str, declared: Option<&str>) -> WorkerOutputFormat {
+    match worker_id {
+        "codex" => WorkerOutputFormat::CodexStreamJson,
+        "claude-code" => WorkerOutputFormat::ClaudeStreamJson,
+        _ => declared
+            .and_then(parse_output_format)
+            .unwrap_or(WorkerOutputFormat::Text),
+    }
+}
+
+/// A structured event from a generic worker's JSON. `text` keeps the payload
+/// renderable by the same consumers that read vendor messages; `json` keeps
+/// the exact parsed object so nothing structural is lost to prose.
+fn generic_json_event(
+    value: &serde_json::Value,
+    artifact_id: &str,
+    stream: RawStreamKind,
+    start: usize,
+    end: usize,
+) -> Option<NormalizedWorkerEvent> {
+    let rendered = value
+        .get("text")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    (!rendered.is_empty()).then(|| {
+        normalized_event(
+            ChannelEventType::WorkerMessage,
+            serde_json::json!({"text": rendered, "json": value}),
+            artifact_id,
+            stream,
+            start,
+            end,
+        )
+    })
+}
+
+/// Byte spans of every balanced `{...}` region, in the order they CLOSE, so
+/// reversing yields the latest-finishing candidate first and, at equal ends,
+/// the outermost before the fragment nested inside it.
+///
+/// Nested regions are kept on purpose: a worker's prose can leave a stray brace
+/// open, and dropping everything after it would silently lose a result that is
+/// sitting right there in the stream. Quoted text is only tracked inside an
+/// object, where JSON strings actually live; unbalanced quotes in prose must
+/// not swallow the rest of the stream.
+///
+/// This is a scanner, not a parser: callers still parse the spans they want.
+fn balanced_object_spans(raw: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut open = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in raw.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' if !open.is_empty() => in_string = true,
+            b'{' => open.push(index),
+            b'}' => {
+                if let Some(start) = open.pop() {
+                    spans.push((start, index + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// The last balanced region that actually parses as a JSON object.
+/// Tolerant by design: unparseable candidates are skipped, never fatal.
+pub fn last_complete_json_object(raw: &[u8]) -> Option<(usize, usize, serde_json::Value)> {
+    balanced_object_spans(raw)
+        .into_iter()
+        .rev()
+        .find_map(|(start, end)| {
+            serde_json::from_slice::<serde_json::Value>(&raw[start..end])
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .map(|value| (start, end, value))
+        })
+}
+
+/// A result Yardlet recovered from captured stdout instead of the result file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredResult {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    /// The worker's exact bytes, so the recovered result stays worker-authored.
+    pub json: String,
+}
+
+/// Tolerantly recover a worker result from captured stdout: the LAST balanced
+/// JSON object that parses as the result schema AND identifies this exact run.
+/// Returns None when the stream holds no such object, which keeps the typed
+/// failure path exactly as it was.
+///
+/// The identity check is not a formality. Every task packet carries a result
+/// SCHEMA EXAMPLE, so a worker that echoes its own prompt prints a
+/// result-shaped object; without this, echoing the packet would manufacture a
+/// finished run — placeholder status, template follow-up tasks and all. A
+/// result that does not name this run and task is not this run's result.
+pub fn recover_result_from_output(
+    raw: &[u8],
+    run_id: &str,
+    task_id: &str,
+) -> Option<RecoveredResult> {
+    if run_id.trim().is_empty() || task_id.trim().is_empty() {
+        return None;
+    }
+    balanced_object_spans(raw)
+        .into_iter()
+        .rev()
+        .find(|(start, end)| {
+            serde_json::from_slice::<crate::schemas::RunResult>(&raw[*start..*end])
+                .is_ok_and(|result| result.run_id == run_id && result.task_id == task_id)
+        })
+        .and_then(|(start, end)| {
+            Some(RecoveredResult {
+                byte_start: start,
+                byte_end: end,
+                json: String::from_utf8(raw[start..end].to_vec()).ok()?,
+            })
+        })
+}
+
+/// One JSON document per attempt: the last complete object becomes a structured
+/// event; every line outside it degrades to text.
+fn normalize_json_document(
+    raw: &[u8],
+    artifact_id: &str,
+    stream: RawStreamKind,
+) -> Vec<NormalizedWorkerEvent> {
+    let document = last_complete_json_object(raw);
+    let mut events = Vec::new();
+    let mut start = 0_usize;
+    while start < raw.len() {
+        let end = raw[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(raw.len(), |offset| start + offset + 1);
+        match &document {
+            Some((doc_start, doc_end, value)) if start < *doc_end && end > *doc_start => {
+                if start <= *doc_start {
+                    events.extend(generic_json_event(
+                        value,
+                        artifact_id,
+                        stream,
+                        *doc_start,
+                        *doc_end,
+                    ));
+                }
+            }
+            _ => {
+                let line = String::from_utf8_lossy(&raw[start..end]);
+                if let Some(event) = text_event(line.trim(), artifact_id, stream, start, end) {
+                    events.push(event);
+                }
+            }
+        }
+        start = end;
+    }
+    events
+}
+
+/// Normalize only provider-exposed public messages/tool activity. Raw bytes
+/// remain the source of truth and every emitted event points at its exact line.
+///
+/// Id-keyed entry, kept as the oracle for the two core-owned vendor profiles:
+/// production always resolves a profile's DECLARED format first, so nothing
+/// outside tests reaches a normalizer through a worker id any more.
+#[cfg(test)]
+pub fn normalize_worker_output(
+    worker_id: &str,
+    stream: RawStreamKind,
+    raw: &[u8],
+    artifact_id: &str,
+) -> Vec<NormalizedWorkerEvent> {
+    normalize_worker_output_with_format(
+        resolve_output_format(worker_id, None),
+        stream,
+        raw,
+        artifact_id,
+    )
+}
+
+/// Format-keyed normalization. Every worker reaches its normalizer through the
+/// declared (or core-owned) stdout shape, never through an id comparison.
+pub fn normalize_worker_output_with_format(
+    format: WorkerOutputFormat,
+    stream: RawStreamKind,
+    raw: &[u8],
+    artifact_id: &str,
+) -> Vec<NormalizedWorkerEvent> {
+    if format == WorkerOutputFormat::Json {
+        return normalize_json_document(raw, artifact_id, stream);
+    }
+    let mut events = Vec::new();
+    let mut start = 0_usize;
+    while start < raw.len() {
+        let end = raw[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(raw.len(), |offset| start + offset + 1);
+        let line = String::from_utf8_lossy(&raw[start..end]);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+            let structured =
+                match (format, parsed.as_ref()) {
+                    (WorkerOutputFormat::CodexStreamJson, Some(value)) => {
+                        Some(normalize_codex_json(value, artifact_id, stream, start, end))
+                    }
+                    (WorkerOutputFormat::ClaudeStreamJson, Some(value)) => Some(
+                        normalize_claude_json(value, artifact_id, stream, start, end),
+                    ),
+                    (WorkerOutputFormat::StreamJson, Some(value)) => Some(
+                        generic_json_event(value, artifact_id, stream, start, end)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    // Text, and any line the declared format could not parse:
+                    // degrade to a message event instead of failing the stream.
+                    _ => None,
+                };
+            match structured {
+                Some(structured) => events.extend(structured),
+                None => events.extend(text_event(trimmed, artifact_id, stream, start, end)),
+            }
+        }
+        start = end;
+    }
+    events
+}
+
+fn publish_complete_public_lines(
+    format: WorkerOutputFormat,
+    stream: RawStreamKind,
+    artifact_id: &str,
+    pending: &mut Vec<u8>,
+    consumed: &mut u64,
+    flush_tail: bool,
+    sink: &AttemptEventSink,
+) -> std::io::Result<()> {
+    loop {
+        let line_len = pending
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|newline| newline + 1)
+            .or_else(|| (flush_tail && !pending.is_empty()).then_some(pending.len()));
+        let Some(line_len) = line_len else {
+            break;
+        };
+        let line = pending.drain(..line_len).collect::<Vec<_>>();
+        if format.streams_line_by_line() {
+            for mut event in normalize_worker_output_with_format(format, stream, &line, artifact_id)
+            {
+                event.raw_ref.byte_start += *consumed;
+                event.raw_ref.byte_end += *consumed;
+                sink(event).map_err(std::io::Error::other)?;
+            }
+        }
+        *consumed += line_len as u64;
+    }
+    Ok(())
+}
+
+fn codex_public_log_line(line: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(line);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return line.to_vec();
+    };
+    let item = value.get("item").unwrap_or(&value);
+    if item.get("type").and_then(|value| value.as_str()) != Some("file_change") {
+        return line.to_vec();
+    }
+    let event_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("item");
+    let status = item
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let change_count = item
+        .get("changes")
+        .and_then(|value| value.as_array())
+        .map_or(0, Vec::len);
+    let newline = if line.ends_with(b"\n") { "\n" } else { "" };
+    format!("[codex {event_type} file_change status={status} changes={change_count}]{newline}")
+        .into_bytes()
+}
+
+fn append_public_output(
+    worker_id: &str,
+    stream: RawStreamKind,
+    bytes: &[u8],
+    pending: &mut Vec<u8>,
+    flush_tail: bool,
+    log: &std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
+) {
+    use std::io::Write;
+
+    if worker_id != "codex" || stream != RawStreamKind::Stdout {
+        if let Ok(mut guard) = log.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.write_all(bytes);
+                let _ = file.flush();
+            }
+        }
+        return;
+    }
+
+    pending.extend_from_slice(bytes);
+    let mut public = Vec::new();
+    loop {
+        let line_len = pending
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|newline| newline + 1)
+            .or_else(|| (flush_tail && !pending.is_empty()).then_some(pending.len()));
+        let Some(line_len) = line_len else {
+            break;
+        };
+        let line = pending.drain(..line_len).collect::<Vec<_>>();
+        public.extend_from_slice(&codex_public_log_line(&line));
+    }
+    if !public.is_empty() {
+        if let Ok(mut guard) = log.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.write_all(&public);
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+/// A model/effort value counts as explicit only when it is set and is not the
+/// "auto" sentinel. Empty or "auto" means: omit the flag and let the worker CLI
+/// choose (its own default / automatic selection).
+fn explicit(v: &str) -> bool {
+    !v.trim().is_empty() && !v.eq_ignore_ascii_case("auto")
+}
+
+pub fn supports_native_resume(profile: &WorkerProfile) -> bool {
+    matches!(profile.id.as_str(), "codex" | "claude-code") || profile.invocation.session.is_some()
+}
+
+/// The profile a task actually runs with. A per-task `model`/`effort` overrides
+/// the worker profile only when EXPLICIT (set and not the "auto" sentinel);
+/// "auto"/empty keeps the profile's pinned value. This makes model/effort a
+/// consistent cascade task -> profile -> CLI default: a worker-level model pin
+/// is honored, and build_command falls back to the CLI's own default only when
+/// the profile itself is empty/auto. (Without this, a task's `model: auto` would
+/// clobber the profile pin and resolve straight to the CLI default.)
+pub fn effective_profile(
+    profile: &WorkerProfile,
+    task_model: &str,
+    task_effort: &str,
+) -> WorkerProfile {
+    let mut p = profile.clone();
+    if explicit(task_model) {
+        p.model = task_model.to_string();
+    }
+    if explicit(task_effort) {
+        p.effort = task_effort.to_string();
+    }
+    p
+}
+
+/// How a given worker turns a packet file into a subprocess command.
+///
+/// Argument shapes are isolated here so a single adapter edit fixes flag drift
+/// without touching orchestration. Verified against:
+///   - Codex CLI 0.136 (`codex exec`, prompt read from stdin)
+///   - Claude Code 2.1 (`claude -p`, prompt read from stdin)
+///
+/// Both are non-interactive and need write permission to produce the required
+/// result/handoff artifacts:
+///   - codex: `--sandbox workspace-write` bounds writes to the workspace.
+///   - claude: `--permission-mode acceptEdits` allows edits without prompts.
+#[allow(clippy::too_many_arguments)]
+pub fn build_command(
+    worker_id: &str,
+    bin: &Path,
+    run_dir: &Path,
+    cwd: &Path,
+    full_access: bool,
+    model: &str,
+    effort: &str,
+    images: &[String],
+    writable_roots: &[PathBuf],
+) -> Command {
+    let mut cmd = Command::new(bin);
+    // The worker must be able to write its artifacts into the run directory.
+    // Codex's workspace-write sandbox treats the hidden `.agents/` tree as
+    // read-only, so the run dir is added as an explicit writable root.
+    //
+    // `full_access` is the explicit, opt-in escalation: it drops the sandbox so
+    // the worker can reach the network, install packages, etc. Off by default.
+    match worker_id {
+        "codex" => {
+            let sandbox = if full_access {
+                "danger-full-access"
+            } else {
+                "workspace-write"
+            };
+            cmd.arg("exec")
+                .arg("-C")
+                .arg(cwd)
+                .arg("--sandbox")
+                .arg(sandbox)
+                .arg("--skip-git-repo-check")
+                .arg("--json"); // stream events as JSONL for the live monitor
+            if explicit(model) {
+                cmd.arg("-m").arg(model);
+            }
+            if explicit(effort) {
+                cmd.arg("-c")
+                    .arg(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            // Attach images natively (codex vision), so Yardlet does not lose it.
+            for img in images {
+                cmd.arg("-i").arg(img);
+            }
+            cmd.arg("--add-dir").arg(run_dir);
+            // The task's own declared writable scope. Codex's workspace-write
+            // sandbox treats the hidden `.agents/` tree as read-only, so a task
+            // whose confirmed contract grants it a skill package could not write
+            // there and asked the operator to re-authorize work already approved
+            // (issue #19).
+            for root in writable_roots {
+                cmd.arg("--add-dir").arg(root);
+            }
+        }
+        "claude-code" => {
+            if full_access {
+                cmd.arg("-p").arg("--dangerously-skip-permissions");
+            } else {
+                cmd.arg("-p").arg("--permission-mode").arg("acceptEdits");
+            }
+            // Stream events as JSONL so the live monitor shows progress.
+            cmd.arg("--output-format")
+                .arg("stream-json")
+                .arg("--verbose");
+            if explicit(model) {
+                cmd.arg("--model").arg(model);
+            }
+            if explicit(effort) {
+                cmd.arg("--effort").arg(effort);
+            }
+            cmd.arg("--add-dir").arg(run_dir);
+            for root in writable_roots {
+                cmd.arg("--add-dir").arg(root);
+            }
+        }
+        _ => {}
+    }
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    cmd
+}
+
+/// The file a `prompt_transport: file` worker reads its packet from.
+///
+/// Fixed by convention and written INTO the run directory Yardlet already owns,
+/// so the run's own lifecycle (retention/gc) is what removes it and no separate
+/// cleanup path can leak a packet after the run.
+pub const PROMPT_FILE_NAME: &str = "packet-prompt.txt";
+
+/// Where the file prompt transport materializes the packet for a run.
+pub fn prompt_file_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(PROMPT_FILE_NAME)
+}
+
+/// Materialize the packet for a `prompt_transport: file` worker and return the
+/// absolute path to hand it. `Ok(None)` for every other transport.
+///
+/// Written 0600 and replaced in place: a retry, a hot chain, or a native resume
+/// inside the same run directory must never leave the worker reading the
+/// previous attempt's packet.
+fn materialize_prompt_file(
+    inv: &Invocation,
+    packet: &str,
+    run_dir: &Path,
+    cwd: &Path,
+) -> Result<Option<String>> {
+    if !inv.prompt_in_file() {
+        return Ok(None);
+    }
+    let path = prompt_file_path(run_dir);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    crate::state::write_private_str_atomic(&absolute, packet)
+        .with_context(|| format!("writing worker packet file {}", absolute.display()))?;
+    Ok(Some(absolute.display().to_string()))
+}
+
+/// Build the command for a worker WITHOUT a built-in adapter, from the
+/// invocation template in its workers.yaml profile. This is what makes a
+/// third worker a pure-config addition: packet on stdin, in one argument, or in
+/// a run-directory file; args from the template, placeholders expanded without
+/// a shell.
+#[allow(clippy::too_many_arguments)]
+pub fn build_generic_command(
+    inv: &Invocation,
+    bin: &Path,
+    packet: &str,
+    run_dir: &Path,
+    cwd: &Path,
+    full_access: bool,
+    model: &str,
+    effort: &str,
+    images: &[String],
+) -> Result<Command> {
+    inv.validate_generic("generic worker")
+        .map_err(anyhow::Error::msg)?;
+    let prompt_file = materialize_prompt_file(inv, packet, run_dir, cwd)?;
+    let prompt_file = prompt_file.as_deref().unwrap_or_default();
+    // `{prompt_file}` is expanded BEFORE `{prompt}` for the same reason
+    // `{prompt}` comes last overall: once packet text is in the string, nothing
+    // may rescan it for placeholders.
+    let expand = |arg: &str, image: &str| -> String {
+        arg.replace("{run_dir}", &run_dir.display().to_string())
+            .replace("{model}", model)
+            .replace("{effort}", effort)
+            .replace("{image}", image)
+            .replace("{prompt_file}", prompt_file)
+            .replace("{prompt}", packet)
+    };
+    let mut cmd = Command::new(bin);
+    for a in &inv.args {
+        cmd.arg(expand(a, ""));
+    }
+    let access = if full_access {
+        &inv.full_access_args
+    } else {
+        &inv.sandbox_args
+    };
+    for a in access {
+        cmd.arg(expand(a, ""));
+    }
+    if explicit(model) {
+        for a in &inv.model_args {
+            cmd.arg(expand(a, ""));
+        }
+    }
+    if explicit(effort) {
+        for a in &inv.effort_args {
+            cmd.arg(expand(a, ""));
+        }
+    }
+    for img in images {
+        for a in &inv.image_args {
+            cmd.arg(expand(a, img));
+        }
+    }
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    Ok(cmd)
+}
+
+/// Build a generic worker's opt-in native resume command from the same binary
+/// and invocation profile as its fresh child. Placeholder expansion writes
+/// directly to `Command` argv, so the opaque session ref and prompt each retain
+/// their declared argument boundary without shell parsing.
+#[allow(clippy::too_many_arguments)]
+fn build_generic_resume_command(
+    inv: &Invocation,
+    bin: &Path,
+    packet: &str,
+    session_ref: &str,
+    run_dir: &Path,
+    cwd: &Path,
+    full_access: bool,
+    model: &str,
+    effort: &str,
+    images: &[String],
+) -> Result<Command> {
+    inv.validate_generic("generic worker")
+        .map_err(anyhow::Error::msg)?;
+    if session_ref.trim().is_empty() {
+        anyhow::bail!("generic native resume requires a non-empty session ref");
+    }
+    let session = inv
+        .session
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("generic worker has no native session contract"))?;
+    let prompt_file = materialize_prompt_file(inv, packet, run_dir, cwd)?;
+    let prompt_file = prompt_file.as_deref().unwrap_or_default();
+    let expand = |arg: &str, image: &str| -> String {
+        arg.replace("{run_dir}", &run_dir.display().to_string())
+            .replace("{model}", model)
+            .replace("{effort}", effort)
+            .replace("{image}", image)
+            .replace("{session}", session_ref)
+            .replace("{prompt_file}", prompt_file)
+            .replace("{prompt}", packet)
+    };
+    let mut cmd = Command::new(bin);
+    for arg in &session.resume_args {
+        cmd.arg(expand(arg, ""));
+    }
+    let access = if full_access {
+        &inv.full_access_args
+    } else {
+        &inv.sandbox_args
+    };
+    for arg in access {
+        cmd.arg(expand(arg, ""));
+    }
+    if explicit(model) {
+        for arg in &inv.model_args {
+            cmd.arg(expand(arg, ""));
+        }
+    }
+    if explicit(effort) {
+        for arg in &inv.effort_args {
+            cmd.arg(expand(arg, ""));
+        }
+    }
+    for image in images {
+        for arg in &inv.image_args {
+            cmd.arg(expand(arg, image));
+        }
+    }
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    Ok(cmd)
+}
+
+/// Build the command to RESUME an existing worker session (continue, not redo).
+/// claude: `-p --resume <id>`; codex: `exec resume <id> -` (prompt on stdin).
+/// Note: codex `resume` has no `--sandbox`/`--add-dir`; full-access bypasses the
+/// sandbox, and a sandboxed session inherits its original writable roots.
+#[allow(clippy::too_many_arguments)]
+fn build_resume_command(
+    worker_id: &str,
+    bin: &Path,
+    run_dir: &Path,
+    cwd: &Path,
+    full_access: bool,
+    model: &str,
+    images: &[String],
+    session: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(bin);
+    match worker_id {
+        "codex" => {
+            // `-C` belongs to `codex exec`, not its `resume` subcommand. Pin
+            // the agent/tool root before resuming so session history cannot
+            // restore a different repository as the effective workspace.
+            cmd.arg("exec").arg("-C").arg(cwd).arg("resume");
+            if full_access {
+                cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+            cmd.arg("--skip-git-repo-check");
+            if explicit(model) {
+                cmd.arg("-m").arg(model);
+            }
+            for img in images {
+                cmd.arg("-i").arg(img);
+            }
+            if let Some(id) = session {
+                cmd.arg(id);
+            }
+            cmd.arg("-"); // continuation prompt on stdin
+        }
+        "claude-code" => {
+            if full_access {
+                cmd.arg("-p").arg("--dangerously-skip-permissions");
+            } else {
+                cmd.arg("-p").arg("--permission-mode").arg("acceptEdits");
+            }
+            // Keep the live monitor working on resumed/chained sessions too.
+            cmd.arg("--output-format")
+                .arg("stream-json")
+                .arg("--verbose");
+            if let Some(id) = session {
+                cmd.arg("--resume").arg(id);
+            }
+            if explicit(model) {
+                cmd.arg("--model").arg(model);
+            }
+            cmd.arg("--add-dir").arg(run_dir);
+        }
+        _ => {}
+    }
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    cmd
+}
+
+/// Has the child exited, WITHOUT reaping it?
+///
+/// `try_wait` reaps, which frees the pid — and the pid is the process group id
+/// the teardown still needs. `WNOWAIT` leaves the child waitable so the group
+/// signal that follows still has a group to reach.
+#[cfg(unix)]
+fn exited_without_reaping(child: &std::process::Child) -> bool {
+    // `waitid`, not `waitpid`: WNOWAIT is a `waitid` option, and `waitpid`
+    // rejects it with EINVAL on both macOS and Linux. An independent review
+    // caught that — the first cut used `waitpid` and so reported "not exited"
+    // for every child, which silently turned the grace window into a fixed
+    // three-second wait.
+    //
+    // `waitid` returns 0 whether or not a child was found, so the answer is in
+    // `si_pid`: it stays 0 when nothing has exited yet.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    // SAFETY: `si_pid` is populated by the kernel for a WEXITED report.
+    unsafe { info.si_pid() != 0 }
+}
+
+#[cfg(not(unix))]
+fn exited_without_reaping(_child: &std::process::Child) -> bool {
+    false
+}
+
+/// How long a worker gets to stop on its own before Yardlet insists.
+///
+/// Long enough for an agent CLI to flush what it was writing, short enough that
+/// the operator's second Ctrl-C is not the one that finally works.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone)]
+pub struct WorkerOutcome {
+    pub exit_ok: bool,
+    /// Exact subprocess termination metadata. A signal has no exit code on
+    /// Unix; a normal exit has no signal.
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub timed_out: bool,
+    /// The operator stopped Yardlet, and this worker was taken down with it
+    /// rather than left holding the run directory (issue #107). Distinct from a
+    /// timeout: nothing was exceeded, the run was interrupted.
+    pub stopped: bool,
+    pub note: String,
+    /// Live public events can be shed under sink backpressure because exact raw
+    /// streams remain authoritative and must never stop draining.
+    pub public_events_dropped: bool,
+    /// Exact Codex thread created by this child process. Captured only from
+    /// that child's JSONL stdout; never inferred from global session files.
+    pub session_id: Option<String>,
+}
+
+fn valid_codex_thread_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn codex_thread_id_from_json_line(line: &[u8]) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if event.get("type").and_then(|value| value.as_str()) != Some("thread.started") {
+        return None;
+    }
+    event
+        .get("thread_id")
+        .and_then(|value| value.as_str())
+        .filter(|id| valid_codex_thread_id(id))
+        .map(str::to_string)
+}
+
+fn capture_codex_thread_id(
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+    captured: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    if captured.lock().is_ok_and(|guard| guard.is_some()) {
+        return;
+    }
+    pending.extend_from_slice(chunk);
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = pending.drain(..=newline).collect();
+        if let Some(id) = codex_thread_id_from_json_line(&line) {
+            if let Ok(mut guard) = captured.lock() {
+                *guard = Some(id);
+            }
+            pending.clear();
+            return;
+        }
+    }
+    // `thread.started` is a small leading event. Fail closed instead of
+    // retaining unbounded non-JSON output while waiting for it.
+    if pending.len() > 64 * 1024 {
+        pending.clear();
+    }
+}
+
+#[derive(Clone)]
+enum SessionCaptureRule {
+    CodexThread,
+    Prefixed(String),
+}
+
+fn session_capture_rule(
+    profile: &WorkerProfile,
+    stream: RawStreamKind,
+    resume: bool,
+) -> Option<SessionCaptureRule> {
+    if resume {
+        return None;
+    }
+    if profile.id == "codex" && stream == RawStreamKind::Stdout {
+        return Some(SessionCaptureRule::CodexThread);
+    }
+    if matches!(profile.id.as_str(), "codex" | "claude-code") {
+        return None;
+    }
+    let capture = &profile.invocation.session.as_ref()?.capture;
+    let selected_stream = match capture.stream.trim() {
+        "stdout" => RawStreamKind::Stdout,
+        "stderr" => RawStreamKind::Stderr,
+        _ => return None,
+    };
+    (selected_stream == stream).then(|| SessionCaptureRule::Prefixed(capture.prefix.clone()))
+}
+
+fn prefixed_session_ref_from_line(line: &[u8], prefix: &str) -> Option<String> {
+    let line = std::str::from_utf8(line)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    line.strip_prefix(prefix)
+        .map(str::trim)
+        .filter(|session_ref| !session_ref.is_empty())
+        .map(str::to_string)
+}
+
+fn capture_prefixed_session_ref(
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+    prefix: &str,
+    captured: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    if captured.lock().is_ok_and(|guard| guard.is_some()) {
+        return;
+    }
+    pending.extend_from_slice(chunk);
+    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = pending.drain(..=newline).collect();
+        if let Some(session_ref) = prefixed_session_ref_from_line(&line, prefix) {
+            if let Ok(mut guard) = captured.lock() {
+                *guard = Some(session_ref);
+            }
+            pending.clear();
+            return;
+        }
+    }
+    if pending.len() > 64 * 1024 {
+        pending.clear();
+    }
+}
+
+/// Spawn a worker with a sanitized environment, feeding the packet on stdin and
+/// capturing all output to `output_log`. Enforces a wall-clock timeout.
+///
+/// This is the only place Yardlet launches a worker. It uses the env produced by
+/// the zero-key guard; it never injects an AI provider API key.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn(
+    profile: &WorkerProfile,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    output_log: &Path,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    spawn_internal(
+        profile,
+        bin,
+        packet,
+        worker_run_dir,
+        cwd,
+        env,
+        output_log,
+        None,
+        None,
+        None,
+        timeout,
+        full_access,
+        images,
+        session,
+        resume,
+        writable_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub fn spawn_attempt(
+    profile: &WorkerProfile,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    capture: &AttemptCapture,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    spawn_attempt_with_sink(
+        profile,
+        bin,
+        packet,
+        worker_run_dir,
+        cwd,
+        env,
+        capture,
+        None,
+        timeout,
+        full_access,
+        images,
+        session,
+        resume,
+        writable_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub fn spawn_attempt_with_sink(
+    profile: &WorkerProfile,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    capture: &AttemptCapture,
+    event_sink: Option<AttemptEventSink>,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    spawn_internal(
+        profile,
+        bin,
+        packet,
+        worker_run_dir,
+        cwd,
+        env,
+        &capture.combined_log,
+        Some(capture),
+        event_sink,
+        None,
+        timeout,
+        full_access,
+        images,
+        session,
+        resume,
+        writable_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_resolved_attempt(
+    profile: &WorkerProfile,
+    selection: &ResolvedWorkerSelection,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    capture: &AttemptCapture,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    spawn_resolved_attempt_with_sink(
+        profile,
+        selection,
+        bin,
+        packet,
+        worker_run_dir,
+        cwd,
+        env,
+        capture,
+        None,
+        timeout,
+        full_access,
+        images,
+        session,
+        resume,
+        writable_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_resolved_attempt_with_sink(
+    profile: &WorkerProfile,
+    selection: &ResolvedWorkerSelection,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    capture: &AttemptCapture,
+    event_sink: Option<AttemptEventSink>,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    spawn_internal(
+        profile,
+        bin,
+        packet,
+        worker_run_dir,
+        cwd,
+        env,
+        &capture.combined_log,
+        Some(capture),
+        event_sink,
+        Some(selection),
+        timeout,
+        full_access,
+        images,
+        session,
+        resume,
+        writable_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_internal(
+    profile: &WorkerProfile,
+    bin: &Path,
+    packet: &str,
+    worker_run_dir: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    output_log: &Path,
+    attempt_capture: Option<&AttemptCapture>,
+    event_sink: Option<AttemptEventSink>,
+    selection: Option<&ResolvedWorkerSelection>,
+    timeout: Duration,
+    full_access: bool,
+    images: &[String],
+    session: Option<&str>,
+    resume: bool,
+    writable_roots: &[PathBuf],
+) -> Result<WorkerOutcome> {
+    use std::io::{Read, Write};
+
+    // `worker_run_dir` may be a staging directory inside an isolated worktree,
+    // while `output_log` and worker.pid remain owned by the main Yardlet
+    // process in the canonical run directory.
+    let control_run_dir = output_log.parent().unwrap_or(cwd);
+    guard::invocation_contract(profile).map_err(anyhow::Error::msg)?;
+    // Defensive re-check with the access this spawn actually uses: routing
+    // already gated on the workspace's requested access, but a generic worker
+    // must never start sandboxed on an unverifiable sandbox claim (issue #123).
+    let spawn_access = if full_access { "full" } else { "sandboxed" };
+    guard::access_contract(profile, spawn_access).map_err(anyhow::Error::msg)?;
+    let packet_on_stdin = matches!(profile.id.as_str(), "codex" | "claude-code")
+        || profile.invocation.prompt_on_stdin();
+    let mut cmd = if resume {
+        match profile.id.as_str() {
+            "codex" | "claude-code" => build_resume_command(
+                &profile.id,
+                bin,
+                worker_run_dir,
+                cwd,
+                full_access,
+                &profile.model,
+                images,
+                session,
+            ),
+            _ => build_generic_resume_command(
+                &profile.invocation,
+                bin,
+                packet,
+                session.ok_or_else(|| {
+                    anyhow::anyhow!("generic native resume requires an exact session ref")
+                })?,
+                worker_run_dir,
+                cwd,
+                full_access,
+                &profile.model,
+                &profile.effort,
+                images,
+            )?,
+        }
+    } else {
+        let mut c = match profile.id.as_str() {
+            // Built-in adapters with verified flags.
+            "codex" | "claude-code" => build_command(
+                &profile.id,
+                bin,
+                worker_run_dir,
+                cwd,
+                full_access,
+                &profile.model,
+                &profile.effort,
+                images,
+                writable_roots,
+            ),
+            // Anything else: the profile's own invocation template.
+            _ => build_generic_command(
+                &profile.invocation,
+                bin,
+                packet,
+                worker_run_dir,
+                cwd,
+                full_access,
+                &profile.model,
+                &profile.effort,
+                images,
+            )?,
+        };
+        // Set a stable session id on a fresh claude run so a transient failure
+        // can resume the same conversation instead of redoing the work.
+        if profile.id == "claude-code" {
+            if let Some(id) = session {
+                c.arg("--session-id").arg(id);
+            }
+        }
+        c
+    };
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // Keep environment-based adapters aligned with the OS cwd too. This is
+    // not a security boundary, but avoids a stale inherited PWD pointing
+    // relative worker operations at the Yardlet parent workspace.
+    cmd.env("PWD", cwd);
+    if packet_on_stdin {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // A worker must outlive the terminal that started it. Yardlet's contract is
+    // that quitting the orchestrator does not kill workers — the next start
+    // ADOPTS a live one — and that held for `q` but not for the window closing:
+    // a plain spawn inherits Yardlet's process group, which is the controlling
+    // pty's foreground group, so pty teardown SIGHUPs the worker too and a whole
+    // reasoning pass is lost (issue #52). Leading its own group detaches it from
+    // that signal. Safe here because all three of its stdio ends are pipes, so
+    // it never reads or writes the controlling terminal (no SIGTTIN/SIGTTOU).
+    // Deliberate termination is unaffected: the stop path writes the `cancelled`
+    // marker and kills `worker.pid` explicitly.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let attempt_raw_files = if let Some(capture) = attempt_capture {
+        for path in [&capture.stdout_log, &capture.stderr_log] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            if path.exists() {
+                anyhow::bail!("attempt raw stream already exists: {}", path.display());
+            }
+        }
+        let stdout = crate::state::create_private_file(&capture.stdout_log)?;
+        let stderr = match crate::state::create_private_file(&capture.stderr_log) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_file(&capture.stdout_log);
+                return Err(error);
+            }
+        };
+        Some((stdout, stderr))
+    } else {
+        None
+    };
+
+    let provenance_identity = attempt_capture
+        .map(|capture| -> Result<(String, String)> {
+            let run_id = control_run_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("worker control directory has no run identity"))?;
+            let attempt_id = capture
+                .stdout_log
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("attempt capture path has no attempt identity"))?;
+            Ok((run_id.to_string(), attempt_id.to_string()))
+        })
+        .transpose()?;
+    let provenance_paths = {
+        let canonical = control_run_dir.join(WORKER_PROCESS_PROVENANCE_FILE);
+        let worker = worker_run_dir.join(WORKER_PROCESS_PROVENANCE_FILE);
+        if worker == canonical {
+            vec![canonical]
+        } else {
+            vec![canonical, worker]
+        }
+    };
+    if let (Some((run_id, attempt_id)), Some(selection)) = (provenance_identity.as_ref(), selection)
+    {
+        if selection.worker_id != profile.id || selection.model != profile.model {
+            anyhow::bail!(
+                "dispatch selection/profile mismatch before spawn: selection={}/{} profile={}/{}",
+                selection.worker_id,
+                selection.model,
+                profile.id,
+                profile.model
+            );
+        }
+        let prepared = WorkerProcessProvenance {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            attempt_id: attempt_id.clone(),
+            worker_id: selection.worker_id.clone(),
+            model: selection.model.clone(),
+            fallback_enabled: selection.fallback_enabled,
+            routing_provenance: selection.routing_provenance.clone(),
+            pid: 0,
+            process_start_marker: String::new(),
+            state: "prepared".to_string(),
+            completed_at: None,
+        };
+        for path in &provenance_paths {
+            crate::state::save_private_yaml_atomic(path, &prepared)?;
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning worker '{}'", bin.display()))?;
+    // Tracked so an emergency exit can still take it down: `process::exit` runs
+    // no destructors, and a worker leads its own group, so nothing else could.
+    // RAII, so every return path below untracks — including the error ones that
+    // a hand-placed call missed.
+    let _tracked = crate::signals::TrackedWorker::new(child.id());
+
+    let provenance_result = (|| -> Result<()> {
+        let Some((run_id, attempt_id)) = provenance_identity.as_ref() else {
+            return Ok(());
+        };
+        let process_start_marker = process_start_marker(child.id())
+            .ok_or_else(|| anyhow::anyhow!("could not observe spawned worker process identity"))?;
+        let selection = selection
+            .cloned()
+            .unwrap_or_else(|| ResolvedWorkerSelection {
+                worker_id: profile.id.clone(),
+                model: profile.model.clone(),
+                fallback_enabled: false,
+                routing_provenance: RoutingProvenance::default(),
+            });
+        let provenance = WorkerProcessProvenance {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            attempt_id: attempt_id.clone(),
+            worker_id: selection.worker_id,
+            model: selection.model,
+            fallback_enabled: selection.fallback_enabled,
+            routing_provenance: selection.routing_provenance,
+            pid: child.id(),
+            process_start_marker,
+            state: "running".to_string(),
+            completed_at: None,
+        };
+        for path in &provenance_paths {
+            crate::state::save_private_yaml_atomic(path, &provenance)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = provenance_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(mut provenance) = load_worker_process_provenance(control_run_dir) {
+            provenance.state = "spawn_failed".to_string();
+            provenance.completed_at = Some(chrono::Local::now().to_rfc3339());
+            for path in &provenance_paths {
+                let _ = crate::state::save_private_yaml_atomic(path, &provenance);
+            }
+        }
+        return Err(error).context("recording run-owned worker process provenance");
+    }
+
+    // Keep the legacy PID projection for monitors. Redirect signaling verifies
+    // the separate run-owned provenance record and never trusts this file.
+    let pid_path = control_run_dir.join("worker.pid");
+    if let Err(error) = crate::state::write_str_atomic(&pid_path, &child.id().to_string()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(mut provenance) = load_worker_process_provenance(control_run_dir) {
+            provenance.state = "pid_projection_failed".to_string();
+            provenance.completed_at = Some(chrono::Local::now().to_rfc3339());
+            for path in &provenance_paths {
+                let _ = crate::state::save_private_yaml_atomic(path, &provenance);
+            }
+        }
+        return Err(error).context("recording worker PID projection");
+    }
+
+    if packet_on_stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Best-effort: a worker that ignores stdin will simply not receive it.
+            let _ = stdin.write_all(packet.as_bytes());
+        }
+    }
+
+    // Stream BOTH stdout and stderr to the log as they arrive, so a Run Monitor
+    // can tail the worker live. Worker CLIs often route progress to stderr or
+    // block-buffer stdout on a pipe, so capturing stderr live (not only after
+    // exit) is what keeps the monitor non-empty during a run.
+    // Failing here must not leave the worker running. These `?`s returned with a
+    // live child that nothing else could reach — an independent review made
+    // `worker-output.log` a directory and watched Yardlet exit 1 while its worker
+    // kept going, which is the orphan #107 is about arriving through an error
+    // path instead of a signal.
+    let open_log = || -> Result<Option<std::fs::File>> {
+        if attempt_capture.is_some() {
+            if let Some(parent) = output_log.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            Ok(Some(crate::state::append_private_file(output_log)?))
+        } else {
+            Ok(std::fs::File::create(output_log).ok())
+        }
+    };
+    let combined = match open_log() {
+        Ok(combined) => combined,
+        Err(error) => {
+            terminate_worker_tree(child.id(), Signal::Kill);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let log_file = std::sync::Arc::new(std::sync::Mutex::new(combined));
+    let captured_session = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (stdout_raw, stderr_raw) = match attempt_raw_files {
+        Some((stdout, stderr)) => (
+            Some(std::sync::Arc::new(std::sync::Mutex::new(stdout))),
+            Some(std::sync::Arc::new(std::sync::Mutex::new(stderr))),
+        ),
+        None => (None, None),
+    };
+    type RawSink = Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>;
+    let attempt_id = attempt_capture.and_then(|capture| {
+        capture
+            .stdout_log
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+    });
+    type StreamSource = (
+        Box<dyn Read + Send>,
+        Option<SessionCaptureRule>,
+        RawSink,
+        RawStreamKind,
+        String,
+    );
+    let mut sources: Vec<StreamSource> = Vec::new();
+    if let Some(o) = child.stdout.take() {
+        sources.push((
+            Box::new(o),
+            session_capture_rule(profile, RawStreamKind::Stdout, resume),
+            stdout_raw,
+            RawStreamKind::Stdout,
+            format!("raw_{}_stdout", attempt_id.unwrap_or("unknown")),
+        ));
+    }
+    if let Some(e) = child.stderr.take() {
+        sources.push((
+            Box::new(e),
+            session_capture_rule(profile, RawStreamKind::Stderr, resume),
+            stderr_raw,
+            RawStreamKind::Stderr,
+            format!("raw_{}_stderr", attempt_id.unwrap_or("unknown")),
+        ));
+    }
+    const PUBLIC_EVENT_QUEUE_CAPACITY: usize = 64;
+    let public_events_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_public_publisher = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reader_event_sink, event_publisher) = match event_sink {
+        Some(sink) if profile.id == "codex" => {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<NormalizedWorkerEvent>(PUBLIC_EVENT_QUEUE_CAPACITY);
+            let dropped = std::sync::Arc::clone(&public_events_dropped);
+            let publisher_dropped = std::sync::Arc::clone(&public_events_dropped);
+            let publisher_stop = std::sync::Arc::clone(&stop_public_publisher);
+            let reader_sink: AttemptEventSink =
+                std::sync::Arc::new(move |event| match sender.try_send(event) {
+                    Ok(()) => Ok(()),
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        Err("public event publisher disconnected".to_string())
+                    }
+                });
+            let publisher = thread::spawn(move || -> std::result::Result<(), String> {
+                while let Ok(event) = receiver.recv() {
+                    if publisher_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        publisher_dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    sink(event)?;
+                }
+                Ok(())
+            });
+            (Some(reader_sink), Some(publisher))
+        }
+        Some(sink) => (Some(sink), None),
+        None => (None, None),
+    };
+    let readers: Vec<_> = sources
+        .into_iter()
+        .map(
+            |(mut src, capture_session, raw_sink, stream, artifact_id)| {
+                let log = std::sync::Arc::clone(&log_file);
+                let captured = std::sync::Arc::clone(&captured_session);
+                let worker_id = profile.id.clone();
+                let output_format =
+                    resolve_output_format(&profile.id, profile.invocation.output_format.as_deref());
+                let event_sink = reader_event_sink.clone();
+                thread::spawn(move || -> std::io::Result<()> {
+                    let mut buf = [0u8; 4096];
+                    let mut pending = Vec::new();
+                    let mut log_pending = Vec::new();
+                    let mut public_pending = Vec::new();
+                    let mut public_consumed = 0_u64;
+                    loop {
+                        match src.read(&mut buf) {
+                            Ok(0) => {
+                                if !pending.is_empty() {
+                                    let session_ref = match &capture_session {
+                                        Some(SessionCaptureRule::CodexThread) => {
+                                            codex_thread_id_from_json_line(&pending)
+                                        }
+                                        Some(SessionCaptureRule::Prefixed(prefix)) => {
+                                            prefixed_session_ref_from_line(&pending, prefix)
+                                        }
+                                        None => None,
+                                    };
+                                    if let Some(session_ref) = session_ref {
+                                        if let Ok(mut guard) = captured.lock() {
+                                            *guard = Some(session_ref);
+                                        }
+                                    }
+                                }
+                                if let Some(sink) = &event_sink {
+                                    publish_complete_public_lines(
+                                        output_format,
+                                        stream,
+                                        &artifact_id,
+                                        &mut public_pending,
+                                        &mut public_consumed,
+                                        true,
+                                        sink,
+                                    )?;
+                                }
+                                append_public_output(
+                                    &worker_id,
+                                    stream,
+                                    &[],
+                                    &mut log_pending,
+                                    true,
+                                    &log,
+                                );
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                            Ok(n) => {
+                                match &capture_session {
+                                    Some(SessionCaptureRule::CodexThread) => {
+                                        capture_codex_thread_id(&mut pending, &buf[..n], &captured);
+                                    }
+                                    Some(SessionCaptureRule::Prefixed(prefix)) => {
+                                        capture_prefixed_session_ref(
+                                            &mut pending,
+                                            &buf[..n],
+                                            prefix,
+                                            &captured,
+                                        );
+                                    }
+                                    None => {}
+                                }
+                                if let Some(raw_sink) = &raw_sink {
+                                    if let Ok(mut raw) = raw_sink.lock() {
+                                        raw.write_all(&buf[..n])?;
+                                        raw.flush()?;
+                                    } else {
+                                        return Err(std::io::Error::other(
+                                            "attempt raw stream lock poisoned",
+                                        ));
+                                    }
+                                }
+                                append_public_output(
+                                    &worker_id,
+                                    stream,
+                                    &buf[..n],
+                                    &mut log_pending,
+                                    false,
+                                    &log,
+                                );
+                                if let Some(sink) = &event_sink {
+                                    public_pending.extend_from_slice(&buf[..n]);
+                                    publish_complete_public_lines(
+                                        output_format,
+                                        stream,
+                                        &artifact_id,
+                                        &mut public_pending,
+                                        &mut public_consumed,
+                                        false,
+                                        sink,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .collect();
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let mut stopped = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if crate::signals::stop_requested() {
+            // The operator asked THIS process to stop, and the worker leads its
+            // own process group so nothing else can reach it (issue #107). Ask
+            // first, then insist: a worker given SIGTERM can close its own files
+            // and stop cleanly, which a SIGKILL denies it.
+            terminate_worker_tree(child.id(), Signal::Term);
+            let grace = Instant::now();
+            while grace.elapsed() < STOP_GRACE && !exited_without_reaping(&child) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            // ALWAYS group-kill, even when the direct child has already gone. A
+            // launcher that handles SIGTERM exits while the agent CLI it spawned
+            // ignores it and keeps the inherited pipe ends open — the grandchild
+            // survives and the reader joins below never see EOF, so this function
+            // hangs. That is the same shape as #52, reached through the stop path.
+            //
+            // Safe here precisely because the grace loop does not reap: an
+            // unreaped child still holds its pid, so `-pid` is still this group
+            // and cannot be a recycled one.
+            terminate_worker_tree(child.id(), Signal::Kill);
+            let _ = child.kill();
+            stopped = true;
+            break child.wait()?;
+        }
+        if start.elapsed() >= timeout {
+            // Kill the GROUP, not just the direct child. A worker profile whose
+            // invocation is a launcher (`bash wrapper.sh`, `npx`, `sh -c` — the
+            // shape this repo's own fixtures use) puts the real agent CLI in a
+            // grandchild, and killing only the launcher leaves it running and
+            // billing while the task is already requeued. It also still holds
+            // the inherited pipe write ends, so the reader joins below would
+            // never see EOF and this function would hang (issue #52).
+            terminate_worker_tree(child.id(), Signal::Kill);
+            let _ = child.kill();
+            timed_out = true;
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let mut reader_error = None;
+    for reader in readers {
+        match reader.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                reader_error.get_or_insert(error);
+            }
+            Err(_) => {
+                reader_error.get_or_insert_with(|| {
+                    std::io::Error::other("worker stream reader thread panicked")
+                });
+            }
+        }
+    }
+    // Preserve the bounded completion path only after try_send actually shed
+    // an event. Otherwise disconnect the sender and let the publisher drain
+    // every accepted tail event before join.
+    if public_events_dropped.load(std::sync::atomic::Ordering::Relaxed) {
+        stop_public_publisher.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(reader_event_sink);
+    if let Some(publisher) = event_publisher {
+        match publisher.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                reader_error.get_or_insert_with(|| std::io::Error::other(error));
+            }
+            Err(_) => {
+                reader_error.get_or_insert_with(|| {
+                    std::io::Error::other("public event publisher thread panicked")
+                });
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    if let Ok(mut provenance) = load_worker_process_provenance(control_run_dir) {
+        provenance.state = "exited".to_string();
+        provenance.completed_at = Some(chrono::Local::now().to_rfc3339());
+        for (index, path) in provenance_paths.iter().enumerate() {
+            // The canonical receipt must survive. The worker-side projection is
+            // updated only while its staging run directory still exists: a
+            // worker deleting that directory is an import failure signal, and
+            // receipt finalization must not recreate it and mask the failure.
+            if index == 0 || path.parent().is_some_and(Path::is_dir) {
+                let _ = crate::state::save_private_yaml_atomic(path, &provenance);
+            }
+        }
+    }
+    if let Some(error) = reader_error {
+        return Err(error).context("preserving attempt raw stream");
+    }
+    let session_id = captured_session
+        .lock()
+        .ok()
+        .and_then(|captured| captured.clone());
+
+    // A worker that finished in the same instant the operator interrupted still
+    // belongs to an interrupted run: whatever comes next — integration, a commit,
+    // the next task — is what the stop was asking Yardlet not to do. The loop
+    // checks `try_wait` before the flag, so without this a fast worker (or one
+    // that exits between spawn and the first poll) wins the race and the task can
+    // land Done despite the Ctrl-C.
+    let stopped = stopped || crate::signals::stop_requested();
+
+    let exit_code = status.code();
+    #[cfg(unix)]
+    let exit_signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let exit_signal = None;
+
+    Ok(WorkerOutcome {
+        exit_ok: status.success() && !timed_out && !stopped,
+        exit_code,
+        exit_signal,
+        timed_out,
+        stopped,
+        session_id,
+        public_events_dropped: public_events_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        note: if stopped {
+            "worker stopped with Yardlet at the operator's request".to_string()
+        } else if timed_out {
+            "worker exceeded wall-clock limit and was stopped".to_string()
+        } else {
+            format!("worker exited (success={})", status.success())
+        },
+    })
+}
+
+/// The packet file path inside a run directory.
+pub fn packet_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("task-packet.md")
+}
+
+// ---- model/effort preset discovery -----------------------------------------
+//
+// Presets stay in sync with the CLIs themselves, no hand-maintained id lists:
+//   - codex: the CLI maintains ~/.codex/models_cache.json with the models
+//     available to THIS account, including each model's supported reasoning
+//     efforts. That file is the authoritative machine-local source.
+//   - claude: model aliases are the CLI's documented stable set; effort
+//     levels are parsed out of `claude --help` (a complete enum in the text).
+// Everything degrades to a sensible static fallback, and Settings always
+// allows typing an exact id.
+
+/// Claude Code model presets ("" = CLI default). The aliases are the CLI's
+/// stable documented set; full model ids can still be typed.
+pub fn known_claude_models() -> Vec<String> {
+    ["", "fable", "opus", "sonnet", "haiku"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Claude Code effort presets, parsed live from `claude --help`.
+pub fn known_claude_efforts() -> Vec<String> {
+    let help = std::process::Command::new("claude")
+        .arg("--help")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let mut out = vec![String::new()];
+    out.extend(parse_claude_efforts(&help).unwrap_or_else(|| {
+        ["low", "medium", "high"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }));
+    out
+}
+
+/// `--effort <level>  ... (low, medium, high, xhigh, max)` -> the level list.
+fn parse_claude_efforts(help: &str) -> Option<Vec<String>> {
+    let after = help.split("--effort").nth(1)?;
+    let inner = after.split('(').nth(1)?.split(')').next()?;
+    let levels: Vec<String> = inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() < 12 && s.chars().all(|c| c.is_ascii_alphabetic()))
+        .collect();
+    (!levels.is_empty()).then_some(levels)
+}
+
+/// Codex model presets ("" = CLI default), read from the CLI's own
+/// models cache of what this account can use.
+pub fn known_codex_models() -> Vec<String> {
+    let mut out = vec![String::new()];
+    if let Some((models, _)) = read_codex_models_cache() {
+        out.extend(models);
+    }
+    if out.len() == 1 {
+        // No cache yet (codex never run on this machine): configured default.
+        if let Some(m) = codex_config_default_model() {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Codex effort presets ("" = CLI default), from the models cache (the union
+/// across listed models).
+pub fn known_codex_efforts() -> Vec<String> {
+    let mut out = vec![String::new()];
+    match read_codex_models_cache() {
+        Some((_, efforts)) if !efforts.is_empty() => out.extend(efforts),
+        _ => out.extend(["low", "medium", "high"].iter().map(|s| s.to_string())),
+    }
+    out
+}
+
+/// Parse ~/.codex/models_cache.json into (listed model slugs, effort union).
+fn read_codex_models_cache() -> Option<(Vec<String>, Vec<String>)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let raw = std::fs::read_to_string(home.join(".codex/models_cache.json")).ok()?;
+    parse_codex_models_cache(&raw)
+}
+
+fn parse_codex_models_cache(raw: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let mut models = Vec::new();
+    let mut efforts: Vec<String> = Vec::new();
+    for m in v.get("models")?.as_array()? {
+        // Hidden entries (e.g. internal review models) are not user choices.
+        if m.get("visibility").and_then(|x| x.as_str()) != Some("list") {
+            continue;
+        }
+        if let Some(slug) = m.get("slug").and_then(|x| x.as_str()) {
+            if !slug.is_empty() && !models.iter().any(|s| s == slug) {
+                models.push(slug.to_string());
+            }
+        }
+        if let Some(levels) = m
+            .get("supported_reasoning_levels")
+            .and_then(|x| x.as_array())
+        {
+            for l in levels {
+                if let Some(e) = l.get("effort").and_then(|x| x.as_str()) {
+                    if !efforts.iter().any(|s| s == e) {
+                        efforts.push(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Some((models, efforts))
+}
+
+fn codex_config_default_model() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let cfg = std::fs::read_to_string(home.join(".codex/config.toml")).ok()?;
+    cfg.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("model")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|m| !m.is_empty())
+    })
+}
+
+/// Which signal [`terminate_worker_tree`] sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// Ask the worker to stop. What the operator's stop and the redirect send.
+    Term,
+    /// Take it down now. What a wall-clock timeout sends.
+    Kill,
+}
+
+#[cfg(unix)]
+impl Signal {
+    fn number(self) -> libc::c_int {
+        match self {
+            Self::Term => libc::SIGTERM,
+            Self::Kill => libc::SIGKILL,
+        }
+    }
+}
+
+/// Terminate a worker and everything it spawned.
+///
+/// A worker leads its own process group (issue #52), so its pgid equals its pid
+/// and a negative target reaches the whole tree. Killing only the direct child
+/// leaves a launcher's grandchild — the actual agent CLI — running after the
+/// task has already been requeued, which is both a runaway process and a second
+/// writer into the same run directory.
+///
+/// This mirrors `kill_validation_child`, which has group-killed since
+/// validation children were first put in their own group.
+///
+/// Returns whether the group signal was delivered. Callers keep their existing
+/// direct kill as the backstop for a worker that is not its own group leader —
+/// one adopted from a version before #52, or a platform without process groups.
+#[cfg(unix)]
+pub fn terminate_worker_tree(pid: u32, signal: Signal) -> bool {
+    // Signalling a group targets pgid == pid, which exists only while that pid
+    // is its group's leader. A zero pid would mean the CALLER's own group, so it
+    // must never reach the syscall.
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    // The syscall, not `Command::new("kill")`: the negative pid a group signal
+    // needs is ambiguous on a command line, and Linux's `kill` reads `-123`
+    // after a signal flag as another option rather than a target. That parsed
+    // fine on macOS and failed on Linux, which is a bad way to discover that
+    // teardown silently stopped reaching the tree.
+    unsafe { libc::kill(-pid, signal.number()) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn terminate_worker_tree(_pid: u32, _signal: Signal) -> bool {
+    // No process groups to signal; callers fall back to their direct kill.
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A fully loaded machine (full cargo test plus external load) can stall
+    // fork/exec and scheduling of these fixtures' fake workers for many
+    // seconds, and a ceiling hit kills the child mid-output: exit_ok flips
+    // false and the asserted stream truncates. The fakes exit immediately on
+    // their own, so this bound only binds when a child genuinely hangs; an
+    // unloaded run never waits anywhere near this long.
+    #[cfg(unix)]
+    const LOAD_TOLERANT_WORKER_CEILING: Duration = Duration::from_secs(120);
+
+    #[test]
+    fn provider_refusal_classification_is_resultless_profile_scoped_and_span_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-provider-refusal-classifier-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("worker-output.log");
+        std::fs::write(
+            &log,
+            "old request refused\ncurrent PROVIDER DECLINED response\nfuture request refused\n",
+        )
+        .unwrap();
+        let mut profile: WorkerProfile = crate::yaml::from_str(
+            "id: fixture\nprovider_response_refusal_patterns: ['provider declined']\ninvocation: {command: fixture}\n",
+        )
+        .unwrap();
+        let current = WorkerOutputLogSpan {
+            path: "worker-output.log".into(),
+            byte_start: "old request refused\n".len() as u64,
+            byte_end: "old request refused\ncurrent PROVIDER DECLINED response\n".len() as u64,
+        };
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &current)
+                .unwrap(),
+            Some(OutputContractCause::ProviderResponseRefused)
+        );
+
+        profile.provider_response_refusal_patterns = vec!["request refused".into()];
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &current)
+                .unwrap(),
+            None,
+            "matches before and after the current attempt span must be ignored"
+        );
+
+        profile.provider_response_refusal_patterns = vec!["provider declined".into()];
+        std::fs::write(root.join("result.json"), "{}\n").unwrap();
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &current)
+                .unwrap(),
+            None,
+            "a present result disables refusal classification"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_refusal_classification_rejects_invalid_spans() {
+        let root =
+            std::env::temp_dir().join(format!("yard-provider-refusal-span-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("worker-output.log");
+        std::fs::write(&log, "provider declined\n").unwrap();
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: fixture\nprovider_response_refusal_patterns: ['provider declined']\ninvocation: {command: fixture}\n",
+        )
+        .unwrap();
+        for span in [
+            // Inverted span.
+            WorkerOutputLogSpan {
+                path: "worker-output.log".into(),
+                byte_start: 10,
+                byte_end: 9,
+            },
+            // Span running past the end of the file.
+            WorkerOutputLogSpan {
+                path: "worker-output.log".into(),
+                byte_start: 0,
+                byte_end: MAX_OUTPUT_CONTRACT_SCAN_BYTES + 1,
+            },
+        ] {
+            assert!(classify_output_contract_cause(
+                &profile,
+                &root.join("result.json"),
+                &log,
+                &span
+            )
+            .is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Regression: a real attempt log is far larger than the scan budget. The
+    /// span must be scanned from its tail rather than rejected, or no live run
+    /// is ever classified.
+    #[test]
+    fn classification_scans_the_tail_of_an_oversized_span() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-output-contract-oversized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("worker-output.log");
+        let filler = "x".repeat(MAX_OUTPUT_CONTRACT_SCAN_BYTES as usize + 4096);
+        std::fs::write(&log, format!("{filler}\nprovider declined\n")).unwrap();
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: fixture\nprovider_response_refusal_patterns: ['provider declined']\ninvocation: {command: fixture}\n",
+        )
+        .unwrap();
+        let span = WorkerOutputLogSpan {
+            path: "worker-output.log".into(),
+            byte_start: 0,
+            byte_end: std::fs::metadata(&log).unwrap().len(),
+        };
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &span)
+                .unwrap(),
+            Some(OutputContractCause::ProviderResponseRefused)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Issue #38: the worker ended its turn with a background task still
+    /// running, so the non-interactive session tore down before result.json was
+    /// written. The teardown markers are structural stream events.
+    #[test]
+    fn classifies_background_task_deferral_from_teardown_markers() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-output-contract-deferral-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("worker-output.log");
+        // Verbatim shape of the teardown events observed in the runs cited by #38.
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"bdtea3zev\",\
+             \"patch\":{\"status\":\"killed\",\"end_time\":1784816678419}}\n\
+             {\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"bdtea3zev\",\
+             \"status\":\"stopped\",\"output_file\":\"\",\"summary\":\"Run full cargo test\"}\n",
+        )
+        .unwrap();
+        let profile: WorkerProfile =
+            crate::yaml::from_str("id: claude-code\ninvocation: {command: claude}\n").unwrap();
+        assert_eq!(
+            profile.background_deferral_patterns,
+            crate::schemas::default_background_deferral_patterns(),
+            "an existing workers.yaml without the key must still be covered"
+        );
+        let span = WorkerOutputLogSpan {
+            path: "worker-output.log".into(),
+            byte_start: 0,
+            byte_end: std::fs::metadata(&log).unwrap().len(),
+        };
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &span)
+                .unwrap(),
+            Some(OutputContractCause::WorkerDeferredToBackgroundTask)
+        );
+
+        // A worker family that never emits those events is unaffected.
+        std::fs::write(&log, "codex finished without writing a result\n").unwrap();
+        let span = WorkerOutputLogSpan {
+            path: "worker-output.log".into(),
+            byte_start: 0,
+            byte_end: std::fs::metadata(&log).unwrap().len(),
+        };
+        assert_eq!(
+            classify_output_contract_cause(&profile, &root.join("result.json"), &log, &span)
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn effective_profile_honors_pin_unless_task_is_explicit() {
+        let base: WorkerProfile = crate::yaml::from_str(
+            "id: claude-code\nmodel: opus\neffort: high\ninvocation: { command: claude }",
+        )
+        .unwrap();
+        // "auto" / empty per-task values keep the profile's pin.
+        let p = effective_profile(&base, "auto", "");
+        assert_eq!(p.model, "opus");
+        assert_eq!(p.effort, "high");
+        let p = effective_profile(&base, "AUTO", "auto");
+        assert_eq!(p.model, "opus");
+        assert_eq!(p.effort, "high");
+        // An explicit per-task value overrides the pin.
+        let p = effective_profile(&base, "sonnet", "low");
+        assert_eq!(p.model, "sonnet");
+        assert_eq!(p.effort, "low");
+        // No profile pin + "auto" task = empty, so build_command later omits the
+        // flag and the worker CLI picks its own default.
+        let bare: WorkerProfile =
+            crate::yaml::from_str("id: codex\ninvocation: { command: codex }").unwrap();
+        let p = effective_profile(&bare, "auto", "auto");
+        assert!(p.model.is_empty());
+        assert!(p.effort.is_empty());
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn generic_adapter_builds_from_the_invocation_template() {
+        let inv: Invocation = crate::yaml::from_str(
+            r#"
+command: mytool
+supports_noninteractive: true
+output_contract: files
+args: ["run", "--json", "--out", "{run_dir}"]
+sandbox_args: ["--sandbox"]
+full_access_args: ["--yolo"]
+model_args: ["--model", "{model}"]
+effort_args: ["--effort", "{effort}"]
+image_args: ["-i", "{image}"]
+"#,
+        )
+        .unwrap();
+        let (bin, run, cwd) = (Path::new("mytool"), Path::new("/tmp/r"), Path::new("/tmp"));
+
+        let sandboxed = args_of(
+            &build_generic_command(
+                &inv,
+                bin,
+                "packet",
+                run,
+                cwd,
+                false,
+                "m-1",
+                "high",
+                &["a.png".to_string()],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            sandboxed,
+            vec![
+                "run",
+                "--json",
+                "--out",
+                "/tmp/r",
+                "--sandbox",
+                "--model",
+                "m-1",
+                "--effort",
+                "high",
+                "-i",
+                "a.png",
+            ]
+        );
+
+        // Full access swaps the access args; auto model/effort add nothing.
+        let full = args_of(
+            &build_generic_command(&inv, bin, "packet", run, cwd, true, "auto", "", &[]).unwrap(),
+        );
+        assert_eq!(full, vec!["run", "--json", "--out", "/tmp/r", "--yolo"]);
+    }
+
+    #[test]
+    fn generic_file_transport_materializes_the_packet_and_passes_its_absolute_path() {
+        let inv: Invocation = crate::yaml::from_str(
+            r#"
+command: mytool
+supports_noninteractive: true
+output_contract: files
+prompt_transport: file
+args: ["run", "--packet", "{prompt_file}", "--out", "{run_dir}"]
+sandbox_args: ["--sandbox"]
+session:
+  capture: {stream: stdout, prefix: "SESSION_REF="}
+  resume_args: ["resume", "--session", "{session}", "--packet", "{prompt_file}"]
+"#,
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "yard-file-transport-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run = root.join("run-1");
+        std::fs::create_dir_all(&run).unwrap();
+
+        let fresh = args_of(
+            &build_generic_command(
+                &inv,
+                Path::new("mytool"),
+                "fresh packet body",
+                &run,
+                &root,
+                false,
+                "auto",
+                "",
+                &[],
+            )
+            .unwrap(),
+        );
+        let expected = prompt_file_path(&run).display().to_string();
+        assert_eq!(
+            fresh,
+            vec![
+                "run",
+                "--packet",
+                &expected,
+                "--out",
+                &run.display().to_string(),
+                "--sandbox",
+            ]
+        );
+        assert!(Path::new(&expected).is_absolute());
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "fresh packet body"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "the packet file must not be world readable"
+            );
+        }
+
+        // A resume in the same run directory replaces the packet in place, so
+        // the worker never reads a stale continuation.
+        let resumed = args_of(
+            &build_generic_resume_command(
+                &inv,
+                Path::new("mytool"),
+                "resume packet body",
+                "session-ref",
+                &run,
+                &root,
+                false,
+                "auto",
+                "",
+                &[],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            resumed,
+            vec![
+                "resume",
+                "--session",
+                "session-ref",
+                "--packet",
+                &expected,
+                "--sandbox",
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "resume packet body"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_models_cache_yields_listed_models_and_efforts() {
+        let raw = r#"{
+            "models": [
+                { "slug": "gpt-5.5", "visibility": "list",
+                  "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "medium"},
+                    {"effort": "high"}, {"effort": "xhigh"} ] },
+                { "slug": "gpt-5.4-mini", "visibility": "list",
+                  "supported_reasoning_levels": [{"effort": "low"}] },
+                { "slug": "internal-review", "visibility": "hide",
+                  "supported_reasoning_levels": [{"effort": "secret"}] }
+            ]
+        }"#;
+        let (models, efforts) = parse_codex_models_cache(raw).unwrap();
+        assert_eq!(models, vec!["gpt-5.5", "gpt-5.4-mini"]);
+        // Hidden models contribute neither slugs nor efforts.
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+    }
+
+    #[test]
+    fn claude_effort_levels_parse_from_help_text() {
+        let help = "  --effort <level>   Effort level for the current session\n\
+                    (low, medium, high, xhigh, max)\n  --other ...";
+        assert_eq!(
+            parse_claude_efforts(help).unwrap(),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(parse_claude_efforts("no flag here").is_none());
+    }
+
+    #[test]
+    fn codex_sandbox_toggles_with_full_access() {
+        let (bin, run, cwd) = (Path::new("codex"), Path::new("/tmp/r"), Path::new("/tmp"));
+        let safe = args_of(&build_command(
+            "codex",
+            bin,
+            run,
+            cwd,
+            false,
+            "",
+            "",
+            &[],
+            &[],
+        ));
+        assert!(safe.iter().any(|a| a == "workspace-write"));
+        assert!(!safe.iter().any(|a| a == "danger-full-access"));
+        let full = args_of(&build_command(
+            "codex",
+            bin,
+            run,
+            cwd,
+            true,
+            "",
+            "",
+            &[],
+            &[],
+        ));
+        assert!(full.iter().any(|a| a == "danger-full-access"));
+    }
+
+    #[test]
+    fn codex_commands_pin_the_agent_root_to_the_process_cwd() {
+        let (bin, run, cwd) = (
+            Path::new("codex"),
+            Path::new("/tmp/run"),
+            Path::new("/tmp/declared-worktree"),
+        );
+        let fresh = build_command("codex", bin, run, cwd, true, "", "", &[], &[]);
+        let fresh_args = args_of(&fresh);
+        assert_eq!(fresh.get_current_dir(), Some(cwd));
+        assert!(fresh_args.windows(2).any(|args| {
+            matches!(args[0].as_str(), "-C" | "--cd") && args[1] == cwd.to_string_lossy()
+        }));
+
+        let resumed = build_resume_command("codex", bin, run, cwd, true, "", &[], Some("SID"));
+        let resumed_args = args_of(&resumed);
+        assert_eq!(resumed.get_current_dir(), Some(cwd));
+        assert!(resumed_args.windows(2).any(|args| {
+            matches!(args[0].as_str(), "-C" | "--cd") && args[1] == cwd.to_string_lossy()
+        }));
+        let resume_index = resumed_args.iter().position(|arg| arg == "resume").unwrap();
+        let cwd_index = resumed_args
+            .iter()
+            .position(|arg| matches!(arg.as_str(), "-C" | "--cd"))
+            .unwrap();
+        assert!(
+            cwd_index < resume_index,
+            "Codex resume accepts -C before its subcommand"
+        );
+    }
+
+    #[test]
+    fn claude_permission_toggles_with_full_access() {
+        let (bin, run, cwd) = (Path::new("claude"), Path::new("/tmp/r"), Path::new("/tmp"));
+        let safe = args_of(&build_command(
+            "claude-code",
+            bin,
+            run,
+            cwd,
+            false,
+            "",
+            "",
+            &[],
+            &[],
+        ));
+        assert!(safe.iter().any(|a| a == "acceptEdits"));
+        let full = args_of(&build_command(
+            "claude-code",
+            bin,
+            run,
+            cwd,
+            true,
+            "",
+            "",
+            &[],
+            &[],
+        ));
+        assert!(full.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn model_and_effort_flags_passed() {
+        let (bin, run, cwd) = (Path::new("x"), Path::new("/tmp/r"), Path::new("/tmp"));
+        let cx = args_of(&build_command(
+            "codex",
+            bin,
+            run,
+            cwd,
+            false,
+            "gpt-5",
+            "high",
+            &[],
+            &[],
+        ));
+        assert!(cx.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"));
+        assert!(cx
+            .iter()
+            .any(|a| a.contains("model_reasoning_effort=\"high\"")));
+        let cl = args_of(&build_command(
+            "claude-code",
+            bin,
+            run,
+            cwd,
+            false,
+            "opus",
+            "high",
+            &[],
+            &[],
+        ));
+        assert!(cl.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
+        assert!(cl.windows(2).any(|w| w[0] == "--effort" && w[1] == "high"));
+    }
+
+    /// The helper deciding the roots is only half of it: the command has to
+    /// carry them, for both built-in adapters (issue #19).
+    #[test]
+    fn declared_writable_roots_reach_the_sandbox_arguments() {
+        let bin = Path::new("/bin/true");
+        let run = Path::new("/ws/.agents/runs/run-1");
+        let cwd = Path::new("/ws");
+        let package = PathBuf::from("/ws/.agents/skills/route-game-development");
+
+        for worker in ["codex", "claude-code"] {
+            let with = args_of(&build_command(
+                worker,
+                bin,
+                run,
+                cwd,
+                false,
+                "",
+                "",
+                &[],
+                std::slice::from_ref(&package),
+            ));
+            assert!(
+                with.windows(2)
+                    .any(|pair| pair[0] == "--add-dir" && pair[1] == package.to_string_lossy()),
+                "{worker} did not receive the task's declared writable root: {with:?}"
+            );
+            // The run directory stays writable regardless — that is what the
+            // worker writes its own artifacts into.
+            assert!(
+                with.windows(2)
+                    .any(|pair| pair[0] == "--add-dir" && pair[1] == run.to_string_lossy()),
+                "{worker} lost the run directory root: {with:?}"
+            );
+
+            let without = args_of(&build_command(
+                worker,
+                bin,
+                run,
+                cwd,
+                false,
+                "",
+                "",
+                &[],
+                &[],
+            ));
+            assert_eq!(
+                without.iter().filter(|a| *a == "--add-dir").count(),
+                1,
+                "{worker} added a root nothing asked for: {without:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_attaches_images() {
+        let (bin, run, cwd) = (Path::new("codex"), Path::new("/tmp/r"), Path::new("/tmp"));
+        let imgs = vec!["a.png".to_string(), "b.jpg".to_string()];
+        let cx = args_of(&build_command(
+            "codex",
+            bin,
+            run,
+            cwd,
+            false,
+            "",
+            "",
+            &imgs,
+            &[],
+        ));
+        assert!(cx.windows(2).any(|w| w[0] == "-i" && w[1] == "a.png"));
+        assert!(cx.windows(2).any(|w| w[0] == "-i" && w[1] == "b.jpg"));
+    }
+
+    #[test]
+    fn resume_commands_target_the_session() {
+        let (bin, run, cwd) = (Path::new("x"), Path::new("/tmp/r"), Path::new("/tmp"));
+        let cx = args_of(&build_resume_command(
+            "codex",
+            bin,
+            run,
+            cwd,
+            true,
+            "",
+            &[],
+            Some("SID"),
+        ));
+        assert_eq!(cx.first().map(String::as_str), Some("exec"));
+        assert!(cx.iter().any(|arg| arg == "resume"));
+        assert!(cx.iter().any(|a| a == "SID"));
+        assert!(cx
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        let cl = args_of(&build_resume_command(
+            "claude-code",
+            bin,
+            run,
+            cwd,
+            false,
+            "opus",
+            &[],
+            Some("SID"),
+        ));
+        assert!(cl.windows(2).any(|w| w[0] == "--resume" && w[1] == "SID"));
+        assert!(cl.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
+    }
+
+    #[test]
+    fn generic_resume_uses_the_profile_command_and_preserves_each_argument_boundary() {
+        let profile: WorkerProfile = crate::yaml::from_str(
+            r#"
+id: fixture
+model: fixture-model
+effort: high
+invocation:
+  command: fixture
+  prompt_transport: argument
+  args: [fresh, '{prompt}']
+  sandbox_args: ['safe mode']
+  full_access_args: ['full mode']
+  model_args: [--model, '{model}']
+  effort_args: [--effort, '{effort}']
+  image_args: [--image, '{image}']
+  session:
+    capture: {stream: stdout, prefix: 'SESSION_REF='}
+    resume_args: [resume, '{session}', '{prompt}']
+"#,
+        )
+        .unwrap();
+        let packet = "answer with spaces; $(must stay literal)";
+        let command = build_generic_resume_command(
+            &profile.invocation,
+            Path::new("fixture"),
+            packet,
+            "session ref with spaces",
+            Path::new("/tmp/run"),
+            Path::new("/tmp/work tree"),
+            false,
+            &profile.model,
+            &profile.effort,
+            &["image one.png".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            args_of(&command),
+            [
+                "resume",
+                "session ref with spaces",
+                packet,
+                "safe mode",
+                "--model",
+                "fixture-model",
+                "--effort",
+                "high",
+                "--image",
+                "image one.png",
+            ]
+        );
+        assert_eq!(command.get_program(), Path::new("fixture"));
+        assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/work tree")));
+        assert!(supports_native_resume(&profile));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_codex_session_id_comes_from_that_childs_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("yard-codex-session-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("codex");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"11111111-2222-4333-8444-555555555555"}'
+printf '%s\n' '{"type":"thread.started","thread_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}' >&2
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: codex\ninvocation: {command: codex, supports_noninteractive: true, output_contract: files}\nlimits: {max_wall_minutes: 1}\n",
+        )
+        .unwrap();
+        let log = root.join("worker-output.log");
+        let outcome = spawn(
+            &profile,
+            &fake_codex,
+            "packet",
+            &root,
+            &root,
+            &[],
+            &log,
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        assert!(outcome.exit_ok);
+        assert_eq!(
+            outcome.session_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555"),
+            "only the exact fresh child's stdout may identify its session"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_codex_without_stdout_thread_event_has_no_session_to_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "yard-codex-session-fail-closed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("codex");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}' >&2
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: codex\ninvocation: {command: codex, supports_noninteractive: true, output_contract: files}\nlimits: {max_wall_minutes: 1}\n",
+        )
+        .unwrap();
+        let outcome = spawn(
+            &profile,
+            &fake_codex,
+            "packet",
+            &root,
+            &root,
+            &[],
+            &root.join("worker-output.log"),
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        assert!(outcome.exit_ok);
+        assert_eq!(outcome.session_id, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_and_empty_omit_model_effort_flags() {
+        // "auto" (any case) and empty both mean: let the CLI choose — no flag.
+        let (bin, run, cwd) = (Path::new("x"), Path::new("/tmp/r"), Path::new("/tmp"));
+        for (model, effort) in [("auto", "auto"), ("", ""), ("AUTO", "Auto")] {
+            let cx = args_of(&build_command(
+                "codex",
+                bin,
+                run,
+                cwd,
+                false,
+                model,
+                effort,
+                &[],
+                &[],
+            ));
+            assert!(
+                !cx.iter().any(|a| a == "-m"),
+                "codex -m omitted for {model:?}"
+            );
+            assert!(
+                !cx.iter().any(|a| a.contains("model_reasoning_effort")),
+                "codex effort omitted for {effort:?}"
+            );
+            let cl = args_of(&build_command(
+                "claude-code",
+                bin,
+                run,
+                cwd,
+                false,
+                model,
+                effort,
+                &[],
+                &[],
+            ));
+            assert!(
+                !cl.iter().any(|a| a == "--model"),
+                "claude --model omitted for {model:?}"
+            );
+            assert!(
+                !cl.iter().any(|a| a == "--effort"),
+                "claude --effort omitted for {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_public_stream_normalizes_messages_and_tools_but_not_reasoning() {
+        let raw = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"11111111-2222-4333-8444-555555555555\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"private\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"command\":\"cargo test\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"cargo test\",\"exit_code\":0}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"public update\"}}\n"
+        );
+        let events = normalize_worker_output(
+            "codex",
+            RawStreamKind::Stdout,
+            raw.as_bytes(),
+            "raw_att_1_stdout",
+        );
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].event_type,
+            crate::schemas::ChannelEventType::ToolStarted
+        );
+        assert_eq!(
+            events[1].event_type,
+            crate::schemas::ChannelEventType::ToolCompleted
+        );
+        assert_eq!(
+            events[2].event_type,
+            crate::schemas::ChannelEventType::WorkerMessage
+        );
+        assert_eq!(events[2].payload["text"], "public update");
+        assert!(events.iter().all(|event| {
+            event.raw_ref.byte_end > event.raw_ref.byte_start
+                && event.raw_ref.artifact_id == "raw_att_1_stdout"
+        }));
+        assert!(events
+            .iter()
+            .all(|event| !event.payload.to_string().contains("private")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_publisher_drains_unsaturated_tail_before_join() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!(
+            "yard-codex-unsaturated-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("codex");
+        std::fs::write(
+            &fake_codex,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' ",
+                "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}' ",
+                "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"tail\"}}'\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: codex\ninvocation: {command: codex, supports_noninteractive: true, output_contract: files}\nlimits: {max_wall_minutes: 1}\n",
+        )
+        .unwrap();
+        let capture = AttemptCapture {
+            combined_log: root.join("worker-output.log"),
+            stdout_log: root.join("attempts/att_1/stdout.log"),
+            stderr_log: root.join("attempts/att_1/stderr.log"),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let sink: AttemptEventSink = Arc::new(move |event| {
+            // Keep one event in flight until the worker and both raw readers
+            // have exited. The second event remains queued without filling the
+            // 64-slot channel, making join-time tail handling deterministic.
+            std::thread::sleep(Duration::from_millis(300));
+            captured_events.lock().unwrap().push(event);
+            Ok(())
+        });
+
+        let outcome = spawn_attempt_with_sink(
+            &profile,
+            &fake_codex,
+            "packet",
+            &root,
+            &root,
+            &[],
+            &capture,
+            Some(sink),
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        let texts = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.payload["text"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["first", "tail"]);
+        assert!(
+            !outcome.public_events_dropped,
+            "an unsaturated publisher queue must not report shed events"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Issue #20: under sink backpressure the parent stayed busy long after the
+    /// worker had produced a successful result. The bounded queue must shed
+    /// rather than block, and completion must not wait for a slow sink to
+    /// consume the backlog.
+    #[cfg(unix)]
+    #[test]
+    fn codex_saturated_publisher_sheds_and_completes_without_draining_the_backlog() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const EMITTED: usize = 400;
+        const SINK_DELAY: Duration = Duration::from_millis(25);
+
+        let root = std::env::temp_dir().join(format!(
+            "yard-codex-saturated-publisher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake_codex = root.join("codex");
+        // Many small events, emitted as fast as the shell can write them, so the
+        // reader outruns the deliberately slow sink and fills the 64-slot queue.
+        std::fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt {EMITTED} ]; do \
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\
+                 \"text\":\"e%s\"}}}}\\n' \"$i\"; i=$((i+1)); done\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: codex\ninvocation: {command: codex, supports_noninteractive: true, output_contract: files}\nlimits: {max_wall_minutes: 1}\n",
+        )
+        .unwrap();
+        let capture = AttemptCapture {
+            combined_log: root.join("worker-output.log"),
+            stdout_log: root.join("attempts/att_1/stdout.log"),
+            stderr_log: root.join("attempts/att_1/stderr.log"),
+        };
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let sink_delivered = Arc::clone(&delivered);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: AttemptEventSink = Arc::new(move |event| {
+            std::thread::sleep(SINK_DELAY);
+            sink_delivered.fetch_add(1, Ordering::Relaxed);
+            sink_seen.lock().unwrap().push(event);
+            Ok(())
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = spawn_attempt_with_sink(
+            &profile,
+            &fake_codex,
+            "packet",
+            &root,
+            &root,
+            &[],
+            &capture,
+            Some(sink),
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(outcome.exit_ok);
+        assert!(
+            outcome.public_events_dropped,
+            "a saturated publisher queue must report shed events"
+        );
+        // Delivering every event through this sink would take EMITTED *
+        // SINK_DELAY (10s here). Completion must not wait for that backlog.
+        let full_drain = SINK_DELAY * EMITTED as u32;
+        assert!(
+            elapsed < full_drain / 3,
+            "parent did not complete promptly under backpressure: {elapsed:?} \
+             (full drain would be {full_drain:?})"
+        );
+        assert!(
+            delivered.load(Ordering::Relaxed) < EMITTED,
+            "shedding must drop events rather than deliver all of them"
+        );
+        // The authoritative raw stream is never shed: every emitted event is on
+        // disk even though the live sink saw only some of them.
+        let raw = std::fs::read_to_string(&capture.stdout_log).unwrap();
+        assert_eq!(raw.lines().count(), EMITTED);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_resume_cumulative_file_changes_keep_public_log_bounded_and_raw_refs_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        const FRESH: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/v010_003_task_channels/codex-fresh-file-change.jsonl"
+        ));
+        const RESUME: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/v010_003_task_channels/codex-resume-cumulative-file-change.jsonl"
+        ));
+
+        let root = std::env::temp_dir().join(format!(
+            "yard-codex-cumulative-file-change-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let profile: WorkerProfile = crate::yaml::from_str(
+            "id: codex\ninvocation: {command: codex, supports_noninteractive: true, output_contract: files}\nlimits: {max_wall_minutes: 1}\n",
+        )
+        .unwrap();
+
+        let run_fixture = |label: &str, raw: &str, resume: bool| {
+            let fake_codex = root.join(format!("codex-{label}"));
+            std::fs::write(&fake_codex, format!("#!/bin/sh\nprintf '%s' '{}'\n", raw)).unwrap();
+            let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, permissions).unwrap();
+            let capture = AttemptCapture {
+                combined_log: root.join(format!("{label}-worker-output.log")),
+                stdout_log: root.join(format!("attempts/{label}/stdout.log")),
+                stderr_log: root.join(format!("attempts/{label}/stderr.log")),
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured_events = Arc::clone(&events);
+            let sink: AttemptEventSink = Arc::new(move |event| {
+                captured_events.lock().unwrap().push(event);
+                Ok(())
+            });
+            let outcome = spawn_attempt_with_sink(
+                &profile,
+                &fake_codex,
+                "packet",
+                &root,
+                &root,
+                &[],
+                &capture,
+                Some(sink),
+                LOAD_TOLERANT_WORKER_CEILING,
+                false,
+                &[],
+                resume.then_some("11111111-1111-4111-8111-111111111111"),
+                resume,
+                &[],
+            )
+            .unwrap();
+            assert!(outcome.exit_ok);
+            assert_eq!(std::fs::read(&capture.stdout_log).unwrap(), raw.as_bytes());
+            let events = events.lock().unwrap().clone();
+            (capture, events)
+        };
+
+        let (_fresh_capture, fresh_events) = run_fixture("fresh", FRESH, false);
+        assert!(fresh_events
+            .iter()
+            .any(|event| event.event_type == ChannelEventType::WorkerMessage));
+
+        let (resume_capture, resume_events) = run_fixture("resume", RESUME, true);
+        let raw_lines = RESUME.lines().collect::<Vec<_>>();
+        let file_change_values = raw_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["item"]["type"] == "file_change")
+            .collect::<Vec<_>>();
+        let final_change_bytes =
+            serde_json::to_vec(&file_change_values.last().unwrap()["item"]["changes"])
+                .unwrap()
+                .len();
+        let non_file_bytes = raw_lines
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .map(|value| value["item"]["type"] != "file_change")
+                    .unwrap_or(true)
+            })
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        // The public log may retain the final cumulative change representation
+        // once, plus at most 128 bytes of status/count overhead per event.
+        let public_log_bound = non_file_bytes + final_change_bytes + file_change_values.len() * 128;
+        let public_log = std::fs::read(&resume_capture.combined_log).unwrap();
+        assert!(
+            public_log.len() <= public_log_bound,
+            "cumulative file_change amplification: public={} bound={public_log_bound}",
+            public_log.len()
+        );
+
+        let file_events = resume_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    ChannelEventType::ToolStarted | ChannelEventType::ToolCompleted
+                ) && event.payload["name"] == "file_change"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_events.len(), file_change_values.len());
+        let raw = std::fs::read(&resume_capture.stdout_log).unwrap();
+        for event in file_events {
+            assert_eq!(event.raw_ref.stream, "stdout");
+            let start = event.raw_ref.byte_start as usize;
+            let end = event.raw_ref.byte_end as usize;
+            assert!(start < end && end <= raw.len());
+            assert!(String::from_utf8_lossy(&raw[start..end]).contains("file_change"));
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // V010-006: normalization is selected by FORMAT. The two built-in adapters
+    // own theirs, so a declaration cannot move them; every other worker gets
+    // the shape it declared, and text when it declared nothing.
+    #[test]
+    fn output_format_resolution_is_core_owned_for_built_ins_and_declared_for_the_rest() {
+        for declared in [None, Some("text"), Some("json"), Some("stream-json")] {
+            assert_eq!(
+                resolve_output_format("codex", declared),
+                WorkerOutputFormat::CodexStreamJson,
+                "codex profile moved by {declared:?}"
+            );
+            assert_eq!(
+                resolve_output_format("claude-code", declared),
+                WorkerOutputFormat::ClaudeStreamJson,
+                "claude-code profile moved by {declared:?}"
+            );
+        }
+        for (declared, expected) in [
+            (None, WorkerOutputFormat::Text),
+            (Some("text"), WorkerOutputFormat::Text),
+            (Some("json"), WorkerOutputFormat::Json),
+            (Some("stream-json"), WorkerOutputFormat::StreamJson),
+            // Unsupported values are the guard's business; resolution must not
+            // invent a shape for one that slipped through.
+            (Some("ndjson"), WorkerOutputFormat::Text),
+        ] {
+            assert_eq!(
+                resolve_output_format("generic-fixture", declared),
+                expected,
+                "generic profile for {declared:?}"
+            );
+        }
+        assert_eq!(
+            parse_output_format("stream-json"),
+            Some(WorkerOutputFormat::StreamJson)
+        );
+        assert_eq!(parse_output_format("ndjson"), None);
+    }
+
+    // A `json` worker emits ONE document, so its events can only be derived
+    // once the whole stream is captured; every other format streams per line.
+    #[test]
+    fn only_the_json_document_format_defers_normalization_off_the_line_publisher() {
+        for format in [
+            WorkerOutputFormat::CodexStreamJson,
+            WorkerOutputFormat::ClaudeStreamJson,
+            WorkerOutputFormat::Text,
+            WorkerOutputFormat::StreamJson,
+        ] {
+            assert!(format.streams_line_by_line(), "{format:?}");
+        }
+        assert!(!WorkerOutputFormat::Json.streams_line_by_line());
+    }
+
+    #[test]
+    fn declared_stream_json_structures_json_lines_and_degrades_the_rest_to_text() {
+        let raw = concat!(
+            "warming up\n",
+            "{\"text\":\"public update\",\"phase\":\"build\"}\n",
+            "{not json at all\n",
+            "{\"phase\":\"done\"}\n"
+        );
+        let events = normalize_worker_output_with_format(
+            WorkerOutputFormat::StreamJson,
+            RawStreamKind::Stdout,
+            raw.as_bytes(),
+            "raw_att_1_stdout",
+        );
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].payload["text"], "warming up");
+        assert!(events[0].payload.get("json").is_none());
+        assert_eq!(events[1].payload["text"], "public update");
+        assert_eq!(events[1].payload["json"]["phase"], "build");
+        // A line the declared format cannot parse degrades; it never fails.
+        assert_eq!(events[2].payload["text"], "{not json at all");
+        // No `text` field to render: keep the object and say so verbatim.
+        assert_eq!(events[3].payload["json"]["phase"], "done");
+        assert_eq!(events[3].payload["text"], "{\"phase\":\"done\"}");
+        for event in &events {
+            assert_eq!(
+                event.event_type,
+                crate::schemas::ChannelEventType::WorkerMessage
+            );
+            let start = event.raw_ref.byte_start as usize;
+            let end = event.raw_ref.byte_end as usize;
+            assert!(start < end && end <= raw.len());
+        }
+    }
+
+    #[test]
+    fn declared_json_normalizes_the_last_complete_document_and_leaves_the_rest_text() {
+        let raw = concat!(
+            "starting\n",
+            "{\"text\":\"superseded\"}\n",
+            "note between documents\n",
+            "{\n  \"text\": \"final answer\",\n  \"nested\": {\"brace\": \"} not a close\"}\n}\n",
+            "trailing note\n"
+        );
+        let events = normalize_worker_output_with_format(
+            WorkerOutputFormat::Json,
+            RawStreamKind::Stdout,
+            raw.as_bytes(),
+            "raw_att_1_stdout",
+        );
+
+        let texts = events
+            .iter()
+            .map(|event| event.payload["text"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "starting",
+                "{\"text\":\"superseded\"}",
+                "note between documents",
+                "final answer",
+                "trailing note",
+            ]
+        );
+        let document = &events[3];
+        assert_eq!(document.payload["json"]["nested"]["brace"], "} not a close");
+        // The structured event spans the WHOLE document, not just its first line.
+        let start = document.raw_ref.byte_start as usize;
+        let end = document.raw_ref.byte_end as usize;
+        assert_eq!(&raw[start..=start], "{");
+        assert!(raw[start..end].contains("final answer"));
+        assert!(raw[start..end].lines().count() > 1);
+    }
+
+    #[test]
+    fn result_recovery_takes_the_last_result_shaped_object_from_captured_stdout() {
+        let raw = concat!(
+            "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-001\",\"status\":\"failed\"}\n",
+            "still working\n",
+            "{\"type\":\"progress\",\"done\":true}\n",
+            "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-001\",\"status\":\"done\",\"compact_summary\":\"last\"}\n",
+        );
+        let recovered =
+            recover_result_from_output(raw.as_bytes(), "r1", "YARD-001").expect("result recovered");
+        assert!(recovered.json.contains("\"compact_summary\":\"last\""));
+        assert_eq!(
+            &raw[recovered.byte_start..recovered.byte_end],
+            recovered.json
+        );
+        let parsed: crate::schemas::RunResult = serde_json::from_str(&recovered.json).unwrap();
+        assert_eq!(parsed.status, "done");
+    }
+
+    // A stray brace in a worker's prose must not hide the result sitting after
+    // it: the scanner keeps nested candidates precisely so recovery survives an
+    // unbalanced stream.
+    #[test]
+    fn result_recovery_survives_an_unbalanced_brace_earlier_in_the_stream() {
+        let raw = concat!(
+            "writing { and never closing it\n",
+            "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-001\",\"status\":\"done\"}\n",
+        );
+        let recovered =
+            recover_result_from_output(raw.as_bytes(), "r1", "YARD-001").expect("result recovered");
+        assert!(recovered.json.starts_with("{\"schema_version\":1"));
+    }
+
+    // Every task packet carries a result SCHEMA EXAMPLE, so a worker that
+    // echoes its own prompt prints a result-shaped object. Recovering that
+    // would manufacture a finished run out of a template.
+    #[test]
+    fn result_recovery_refuses_the_result_schema_example_a_worker_echoed_back() {
+        let task: crate::schemas::Task =
+            crate::yaml::from_str("id: YARD-001\ntitle: echo the packet\n").unwrap();
+        let echoed = format!(
+            "here is my packet:\n{}\n",
+            crate::packet::compile(&crate::packet::PacketInputs {
+                worker_id: "generic-fixture",
+                task: &task,
+                intent: None,
+                repo: &Default::default(),
+                run_dir_rel: ".agents/runs/run-1",
+                conversation: &[],
+                continuation: None,
+                chained_from: None,
+                language: "en",
+                images: &[],
+                role_notes: "",
+                harness: &Default::default(),
+                approved: false,
+                pre_push_checks: &[],
+            })
+        );
+        assert!(
+            echoed.contains("\"run_id\": \"<run-id>\""),
+            "the packet no longer carries the template this guards against"
+        );
+        assert_eq!(
+            recover_result_from_output(echoed.as_bytes(), "run-1", "YARD-001"),
+            None,
+            "the packet's own schema example was recovered as a result"
+        );
+    }
+
+    #[test]
+    fn result_recovery_declines_broken_non_result_and_foreign_output() {
+        for (label, raw) in [
+            // Truncated: no balanced object at all.
+            (
+                "truncated",
+                "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-001\",\"status\":\"done\"",
+            ),
+            // Balanced but not the result schema.
+            ("not a result", "{\"type\":\"progress\",\"done\":true}\n"),
+            // Balanced, result-ish, but missing required fields.
+            ("partial schema", "{\"status\":\"done\"}\n"),
+            // A complete result that belongs to a DIFFERENT run or task.
+            (
+                "foreign run",
+                "{\"schema_version\":1,\"run_id\":\"r0\",\"task_id\":\"YARD-001\",\"status\":\"done\"}\n",
+            ),
+            (
+                "foreign task",
+                "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-999\",\"status\":\"done\"}\n",
+            ),
+            ("empty", ""),
+        ] {
+            assert_eq!(
+                recover_result_from_output(raw.as_bytes(), "r1", "YARD-001"),
+                None,
+                "{label}: recovered a result from {raw:?}"
+            );
+        }
+        // An unidentifiable run cannot claim any result as its own.
+        let mine =
+            "{\"schema_version\":1,\"run_id\":\"r1\",\"task_id\":\"YARD-001\",\"status\":\"done\"}";
+        assert_eq!(
+            recover_result_from_output(mine.as_bytes(), "", "YARD-001"),
+            None
+        );
+        assert_eq!(recover_result_from_output(mine.as_bytes(), "r1", ""), None);
+    }
+
+    #[test]
+    fn text_only_stream_degrades_to_message_events_with_exact_spans() {
+        let events = normalize_worker_output(
+            "generic-text",
+            RawStreamKind::Stderr,
+            b"first line\n\nsecond line\n",
+            "raw_att_2_stderr",
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["text"], "first line");
+        assert_eq!(events[0].raw_ref.byte_start, 0);
+        assert_eq!(events[0].raw_ref.byte_end, 11);
+        assert_eq!(events[1].payload["text"], "second line");
+        assert_eq!(events[1].raw_ref.stream, "stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attempt_capture_separates_stdout_stderr_and_refuses_overwrite() {
+        let root =
+            std::env::temp_dir().join(format!("yard-attempt-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let profile: WorkerProfile = crate::yaml::from_str(
+            r#"
+id: fixture
+invocation:
+  command: sh
+  supports_noninteractive: true
+  output_contract: files
+  args: ["-c", "printf stdout-only; printf stderr-only >&2"]
+  sandbox_args: ["--fixture-sandbox"]
+limits: {max_wall_minutes: 1}
+"#,
+        )
+        .unwrap();
+        let capture = AttemptCapture {
+            combined_log: root.join("worker-output.log"),
+            stdout_log: root.join("attempts/att_1/stdout.log"),
+            stderr_log: root.join("attempts/att_1/stderr.log"),
+        };
+        let outcome = spawn_attempt(
+            &profile,
+            Path::new("/bin/sh"),
+            "packet",
+            &root,
+            &root,
+            &[],
+            &capture,
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(outcome.exit_ok);
+        assert_eq!(
+            std::fs::read_to_string(&capture.stdout_log).unwrap(),
+            "stdout-only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&capture.stderr_log).unwrap(),
+            "stderr-only"
+        );
+        let combined = std::fs::read_to_string(&capture.combined_log).unwrap();
+        assert!(combined.contains("stdout-only"));
+        assert!(combined.contains("stderr-only"));
+
+        let error = spawn_attempt(
+            &profile,
+            Path::new("/bin/sh"),
+            "packet",
+            &root,
+            &root,
+            &[],
+            &capture,
+            LOAD_TOLERANT_WORKER_CEILING,
+            false,
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("attempt raw stream already exists"));
+        assert_eq!(
+            std::fs::read_to_string(&capture.stdout_log).unwrap(),
+            "stdout-only"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

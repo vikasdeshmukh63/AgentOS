@@ -1,0 +1,1311 @@
+//! A read-only snapshot of workspace state, shared by `yardlet status` and the TUI.
+
+use anyhow::Result;
+use serde::Serialize;
+
+use crate::guard;
+use std::collections::BTreeMap;
+
+use crate::schemas::{
+    IntentContract, RunnableClass, Task, TaskState, TransitionRecord, WorkQueue, YardConfig,
+};
+use crate::state::Workspace;
+
+pub struct Snapshot {
+    pub config: YardConfig,
+    pub intent: Option<IntentContract>,
+    pub queue: WorkQueue,
+    /// Read-only content gates for the idle Home footer. Computed with the
+    /// snapshot/reload, never by the render loop.
+    pub home_footer: HomeFooterAvailability,
+    pub workers: Vec<WorkerLine>,
+    /// The configured planning worker (routing primary).
+    pub planner: String,
+    /// (task id, question) for the first task waiting on the user, if any.
+    pub pending: Option<(String, String)>,
+    /// The ambiguity-gate state, when the intent is gated: (open questions,
+    /// interview turns so far).
+    pub gate: Option<(Vec<String>, u32)>,
+    /// Task ids that are gated and not yet granted approval.
+    pub approvals_needed: Vec<String>,
+    /// Capabilities the enabled workers declare (already parsed from
+    /// workers.yaml here, so callers need not re-read it).
+    pub capabilities: std::collections::BTreeSet<String>,
+    pub last_transitions: BTreeMap<String, TransitionRecord>,
+    /// Read-only effective-state diagnostics for canonical Running tasks whose
+    /// exact worker identity is no longer live.
+    pub recovery_required: Vec<RecoveryRequired>,
+    /// Runs (latest per task, current intent) that persisted worktree
+    /// harness-copy warnings as evidence. Absence of the evidence file means
+    /// preparation was clean, so such runs never appear here.
+    pub harness_copy_warnings: Vec<HarnessCopyWarning>,
+    /// An open planning session still waiting on the operator. The queue is
+    /// legitimately empty in this state, so without this the surface is
+    /// indistinguishable from having no work at all (issue #65).
+    pub planning_reentry: Option<crate::planning::PlanningReentry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomeFooterAvailability {
+    pub tidy: bool,
+    pub defer: bool,
+    pub revive: bool,
+    pub monitor: bool,
+    pub handoff: bool,
+    pub trust: bool,
+}
+
+impl HomeFooterAvailability {
+    fn load(
+        ws: &Workspace,
+        queue: &WorkQueue,
+        has_intent: bool,
+        capabilities: &std::collections::BTreeSet<String>,
+        approvals_needed: &[String],
+    ) -> Self {
+        let mut availability = Self::from_queue(queue, has_intent, capabilities, approvals_needed);
+
+        if let Ok(entries) = std::fs::read_dir(ws.runs_dir()) {
+            for entry in entries.flatten() {
+                let run_dir = entry.path();
+                if !run_dir.is_dir() {
+                    continue;
+                }
+                // This matches the Monitor's fallback: any persisted run dir
+                // gives it a target, even when no task is currently Running.
+                availability.monitor = true;
+                if run_dir.join("handoff.md").is_file() {
+                    availability.handoff = true;
+                }
+            }
+        }
+        availability.trust = !crate::telemetry::read_runs(ws).is_empty()
+            || !ws.load_all_transition_logs().is_empty();
+        availability
+    }
+
+    fn from_queue(
+        queue: &WorkQueue,
+        has_intent: bool,
+        capabilities: &std::collections::BTreeSet<String>,
+        approvals_needed: &[String],
+    ) -> Self {
+        let defer = queue.tasks.iter().any(|task| {
+            matches!(
+                task.state,
+                TaskState::Queued
+                    | TaskState::NeedsUser
+                    | TaskState::Partial
+                    | TaskState::Failed
+                    | TaskState::Blocked
+            )
+        });
+        let revive = queue
+            .tasks
+            .iter()
+            .any(|task| task.state == TaskState::Deferred);
+        let tidy_task = queue.tasks.iter().any(|task| match task.state {
+            TaskState::Blocked if !task.required_capabilities.is_empty() => {
+                !crate::routing::unsatisfiable_capabilities(
+                    &task.required_capabilities,
+                    capabilities,
+                )
+                .is_empty()
+            }
+            TaskState::Queued => {
+                let approved =
+                    task.approval_required() && !approvals_needed.iter().any(|id| id == &task.id);
+                matches!(
+                    queue.runnable_class(task, approved, capabilities),
+                    RunnableClass::WaitingDependency
+                        | RunnableClass::WaitingApproval
+                        | RunnableClass::WaitingCapability
+                )
+            }
+            _ => false,
+        });
+
+        Self {
+            tidy: tidy_task || (has_intent && crate::state::ready_for_completion(queue)),
+            defer,
+            revive,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HarnessCopyWarning {
+    pub task_id: String,
+    pub run_id: String,
+    pub warning_count: usize,
+    /// Evidence path relative to the run directory.
+    pub evidence: String,
+}
+
+/// Read-only count of a run's persisted harness-copy warnings; None when the
+/// run left no warnings evidence (preparation was clean).
+pub(crate) fn harness_copy_warning_count(run_dir: &std::path::Path) -> Option<usize> {
+    let text =
+        std::fs::read_to_string(run_dir.join(crate::state::HARNESS_COPY_WARNINGS_FILE)).ok()?;
+    Some(text.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryRequired {
+    pub task_id: String,
+    pub run_id: String,
+    pub canonical_state: String,
+    pub effective_state: String,
+    pub reason: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QueueHealth {
+    pub runnable: usize,
+    /// Runnable tasks the verifier barrier is holding back, and runnable
+    /// reviews that will go one at a time because nothing else is queued.
+    ///
+    /// `runnable` alone counts tasks the scheduler will deliberately refuse to
+    /// co-schedule, which reads as parallelism that never arrives (issue #51).
+    ///
+    /// Both are computed HERE, from `task_class` — the same real capability
+    /// vocabulary and live approval grants `runnable` uses. The scheduler's own
+    /// helpers deliberately work from an empty vocabulary and ignore approval
+    /// grants (so parallel selection falls through to the serial selector for
+    /// those cases), which makes them right for scheduling and wrong to print
+    /// next to `runnable`: a queue of approval-granted reviews would count 3
+    /// runnable and 0 held.
+    ///
+    /// There is deliberately no "how many will start" number. That would also
+    /// have to fold in `max_parallel`, and a count that says "1 parallelizable"
+    /// in a workspace where parallelism is switched off explains nothing.
+    pub review_barrier: usize,
+    pub serialized_reviews: usize,
+    pub running: usize,
+    pub waiting_decision: usize,
+    pub waiting_approval: usize,
+    pub waiting_dependency: usize,
+    pub waiting_capability: usize,
+    pub held: usize,
+    pub set_aside: usize,
+    pub done: usize,
+    pub total: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WorkerLine {
+    pub id: String,
+    pub readiness: String,
+    pub version: Option<String>,
+    pub billing_env_present: usize,
+    /// True when AI-billing env is present AND the policy is strict (`block`),
+    /// so the worker would hard-stop at run time. Distinguishes a real block
+    /// from the default scrub (present-but-removed-before-spawn).
+    pub billing_blocked: bool,
+    /// Model this worker runs with (alias or full id); empty = the CLI default.
+    pub model: String,
+    /// The profile's declared `min_version`, so the workers panel can say
+    /// "upgrade to >= X" without re-reading workers.yaml.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_version: Option<String>,
+    pub detail: String,
+    pub enabled: bool,
+    /// Non-public cache identity for the invocation/billing inputs that produced
+    /// this readiness result. Prevents a cheap TUI reload from reusing stale
+    /// ready state after workers.yaml or billing posture changes.
+    #[serde(skip)]
+    pub readiness_cache_key: String,
+}
+
+impl Snapshot {
+    pub fn load(ws: &Workspace) -> Result<Snapshot> {
+        Self::load_inner(ws, None)
+    }
+
+    /// Load with an injected offline worker probe. Startup fixtures use this
+    /// seam to exercise slow or failed readiness without spawning a real CLI.
+    #[cfg(test)]
+    pub(crate) fn load_with_probe(
+        ws: &Workspace,
+        probe: impl FnMut(
+            &crate::schemas::WorkerProfile,
+            &crate::schemas::BillingPolicy,
+            &str,
+        ) -> crate::guard::WorkerStatus,
+    ) -> Result<Snapshot> {
+        Self::load_inner_with_probe(ws, None, probe)
+    }
+
+    /// Reload the cheap state (yaml files) while reusing a previous worker
+    /// probe. `load` spawns each worker CLI with `--version`, which blocks the
+    /// caller for ~100ms — too slow for the TUI's once-a-second refresh.
+    pub fn load_reusing_workers(ws: &Workspace, workers: Vec<WorkerLine>) -> Result<Snapshot> {
+        Self::load_inner(ws, Some(workers))
+    }
+
+    fn load_inner(ws: &Workspace, cached_workers: Option<Vec<WorkerLine>>) -> Result<Snapshot> {
+        Self::load_inner_with_probe(ws, cached_workers, guard::probe)
+    }
+
+    fn load_inner_with_probe(
+        ws: &Workspace,
+        cached_workers: Option<Vec<WorkerLine>>,
+        mut probe: impl FnMut(
+            &crate::schemas::WorkerProfile,
+            &crate::schemas::BillingPolicy,
+            &str,
+        ) -> crate::guard::WorkerStatus,
+    ) -> Result<Snapshot> {
+        // A snapshot is a trusted projection used by both status and every TUI
+        // action. Never expose canonical state until its activation provenance
+        // and immutable runtime envelope have passed the shared fail-closed gate.
+        crate::planning::validate_active_activation(ws)?;
+        let config = ws.load_config()?;
+        let intent = ws.load_intent()?;
+        // Sort for display (active work on top, done at the bottom); in-memory
+        // only, the on-disk queue order is unchanged.
+        let mut queue = ws.load_queue()?;
+        queue.sort_for_display();
+        let billing = ws.load_billing()?;
+        let workers_file = ws.load_workers()?;
+        let policy = billing.worker_invocation.ai_billing_env_policy.clone();
+        let requested_access = config.default_access.clone();
+
+        // The enabled flag, model, and billing-policy posture are always re-read
+        // from config (cheap and user-editable); only the expensive probe
+        // (spawning `--version`) is reused from the cache, matched by worker id.
+        let workers = workers_file
+            .workers
+            .iter()
+            .map(|p| {
+                let readiness_cache_key =
+                    guard::readiness_cache_key(p, &billing, &requested_access);
+                if !p.enabled {
+                    return WorkerLine {
+                        id: p.id.clone(),
+                        readiness: "disabled".to_string(),
+                        version: None,
+                        billing_env_present: 0,
+                        billing_blocked: false,
+                        model: p.model.clone(),
+                        required_version: p.invocation.min_version.clone(),
+                        detail: "disabled (toggle on the Home workers panel)".to_string(),
+                        enabled: false,
+                        readiness_cache_key,
+                    };
+                }
+                if let Some(c) = cached_workers.as_ref().and_then(|cw| {
+                    cw.iter().find(|w| {
+                        w.id == p.id
+                            && w.readiness != "disabled"
+                            && w.readiness_cache_key == readiness_cache_key
+                    })
+                }) {
+                    return WorkerLine {
+                        enabled: true,
+                        model: p.model.clone(),
+                        required_version: p.invocation.min_version.clone(),
+                        billing_blocked: guard::billing_blocked(&policy, c.billing_env_present),
+                        readiness_cache_key,
+                        ..c.clone()
+                    };
+                }
+                let s = probe(p, &billing, &requested_access);
+                let present = s.billing_env_present.len();
+                WorkerLine {
+                    id: s.id,
+                    readiness: s.readiness.label().to_string(),
+                    version: s.version,
+                    billing_env_present: present,
+                    billing_blocked: guard::billing_blocked(&policy, present),
+                    model: p.model.clone(),
+                    required_version: s.required_version,
+                    detail: s.detail,
+                    enabled: true,
+                    readiness_cache_key,
+                }
+            })
+            .collect();
+
+        let planner = {
+            let primary = &workers_file.routing.planning_gate.primary;
+            if primary.is_empty() {
+                "codex".to_string()
+            } else {
+                primary.clone()
+            }
+        };
+
+        let pending = queue
+            .tasks
+            .iter()
+            .find(|t| t.state == TaskState::NeedsUser)
+            .map(|t| {
+                let q = crate::run::latest_question_for(ws, &t.id).unwrap_or_default();
+                (t.id.clone(), q)
+            });
+
+        let gate = intent
+            .as_ref()
+            .filter(|i| crate::planner::intent_gated(i, config.ambiguity_gate))
+            .map(|i| (i.open_questions.clone(), i.interview_turns));
+
+        // Approval is only "needed" for a task that could still run: a Done or
+        // Deferred (or Blocked/Running) task keeps its approval flag but must not
+        // light up the status bar. Only pending, runnable-next states count.
+        let approvals_needed: Vec<String> = queue
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.approval_required()
+                    && matches!(
+                        t.state,
+                        TaskState::Queued
+                            | TaskState::NeedsUser
+                            | TaskState::Partial
+                            | TaskState::Failed
+                    )
+                    && !crate::approvals::is_granted(ws, &t.id)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+
+        let capabilities = crate::routing::declared_capabilities(&workers_file);
+        let last_transitions = queue
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                ws.latest_transition_for_intent(&task.id, &queue.intent_id)
+                    .map(|rec| (task.id.clone(), rec))
+            })
+            .collect();
+        let recovery_required = queue
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Running)
+            .filter_map(|task| {
+                let Some((run_id, run_dir)) =
+                    crate::run::latest_run_for_intent(ws, &task.id, &queue.intent_id)
+                else {
+                    return Some(RecoveryRequired {
+                        task_id: task.id.clone(),
+                        run_id: String::new(),
+                        canonical_state: "running".to_string(),
+                        effective_state: "interrupted".to_string(),
+                        reason: "canonical task is Running but has no recorded run".to_string(),
+                        action: "yardlet recover".to_string(),
+                    });
+                };
+                crate::run::stale_running_reason(&run_dir, &task.id, &queue.intent_id).map(
+                    |reason| RecoveryRequired {
+                        task_id: task.id.clone(),
+                        run_id,
+                        canonical_state: "running".to_string(),
+                        effective_state: "interrupted".to_string(),
+                        reason,
+                        action: "yardlet recover".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let harness_copy_warnings = queue
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                let (run_id, run_dir) =
+                    crate::run::latest_run_for_intent(ws, &task.id, &queue.intent_id)?;
+                let warning_count = harness_copy_warning_count(&run_dir)?;
+                Some(HarnessCopyWarning {
+                    task_id: task.id.clone(),
+                    run_id,
+                    warning_count,
+                    evidence: crate::state::HARNESS_COPY_WARNINGS_FILE.to_string(),
+                })
+            })
+            .collect();
+        let home_footer = HomeFooterAvailability::load(
+            ws,
+            &queue,
+            intent.is_some(),
+            &capabilities,
+            &approvals_needed,
+        );
+
+        Ok(Snapshot {
+            config,
+            intent,
+            queue,
+            home_footer,
+            workers,
+            planner,
+            pending,
+            gate,
+            approvals_needed,
+            capabilities,
+            last_transitions,
+            recovery_required,
+            harness_copy_warnings,
+            planning_reentry: crate::planning::reentry(ws),
+        })
+    }
+
+    pub fn workers_ready(&self) -> usize {
+        self.workers
+            .iter()
+            .filter(|w| w.readiness == "invocable")
+            .count()
+    }
+
+    pub fn task_class(&self, task: &Task) -> RunnableClass {
+        let approved =
+            task.approval_required() && !self.approvals_needed.iter().any(|id| id == &task.id);
+        self.queue
+            .runnable_class(task, approved, &self.capabilities)
+    }
+
+    pub fn health(&self) -> QueueHealth {
+        let mut health = QueueHealth {
+            total: self.queue.tasks.len(),
+            ..QueueHealth::default()
+        };
+        for task in &self.queue.tasks {
+            match self.task_class(task) {
+                RunnableClass::Runnable => health.runnable += 1,
+                RunnableClass::Running => health.running += 1,
+                RunnableClass::WaitingDecision => health.waiting_decision += 1,
+                RunnableClass::WaitingApproval => health.waiting_approval += 1,
+                RunnableClass::WaitingDependency => health.waiting_dependency += 1,
+                RunnableClass::WaitingCapability => health.waiting_capability += 1,
+                RunnableClass::Held => health.held += 1,
+                RunnableClass::SetAside => health.set_aside += 1,
+                RunnableClass::Done => health.done += 1,
+            }
+        }
+        let work_pending = crate::parallel::has_queued_non_verifier(&self.queue);
+        for task in &self.queue.tasks {
+            if !crate::parallel::is_verifier(task)
+                || self.task_class(task) != RunnableClass::Runnable
+            {
+                continue;
+            }
+            if work_pending || self.queue.has_active_remediation_for(&task.id) {
+                health.review_barrier += 1;
+            } else {
+                health.serialized_reviews += 1;
+            }
+        }
+        health
+    }
+
+    pub fn intent_summary(&self) -> &str {
+        self.intent
+            .as_ref()
+            .map(|i| i.summary.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no intent yet — open New Work)")
+    }
+
+    pub fn tasks(&self) -> &[Task] {
+        &self.queue.tasks
+    }
+
+    /// JSON view for `yardlet status --json`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let health = self.health();
+        let mut json = serde_json::json!({
+            "product": self.config.product,
+            "workspace_id": self.config.workspace_id,
+            "planner": self.planner,
+            "pending": self.pending.as_ref().map(|(id, q)| serde_json::json!({"task": id, "question": q})),
+            "intent": self.intent_summary(),
+            "planning_reentry": self.planning_reentry.map(|reentry| match reentry {
+                crate::planning::PlanningReentry::PendingProposal { count } => {
+                    serde_json::json!({"kind": "pending_proposal", "count": count})
+                }
+                crate::planning::PlanningReentry::AcceptedDraft => {
+                    serde_json::json!({"kind": "accepted_draft"})
+                }
+                crate::planning::PlanningReentry::Unreadable => {
+                    serde_json::json!({"kind": "unreadable"})
+                }
+            }),
+            "queue": {
+                "runnable": health.runnable,
+                "review_barrier": health.review_barrier,
+                "serialized_reviews": health.serialized_reviews,
+                "running": health.running,
+                "waiting_decision": health.waiting_decision,
+                "waiting_approval": health.waiting_approval,
+                "waiting_dependency": health.waiting_dependency,
+                "waiting_capability": health.waiting_capability,
+                "held": health.held,
+                "set_aside": health.set_aside,
+                "done": health.done,
+                "total": health.total,
+            },
+            "tasks": self.queue.tasks.iter().map(|task| {
+                serde_json::json!({
+                    "id": task.id,
+                    "state": format!("{:?}", task.state),
+                    "class": self.task_class(task),
+                    "last_transition": self.last_transitions.get(&task.id),
+                })
+            }).collect::<Vec<_>>(),
+            "recovery_required": self.recovery_required,
+            "workers": self.workers,
+        });
+        // Only runs that persisted warnings add the key, so a workspace whose
+        // runs prepared cleanly keeps its JSON output byte-identical.
+        if !self.harness_copy_warnings.is_empty() {
+            json["harness_copy_warnings"] = serde_json::json!(self.harness_copy_warnings);
+        }
+        json
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reused_task_id_fixture(name: &str) -> (Workspace, Snapshot, String) {
+    let root = std::env::temp_dir().join(format!("yard-snapshot-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let ws = Workspace::at(&root);
+    std::fs::create_dir_all(ws.agents_dir()).unwrap();
+    std::fs::write(
+        ws.config_path(),
+        r#"schema_version: 1
+product: yardlet
+workspace_id: snapshot-test
+created_at: "2026-07-12T00:00:00Z"
+state_dir: .agents
+default_interface: tui
+canonical_queue: work-queue.yaml
+current_intent: intent-current
+"#,
+    )
+    .unwrap();
+    std::fs::write(ws.billing_path(), crate::templates::BILLING_POLICY).unwrap();
+    std::fs::write(
+        ws.workers_path(),
+        "schema_version: 1\nworkers: []\nrouting: {}\n",
+    )
+    .unwrap();
+
+    let mut queue = WorkQueue::empty();
+    queue.queue_id = "queue-intent-current".into();
+    queue.intent_id = "intent-current".into();
+    queue.tasks.push(
+        crate::yaml::from_str(
+            "id: SHARED\ntitle: Reused task id\nstate: needs_user\npriority: 10\n",
+        )
+        .unwrap(),
+    );
+    ws.save_queue(&queue).unwrap();
+
+    std::fs::create_dir_all(ws.transitions_dir()).unwrap();
+    let historical = r#"task_id: SHARED
+records:
+  - task_id: SHARED
+    intent_id: intent-old
+    from: queued
+    to: needs_user
+    cause: run_outcome
+    detail: STALE INTENT REASON
+    actor:
+      kind: system
+    ts: "2026-07-11T00:00:00+09:00"
+"#
+    .to_string();
+    std::fs::write(ws.transition_path("SHARED"), &historical).unwrap();
+
+    let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+    (ws, snapshot, historical)
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_activated_state_fixture(name: &str) -> Workspace {
+    let root = std::env::temp_dir().join(format!(
+        "yard-snapshot-corrupt-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let ws = Workspace::at(&root);
+    std::fs::create_dir_all(ws.agents_dir()).unwrap();
+    std::fs::write(
+        ws.config_path(),
+        r#"schema_version: 1
+product: yardlet
+workspace_id: corrupt-snapshot-test
+created_at: "2026-07-14T00:00:00Z"
+state_dir: .agents
+default_interface: tui
+canonical_queue: work-queue.yaml
+current_intent: intent-corrupt-test
+"#,
+    )
+    .unwrap();
+    std::fs::write(ws.billing_path(), crate::templates::BILLING_POLICY).unwrap();
+    std::fs::write(
+        ws.workers_path(),
+        "schema_version: 1\nworkers: []\nrouting: {}\n",
+    )
+    .unwrap();
+
+    let content: crate::schemas::PlanningDraftContent = crate::yaml::from_str(
+        r#"
+intent:
+  schema_version: 1
+  id: intent-corrupt-test
+  source: user
+  raw_request: reject corrupt active state
+  summary: reject corrupt active state
+  allowed_scope: [src]
+  out_of_scope: [docs]
+  acceptance: [fail closed]
+  ambiguity: low
+  status: accepted
+queue:
+  schema_version: 1
+  queue_id: queue-intent-corrupt-test
+  intent_id: intent-corrupt-test
+  tasks:
+    - id: YARD-001
+      title: reject corrupt active state
+      state: queued
+      allowed_scope: [src]
+      acceptance: [fail closed]
+      approval:
+        required: true
+"#,
+    )
+    .unwrap();
+    crate::planning::activate_express_draft(&ws, "reject corrupt active state", content).unwrap();
+
+    let mut queue = ws.load_activated_queue().unwrap().unwrap();
+    queue.tasks[0].task.title = "forged active task".to_string();
+    let lock = ws.acquire_planning_lock().unwrap();
+    ws.save_activated_queue_snapshot_locked(&lock, &queue)
+        .unwrap();
+    drop(lock);
+    ws
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::{TaskState, TransitionActor, TransitionCause};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn home_footer_task(id: &str, state: TaskState) -> Task {
+        let mut task: Task =
+            crate::yaml::from_str(&format!("id: {id}\ntitle: Home footer {id}\n")).unwrap();
+        task.state = state;
+        task
+    }
+
+    /// The health projection and the scheduler must agree on what "ready"
+    /// buys you. `runnable` alone counted three reviews the barrier would
+    /// refuse to co-schedule (issue #51).
+    #[test]
+    fn health_reports_what_the_scheduler_would_actually_admit() {
+        let mut builder = home_footer_task("BUILD", TaskState::Queued);
+        builder.kind = "implementation".into();
+        let mut tasks = vec![builder];
+        for id in ["REVIEW-A", "REVIEW-B", "REVIEW-C"] {
+            let mut review = home_footer_task(id, TaskState::Queued);
+            review.kind = "review".into();
+            tasks.push(review);
+        }
+        let mut queue = WorkQueue::empty();
+        queue.tasks = tasks;
+        let mut config: YardConfig = crate::yaml::from_str(
+            "schema_version: 1\nproduct: yardlet\nworkspace_id: health\ncreated_at: \"2026-07-27T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: \"\"\n",
+        )
+        .unwrap();
+        config.max_parallel = 4;
+        let snapshot = Snapshot {
+            config,
+            intent: None,
+            queue,
+            home_footer: HomeFooterAvailability::default(),
+            workers: Vec::new(),
+            planner: String::new(),
+            pending: None,
+            gate: None,
+            approvals_needed: Vec::new(),
+            capabilities: Default::default(),
+            last_transitions: BTreeMap::new(),
+            recovery_required: Vec::new(),
+            harness_copy_warnings: Vec::new(),
+            planning_reentry: None,
+        };
+
+        let health = snapshot.health();
+        assert_eq!(health.runnable, 4, "all four are class-runnable");
+        assert_eq!(
+            health.review_barrier, 3,
+            "three of them are reviews the barrier will not co-schedule"
+        );
+        assert_eq!(health.serialized_reviews, 0, "a builder is still queued");
+
+        // Reviews as the only work left: nothing is held BEHIND anything, but
+        // they still run one at a time — issue #51's second reported case,
+        // which a barrier-only signal reports as a bare, dishonest count.
+        let mut reviews_only = snapshot.queue.clone();
+        reviews_only.tasks.retain(|task| task.kind == "review");
+        let reviews_only = Snapshot {
+            queue: reviews_only,
+            ..snapshot
+        };
+        let health = reviews_only.health();
+        assert_eq!(health.runnable, 3);
+        assert_eq!(health.review_barrier, 0);
+        assert_eq!(health.serialized_reviews, 3);
+
+        // The counts must use the SAME inputs as `runnable`. The scheduler's own
+        // helpers work from an empty capability vocabulary and ignore approval
+        // grants, so reading them here would report 3 runnable and 0 held for a
+        // queue that is entirely reviews requiring a granted approval.
+        let mut approval_gated = reviews_only.queue.clone();
+        for task in &mut approval_gated.tasks {
+            task.approval = Some(crate::yaml::from_str("required: true").unwrap());
+        }
+        let approval_gated = Snapshot {
+            queue: approval_gated,
+            approvals_needed: Vec::new(),
+            ..reviews_only
+        };
+        let health = approval_gated.health();
+        assert_eq!(
+            health.runnable, 3,
+            "approval was granted, so these are ready"
+        );
+        assert_eq!(
+            health.serialized_reviews, 3,
+            "and the count that explains them has to agree"
+        );
+    }
+
+    #[test]
+    fn snapshot_worker_probe_can_be_injected_without_spawning_a_cli() {
+        let root =
+            std::env::temp_dir().join(format!("yard-snapshot-probe-seam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        std::fs::create_dir_all(ws.agents_dir()).unwrap();
+        std::fs::write(
+            ws.config_path(),
+            r#"schema_version: 1
+product: yardlet
+workspace_id: snapshot-probe-seam
+created_at: "2026-07-24T00:00:00Z"
+state_dir: .agents
+default_interface: tui
+canonical_queue: work-queue.yaml
+current_intent: ""
+"#,
+        )
+        .unwrap();
+        std::fs::write(ws.billing_path(), crate::templates::BILLING_POLICY).unwrap();
+        std::fs::write(
+            ws.workers_path(),
+            "schema_version: 1\nworkers:\n  - id: slow\n    enabled: true\n    invocation:\n      command: never-spawn-this\nrouting: {}\n",
+        )
+        .unwrap();
+        ws.save_queue(&WorkQueue::empty()).unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let snapshot = Snapshot::load_with_probe(&ws, |profile, _billing, _access| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            crate::guard::WorkerStatus {
+                id: profile.id.clone(),
+                command: profile.invocation.command.clone(),
+                binary_path: Some("/fixture/slow".into()),
+                version: Some("fixture 1.0".into()),
+                billing_env_present: Vec::new(),
+                contract_error: None,
+                identity: crate::guard::IdentityState::NotDeclared,
+                auth: crate::guard::AuthState::NotProbed,
+                required_version: None,
+                readiness: crate::guard::Readiness::Ready,
+                detail: "injected readiness".into(),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.workers.len(), 1);
+        assert_eq!(snapshot.workers[0].readiness, "invocable");
+        assert_eq!(snapshot.workers[0].version.as_deref(), Some("fixture 1.0"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn home_footer_queue_availability_covers_empty_terminal_and_mixed_states() {
+        let capabilities = std::collections::BTreeSet::new();
+        let mut queue = WorkQueue::empty();
+
+        let empty = HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]);
+        assert_eq!(empty, HomeFooterAvailability::default());
+
+        queue.tasks = vec![
+            home_footer_task("DONE", TaskState::Done),
+            home_footer_task("RUNNING", TaskState::Running),
+            home_footer_task("DEFERRED", TaskState::Deferred),
+        ];
+        let terminal = HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]);
+        assert!(!terminal.defer);
+        assert!(terminal.revive);
+        assert!(!terminal.tidy);
+
+        queue
+            .tasks
+            .push(home_footer_task("QUEUED", TaskState::Queued));
+        let mixed = HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]);
+        assert!(mixed.defer);
+        assert!(mixed.revive);
+        assert!(!mixed.tidy);
+    }
+
+    #[test]
+    fn home_footer_tidy_availability_matches_queue_cleanup_boundaries() {
+        let mut capabilities = std::collections::BTreeSet::new();
+        let mut queue = WorkQueue::empty();
+        queue.tasks = vec![home_footer_task("READY", TaskState::Queued)];
+        assert!(!HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]).tidy);
+
+        let mut waiting = home_footer_task("WAITING", TaskState::Queued);
+        waiting.depends_on = vec!["HELD".to_string()];
+        queue.tasks = vec![waiting, home_footer_task("HELD", TaskState::Deferred)];
+        assert!(HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]).tidy);
+
+        queue.tasks = vec![home_footer_task("DONE", TaskState::Done)];
+        assert!(!HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]).tidy);
+        assert!(HomeFooterAvailability::from_queue(&queue, true, &capabilities, &[]).tidy);
+
+        let mut blocked = home_footer_task("BLOCKED", TaskState::Blocked);
+        blocked.required_capabilities = vec!["image_generation".to_string()];
+        queue.tasks = vec![blocked];
+        assert!(HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]).tidy);
+        capabilities.insert("image_generation".to_string());
+        assert!(!HomeFooterAvailability::from_queue(&queue, false, &capabilities, &[]).tidy);
+    }
+
+    #[test]
+    fn home_footer_workspace_evidence_gates_monitor_handoff_and_trust() {
+        let root =
+            std::env::temp_dir().join(format!("yard-home-footer-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::at(&root);
+        let queue = WorkQueue::empty();
+        let capabilities = std::collections::BTreeSet::new();
+        let availability = HomeFooterAvailability::load(&ws, &queue, false, &capabilities, &[]);
+        assert!(!availability.monitor);
+        assert!(!availability.handoff);
+        assert!(!availability.trust);
+
+        let run_dir = ws.runs_dir().join("run-home-footer");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let availability = HomeFooterAvailability::load(&ws, &queue, false, &capabilities, &[]);
+        assert!(availability.monitor);
+        assert!(!availability.handoff);
+        assert!(!availability.trust);
+
+        std::fs::write(run_dir.join("handoff.md"), "# Handoff\n").unwrap();
+        let availability = HomeFooterAvailability::load(&ws, &queue, false, &capabilities, &[]);
+        assert!(availability.monitor);
+        assert!(availability.handoff);
+        assert!(!availability.trust);
+
+        let telemetry = crate::telemetry::log_path(&ws);
+        std::fs::create_dir_all(telemetry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &telemetry,
+            "{\"ts\":\"\",\"task_id\":\"TASK\",\"worker\":\"codex\"}\n",
+        )
+        .unwrap();
+        assert!(HomeFooterAvailability::load(&ws, &queue, false, &capabilities, &[]).trust);
+
+        std::fs::remove_file(telemetry).unwrap();
+        crate::state::append_transition(
+            &ws,
+            crate::state::transition(
+                "TASK",
+                TaskState::Queued,
+                TaskState::Done,
+                TransitionCause::RunOutcome,
+                "finished",
+                TransitionActor::System,
+            ),
+        )
+        .unwrap();
+        assert!(HomeFooterAvailability::load(&ws, &queue, false, &capabilities, &[]).trust);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_projection_uses_only_the_queue_intent_transition() {
+        let (ws, stale_only, historical) = reused_task_id_fixture("intent-scope");
+        assert!(!stale_only.last_transitions.contains_key("SHARED"));
+        assert_eq!(
+            std::fs::read_to_string(ws.transition_path("SHARED")).unwrap(),
+            historical
+        );
+
+        crate::state::append_transition(
+            &ws,
+            crate::state::transition(
+                "SHARED",
+                TaskState::Queued,
+                TaskState::NeedsUser,
+                TransitionCause::RunOutcome,
+                "CURRENT INTENT REASON",
+                TransitionActor::System,
+            ),
+        )
+        .unwrap();
+        let current = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert_eq!(
+            current.last_transitions.get("SHARED").unwrap().detail,
+            "CURRENT INTENT REASON"
+        );
+        let preserved = std::fs::read_to_string(ws.transition_path("SHARED")).unwrap();
+        assert!(preserved.contains("STALE INTENT REASON"));
+        assert!(preserved.contains("CURRENT INTENT REASON"));
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn snapshot_rejects_corrupt_activated_state_before_projecting_it() {
+        let ws = corrupt_activated_state_fixture("validation-gate");
+
+        let error = Snapshot::load_reusing_workers(&ws, Vec::new())
+            .err()
+            .expect("corrupt activated state must not produce a snapshot")
+            .to_string();
+
+        assert!(error.contains("unconfirmed_or_inconsistent"), "{error}");
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn issue_29_dead_worker_is_projected_as_recovery_required_without_writes() {
+        let (ws, _, _) = reused_task_id_fixture("dead-worker-status");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        let run_id = "run-issue-29-dead-worker";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: running\nstarted_at: \"2026-07-23T00:00:00Z\"\nworktree: .\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(run_dir.join("worker.pid"), u32::MAX.to_string()).unwrap();
+        std::fs::write(
+            run_dir.join("worker-process.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\nattempt_id: att-dead\nworker_id: fixture\npid: {}\nprocess_start_marker: definitely-not-live\nstate: running\n",
+                u32::MAX
+            ),
+        )
+        .unwrap();
+
+        let queue_before = std::fs::read(ws.queue_path()).unwrap();
+        let run_before = std::fs::read(run_dir.join("run.yaml")).unwrap();
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        let json = snapshot.to_json();
+
+        assert_eq!(json["queue"]["running"], 1);
+        let diagnostic = &json["recovery_required"][0];
+        assert_eq!(diagnostic["task_id"], "SHARED");
+        assert_eq!(diagnostic["run_id"], run_id);
+        assert_eq!(diagnostic["effective_state"], "interrupted");
+        assert_eq!(diagnostic["action"], "yardlet recover");
+        assert_eq!(std::fs::read(ws.queue_path()).unwrap(), queue_before);
+        assert_eq!(std::fs::read(run_dir.join("run.yaml")).unwrap(), run_before);
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn issue_29_newer_historical_run_does_not_mask_live_current_intent_worker() {
+        let (ws, _, _) = reused_task_id_fixture("live-current-worker");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        let current_run_id = "run-issue-29-live-current";
+        let current_run_dir = ws.runs_dir().join(current_run_id);
+        std::fs::create_dir_all(&current_run_dir).unwrap();
+        std::fs::write(
+            current_run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {current_run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: running\nstarted_at: \"2026-07-23T00:00:00Z\"\n"
+            ),
+        )
+        .unwrap();
+        let pid = std::process::id();
+        std::fs::write(current_run_dir.join("worker.pid"), pid.to_string()).unwrap();
+        std::fs::write(
+            current_run_dir.join("worker-process.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {current_run_id}\nattempt_id: att-live\nworker_id: fixture\npid: {pid}\nprocess_start_marker: {}\nstate: running\n",
+                crate::workers::process_start_marker(pid).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let stale_run_id = "run-issue-29-newer-old-intent";
+        let stale_run_dir = ws.runs_dir().join(stale_run_id);
+        std::fs::create_dir_all(&stale_run_dir).unwrap();
+        std::fs::write(
+            stale_run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {stale_run_id}\ntask_id: SHARED\nintent_id: intent-old\nworker: fixture\nstate: running\nstarted_at: \"2099-01-01T00:00:00Z\"\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert!(
+            snapshot.recovery_required.is_empty(),
+            "a newer historical run must not mask the verified live worker for the current intent"
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn issue_29_finalized_run_is_not_diagnosed_as_a_dead_worker() {
+        let (ws, _, _) = reused_task_id_fixture("finalized-worker-status");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        let run_id = "run-issue-29-finalized";
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: done\ncompleted_at: \"2026-07-23T00:01:00Z\"\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert!(snapshot.recovery_required.is_empty());
+        assert!(snapshot.to_json()["recovery_required"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn write_done_run_for_current_intent(ws: &Workspace, run_id: &str) -> std::path::PathBuf {
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: done\nstarted_at: \"2026-07-23T00:00:00Z\"\ncompleted_at: \"2026-07-23T00:01:00Z\"\n"
+            ),
+        )
+        .unwrap();
+        run_dir
+    }
+
+    #[test]
+    fn harness_copy_warnings_evidence_is_surfaced_in_the_readonly_projection() {
+        let (ws, _, _) = reused_task_id_fixture("harness-copy-warnings");
+        let run_id = "run-harness-copy-warnings";
+        let run_dir = write_done_run_for_current_intent(&ws, run_id);
+        std::fs::create_dir_all(run_dir.join("evidence")).unwrap();
+        std::fs::write(
+            run_dir.join("evidence/harness-copy-warnings.log"),
+            "copy_dir: skipped symlink 'a' -> 'b'\ncopy_dir: skipped symlink 'c' -> 'd'\n",
+        )
+        .unwrap();
+
+        let queue_before = std::fs::read(ws.queue_path()).unwrap();
+        let run_before = std::fs::read(run_dir.join("run.yaml")).unwrap();
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+
+        let warning = snapshot
+            .harness_copy_warnings
+            .first()
+            .expect("a run with harness-copy-warnings evidence must be projected");
+        assert_eq!(warning.task_id, "SHARED");
+        assert_eq!(warning.run_id, run_id);
+        assert_eq!(warning.warning_count, 2);
+        assert_eq!(warning.evidence, "evidence/harness-copy-warnings.log");
+
+        let json = snapshot.to_json();
+        assert_eq!(json["harness_copy_warnings"][0]["task_id"], "SHARED");
+        assert_eq!(json["harness_copy_warnings"][0]["run_id"], run_id);
+        assert_eq!(json["harness_copy_warnings"][0]["warning_count"], 2);
+
+        // Read-only projection: surfacing the evidence must not rewrite any
+        // canonical state or run record.
+        assert_eq!(std::fs::read(ws.queue_path()).unwrap(), queue_before);
+        assert_eq!(std::fs::read(run_dir.join("run.yaml")).unwrap(), run_before);
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn runs_without_harness_copy_warnings_leave_the_projection_unchanged() {
+        let (ws, _, _) = reused_task_id_fixture("harness-copy-clean");
+        write_done_run_for_current_intent(&ws, "run-harness-copy-clean");
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert!(snapshot.harness_copy_warnings.is_empty());
+        assert!(
+            snapshot.to_json().get("harness_copy_warnings").is_none(),
+            "a clean run must not grow a new status key"
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn write_prepare_window_run(ws: &Workspace, run_id: &str, started_at: &str) {
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: running\nstarted_at: \"{started_at}\"\nworktree: .\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("worker-process.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\nattempt_id: att-prepare\nworker_id: fixture\npid: 0\nstate: prepared\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn issue_29_fresh_dispatch_prepare_window_is_not_flagged_as_stale() {
+        let (ws, _, _) = reused_task_id_fixture("prepare-window-fresh");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        write_prepare_window_run(
+            &ws,
+            "run-issue-29-prepare-fresh",
+            &chrono::Local::now().to_rfc3339(),
+        );
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert!(
+            snapshot.recovery_required.is_empty(),
+            "a just-started dispatch still in its prepared/pid=0 window must not be \
+             diagnosed as interrupted: {:?}",
+            snapshot.recovery_required
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    fn write_run_without_provenance_file(ws: &Workspace, run_id: &str, started_at: &str) {
+        let run_dir = ws.runs_dir().join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.yaml"),
+            format!(
+                "schema_version: 1\nrun_id: {run_id}\ntask_id: SHARED\nintent_id: intent-current\nworker: fixture\nstate: running\nstarted_at: \"{started_at}\"\nworktree: .\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn issue_29_fresh_run_without_provenance_file_is_not_flagged_as_stale() {
+        let (ws, _, _) = reused_task_id_fixture("provenance-pre-window-fresh");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        write_run_without_provenance_file(
+            &ws,
+            "run-issue-29-provenance-pre-fresh",
+            &chrono::Local::now().to_rfc3339(),
+        );
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        assert!(
+            snapshot.recovery_required.is_empty(),
+            "a just-started run whose worker-process.yaml is not written yet must not \
+             be diagnosed as interrupted: {:?}",
+            snapshot.recovery_required
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn issue_29_old_run_with_lost_provenance_is_still_diagnosed() {
+        let (ws, _, _) = reused_task_id_fixture("provenance-lost-old");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        let run_id = "run-issue-29-provenance-lost";
+        write_run_without_provenance_file(&ws, run_id, "2026-01-01T00:00:00+00:00");
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        let diagnostic = snapshot
+            .recovery_required
+            .first()
+            .expect("a run whose provenance never appeared must be diagnosed once stale");
+        assert_eq!(diagnostic.task_id, "SHARED");
+        assert_eq!(diagnostic.run_id, run_id);
+        assert_eq!(diagnostic.effective_state, "interrupted");
+        assert!(
+            diagnostic.reason.contains("provenance is missing"),
+            "reason should name the lost provenance: {}",
+            diagnostic.reason
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+
+    #[test]
+    fn issue_29_stalled_dispatch_preparation_is_still_diagnosed() {
+        let (ws, _, _) = reused_task_id_fixture("prepare-window-stalled");
+        let mut queue = ws.load_queue().unwrap();
+        queue.tasks[0].state = TaskState::Running;
+        ws.save_queue(&queue).unwrap();
+
+        let run_id = "run-issue-29-prepare-stalled";
+        write_prepare_window_run(&ws, run_id, "2026-01-01T00:00:00+00:00");
+
+        let snapshot = Snapshot::load_reusing_workers(&ws, Vec::new()).unwrap();
+        let diagnostic = snapshot
+            .recovery_required
+            .first()
+            .expect("a dispatch that never left preparation must be diagnosed once stale");
+        assert_eq!(diagnostic.task_id, "SHARED");
+        assert_eq!(diagnostic.run_id, run_id);
+        assert_eq!(diagnostic.effective_state, "interrupted");
+        assert!(
+            diagnostic.reason.contains("dispatch preparation"),
+            "reason should name the stalled prepare window: {}",
+            diagnostic.reason
+        );
+
+        let _ = std::fs::remove_dir_all(ws.root);
+    }
+}

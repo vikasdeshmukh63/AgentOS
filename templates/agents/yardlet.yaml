@@ -1,0 +1,38 @@
+# Reference shape for the dynamic `.agents/yardlet.yaml` written by
+# `yardlet init`. Workspace identity and timestamps are generated at runtime.
+schema_version: 1
+product: yardlet
+workspace_id: generated-at-init
+created_at: generated-at-init
+state_dir: .agents
+default_interface: tui
+canonical_queue: .agents/work-queue.yaml
+current_intent: .agents/intent-contract.yaml
+language: auto
+default_access: sandboxed
+max_parallel: 1
+# macOS only: switch to an ASCII input source when a shortcut screen gains
+# focus, and restore your IME on text screens. The switch happens only on a
+# screen transition; a manual 한/영 toggle afterwards is respected. If this
+# still fights your input-source tooling (e.g. Karabiner-Elements rules keyed
+# on the active source), set it to false. Trade-off when off: with a CJK IME
+# active, the first key on a shortcut screen is eaten by composition.
+auto_ime: true
+ambiguity_gate: true
+harness_discovery: true
+skill_library: ""
+auto_equip: true
+auto_skill: true
+auto_rule: true
+auto_prune: true
+hooks: true
+auto_commit: false
+git_finish:
+  # Remote delivery stays disabled until the user opts in.
+  auto_push: false
+  # `direct` preserves legacy explicit-target semantics. Set `auto` only for a
+  # GitHub checkout with an upstream and an installed, authenticated `gh`.
+  delivery: direct
+  remote: ""
+  target_ref: ""
+  pre_push_checks: []

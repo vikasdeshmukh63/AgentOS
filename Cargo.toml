@@ -1,0 +1,71 @@
+[package]
+name = "agentos"
+version = "0.10.3"
+edition = "2021"
+rust-version = "1.82"
+description = "AgentOS: a local AI workbench. Plan, queue, route, validate, and hand off long-running work using your already-installed Codex and Claude Code CLIs as hidden workers."
+license = "MIT"
+repository = "https://www.build01.com"
+keywords = ["ai", "agent", "tui", "workbench", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Ship only what is needed to build/use the crate. Keeps internal/non-public
+# material (repo's own .agents state, seed queues, CI, backups) out of the
+# published tarball, which is permanent on crates.io.
+exclude = ["seeds/**", ".github/**", ".agents/**", ".claude", ".codex", "*.bundle"]
+
+[[bin]]
+name = "agentos"
+path = "src/main.rs"
+
+# cargo-binstall: fetch the prebuilt binary attached to the GitHub release
+# (see .github/workflows/release.yml) instead of compiling from source.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/agentos-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "agentos"
+
+[dependencies]
+# Clap 4.6 requires Cargo's edition-2024 support. Keep the 4.5 line while the
+# package's declared MSRV remains Rust 1.82.
+clap = { version = ">=4.5, <4.6", features = ["derive"] }
+# Clap 4.5.58+ accepts clap_lex 1.x, whose 1.1 line requires Rust 1.85.
+# Constrain resolution to the Rust-1.82-compatible 1.0 line without blocking
+# compatible Clap 4.5 patch releases.
+clap_lex = ">=1.0, <1.1"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+anyhow = "1"
+chrono = { version = "0.4", features = ["clock"] }
+unicode-width = "0.2"
+ctrlc = "3"
+libc = "0.2"
+
+[features]
+# The slow process fixtures: they spawn real binaries, open PTYs, and wait on
+# real timing. They are 56% of a full test run's wall clock and they are what
+# catches the defects unit tests structurally cannot (#52, #64, #83, #91, #107
+# were all found or proven there), so they run in CI on every PR — this feature
+# only decides whether a LOCAL `cargo test` pays for them (issue #105).
+#
+# Off by default, and never silently: each gated target keeps a test whose NAME
+# says it is gated, so a local run lists what it did not verify.
+slow-process-tests = []
+
+[profile.test]
+# Line tables keep backtraces and panic locations readable while dropping the
+# full type/variable debug info. That info is what made the test artifacts
+# dominate the build cache: every one of the integration test binaries carries
+# its own complete copy (issue #105).
+debug = "line-tables-only"
+
+[profile.dev]
+# Same reasoning for the binary the process tests spawn.
+debug = "line-tables-only"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

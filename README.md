@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/vikasdeshmukh63/AgentOS">
-    <img src="docs/assets/logo_text.png" alt="AgentOS Logo Text">
+    <img src="docs/assets/logo_text.png" alt="AgentOS Logo Text" style="width:300px; height:auto">
   </a>
 </p>
 

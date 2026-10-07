@@ -2,9 +2,8 @@
 
 <p align="center">
   <a href="https://github.com/vikasdeshmukh63/AgentOS">
-    ![AgentOS Logo](https://raw.githubusercontent.com/vikasdeshmukh63/AgentOS/main/docs/assets/logo.png)
+  ![AgentOS Logo Text](https://res.cloudinary.com/dlgi9ytwh/image/upload/v1791381611/Agent_OS_Gradient_Ribbon_Logo.png)
   </a>
-  ![AgentOS Logo Text](https://raw.githubusercontent.com/vikasdeshmukh63/AgentOS/main/docs/assets/logo_text.png)
 </p>
 
 [![crates.io](https://img.shields.io/crates/v/agentos.svg)](https://crates.io/crates/agentos)

@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/vikasdeshmukh63/AgentOS">
-  ![AgentOS Logo Text](https://res.cloudinary.com/dlgi9ytwh/image/upload/v1791381611/Agent_OS_Gradient_Ribbon_Logo.png)
+    <img src="docs/assets/logo_text.png" alt="AgentOS Logo Text">
   </a>
 </p>
 

@@ -2,9 +2,9 @@
 
 <p align="center">
   <a href="https://github.com/vikasdeshmukh63/AgentOS">
-    <img src="docs/assets/logo.png" alt="AgentOS Logo" height="120">
+    ![AgentOS Logo](logo.png)
   </a>
-  <img src="docs/assets/symbol.png" alt="AgentOS Symbol" height="60">
+  ![AgentOS Symbol](symbol.png)
 </p>
 
 [![crates.io](https://img.shields.io/crates/v/agentos.svg)](https://crates.io/crates/agentos)

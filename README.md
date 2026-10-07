@@ -1,5 +1,12 @@
 # AgentOS
 
+<p align="center">
+  <a href="https://github.com/vikasdeshmukh63/AgentOS">
+    <img src="docs/assets/logo.png" alt="AgentOS Logo" height="120">
+  </a>
+  <img src="docs/assets/symbol.png" alt="AgentOS Symbol" height="60">
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/agentos.svg)](https://crates.io/crates/agentos)
 [![CI](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml)
 [![downloads](https://img.shields.io/crates/d/agentos.svg)](https://crates.io/crates/agentos)

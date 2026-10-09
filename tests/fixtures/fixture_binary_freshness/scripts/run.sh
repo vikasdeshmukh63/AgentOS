@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 3 ]]; then
-  printf 'usage: %s <yardlet-bin> <evidence-dir> <scenario>\n' "$0" >&2
+  printf 'usage: %s <agentos-bin> <evidence-dir> <scenario>\n' "$0" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCENARIO="$3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -34,8 +34,8 @@ EOF
 }
 
 prepare_stale_binary() {
-  local stale_bin="$EVIDENCE_DIR/stale-yardlet"
-  cp "$FIXTURE_ROOT/stale-yardlet.sh" "$stale_bin"
+  local stale_bin="$EVIDENCE_DIR/stale-agentos"
+  cp "$FIXTURE_ROOT/stale-agentos.sh" "$stale_bin"
   chmod +x "$stale_bin"
   printf '%s\n' "$stale_bin"
 }
@@ -47,8 +47,8 @@ assert_actionable_stale_failure() {
   grep -Fq 'fixture capability preflight failed' "$diagnostic" || fail "preflight headline missing"
   grep -Fq 'target binary:' "$diagnostic" || fail "target binary path missing"
   grep -Fq 'older than the source fixture registry' "$diagnostic" || fail "stale artifact cause missing"
-  grep -Fq 'cargo clean -p yardlet' "$diagnostic" || fail "clean command missing"
-  grep -Fq 'cargo build --bin yardlet' "$diagnostic" || fail "rebuild command missing"
+  grep -Fq 'cargo clean -p agentos' "$diagnostic" || fail "clean command missing"
+  grep -Fq 'cargo build --bin agentos' "$diagnostic" || fail "rebuild command missing"
   grep -Fq 'then retry' "$diagnostic" || fail "retry instruction missing"
   ! grep -Fq 'unknown fixture' "$diagnostic" || fail "raw unknown-fixture error leaked"
   [[ ! -e "$marker" ]] || fail "stale fixture body executed despite failed preflight"
@@ -83,8 +83,8 @@ case "$SCENARIO" in
     write_summary "복수 required fixture id 누락을 모두 본문 실행 전에 진단함"
     ;;
   fresh)
-    preflight_fixture_binary "$YARDLET_BIN" watch-until-path-exists
-    "$YARDLET_BIN" eval fixtures --json --fixture watch-until-path-exists \
+    preflight_fixture_binary "$AGENTOS_BIN" watch-until-path-exists
+    "$AGENTOS_BIN" eval fixtures --json --fixture watch-until-path-exists \
       >"$EVIDENCE_DIR/fresh-result.json"
     python3 - "$EVIDENCE_DIR/fresh-result.json" <<'PY'
 import json

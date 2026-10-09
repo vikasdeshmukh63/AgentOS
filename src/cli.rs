@@ -80,7 +80,7 @@ pub enum Command {
     Memory(MemoryArgs),
     /// Observe a local command or path until a bounded condition is met.
     Watch(WatchArgs),
-    /// Run deterministic Yardlet mechanism fixtures.
+    /// Run deterministic AgentOS mechanism fixtures.
     Eval(EvalArgs),
     /// Review routing telemetry and apply suggested worker preferences.
     Routing(RoutingArgs),
@@ -140,7 +140,7 @@ enum ResourceCmd {
     Stop(ResourceLifecycleArgs),
     /// Restart an owned resource when a typed restart command exists.
     Restart(ResourceLifecycleArgs),
-    /// Detach Yardlet without killing the target.
+    /// Detach AgentOS without killing the target.
     Detach(ResourceLifecycleArgs),
     /// Clean up an owned resource after a fresh identity probe.
     Cleanup(ResourceLifecycleArgs),
@@ -557,7 +557,7 @@ enum EvalCmd {
 
 #[derive(Subcommand)]
 enum MemoryCmd {
-    /// Ask a worker for memory drafts, then let Yardlet core write canonical docs.
+    /// Ask a worker for memory drafts, then let AgentOS core write canonical docs.
     Init,
     /// Refresh memory docs from a worker draft.
     Refresh {
@@ -867,7 +867,7 @@ fn cmd_harness(cwd: &std::path::Path, args: HarnessArgs) -> Result<()> {
                 "\nLearned skills below score floor over enough runs are auto-pruned \
                  (auto_prune). Learned rules are kept until removed (git-reversible). \
                  Mined observations only SUGGEST — apply a rule/skill/scope change yourself. \
-                 Full skill table: `yardlet skill review`."
+                 Full skill table: `agentos skill review`."
             );
         }
     }
@@ -938,7 +938,7 @@ fn cmd_skill(cwd: &std::path::Path, args: SkillArgs) -> Result<()> {
                     println!("nothing to suggest \u{2014} detected presets are fully equipped.");
                 } else {
                     println!("suggested for this repo: {}", s.join(", "));
-                    println!("equip with: yardlet skill equip {}", s.join(" "));
+                    println!("equip with: agentos skill equip {}", s.join(" "));
                 }
             }
             None => unreachable!("the managed built-in library is always available"),
@@ -970,7 +970,7 @@ fn cmd_skill(cwd: &std::path::Path, args: SkillArgs) -> Result<()> {
         SkillCmd::Research { topic } => {
             let topic = topic.join(" ");
             if topic.trim().is_empty() {
-                anyhow::bail!("usage: yardlet skill research \"<topic>\"");
+                anyhow::bail!("usage: agentos skill research \"<topic>\"");
             }
             let r = crate::skill_author::research(&ws, &topic)?;
             println!("researched skill: {}", r.name);
@@ -1077,7 +1077,7 @@ fn cmd_routing(cwd: &std::path::Path, args: RoutingArgs) -> Result<()> {
                 for s in &suggestions {
                     println!("  - {}", s.reason);
                     println!(
-                        "    yardlet routing apply --kind {} --worker {}",
+                        "    agentos routing apply --kind {} --worker {}",
                         s.kind, s.to
                     );
                 }
@@ -1194,9 +1194,9 @@ fn print_drift(d: &crate::rubric::RubricDrift) {
     }
     println!("\nApply:");
     println!(
-        "  yardlet rubric sync               # capabilities + missing workers + fill empty text"
+        "  agentos rubric sync               # capabilities + missing workers + fill empty text"
     );
-    println!("  yardlet rubric sync --adopt-text  # also replace customized best_for/not_for/cost_weight");
+    println!("  agentos rubric sync --adopt-text  # also replace customized best_for/not_for/cost_weight");
 }
 
 fn hint_adopt_text(d: &crate::rubric::RubricDrift, adopt_text: bool) {
@@ -1225,25 +1225,25 @@ fn clip(s: &str) -> String {
 }
 
 fn launch_tui(cwd: &std::path::Path) -> Result<()> {
-    // Like the worker CLIs, `yardlet` just works: it initializes on demand.
+    // Like the worker CLIs, `agentos` just works: it initializes on demand.
     let (ws, just_created) = init::ensure_initialized(cwd)?;
     crate::ui::run(&ws, just_created)
 }
 
 fn cmd_init(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
     let written = init::init(cwd, args.force)?;
-    println!("Initialized Yardlet workspace at {}/.agents", cwd.display());
+    println!("Initialized AgentOS workspace at {}/.agents", cwd.display());
     for f in &written {
         println!("  + {f}");
     }
-    println!("\nNext: `yardlet` opens the workbench, `yardlet worker status` checks workers.");
+    println!("\nNext: `agentos` opens the workbench, `agentos worker status` checks workers.");
     Ok(())
 }
 
 fn cmd_goal(cwd: &std::path::Path, args: GoalArgs) -> Result<()> {
     let (ws, created) = init::ensure_initialized(cwd)?;
     if created {
-        println!("Initialized Yardlet workspace (.agents/).");
+        println!("Initialized AgentOS workspace (.agents/).");
     }
     let goal = args.goal.join(" ");
     let report = crate::planner::plan_goal_with_report(
@@ -1269,13 +1269,13 @@ fn cmd_goal(cwd: &std::path::Path, args: GoalArgs) -> Result<()> {
             report.draft_revision_id, report.session_id
         );
         println!(
-            "Next: `yardlet planning show`, then `yardlet planning confirm --expected-head {}`.",
+            "Next: `agentos planning show`, then `agentos planning confirm --expected-head {}`.",
             report.draft_revision_id
         );
         return Ok(());
     }
     if args.plan_only {
-        println!("Next: `yardlet run --auto` to execute.");
+        println!("Next: `agentos run --auto` to execute.");
         return Ok(());
     }
     println!("\nRunning \u{2014} stops only if it needs you:\n");
@@ -1286,7 +1286,7 @@ fn cmd_goal(cwd: &std::path::Path, args: GoalArgs) -> Result<()> {
 fn cmd_new(cwd: &std::path::Path, args: NewArgs) -> Result<()> {
     let (ws, created) = init::ensure_initialized(cwd)?;
     if created {
-        println!("Initialized Yardlet workspace (.agents/).");
+        println!("Initialized AgentOS workspace (.agents/).");
     }
     let request = args.request.join(" ");
     if request.trim().is_empty() {
@@ -1294,7 +1294,7 @@ fn cmd_new(cwd: &std::path::Path, args: NewArgs) -> Result<()> {
     }
     if args.run {
         anyhow::bail!(
-            "`yardlet new --run` cannot bypass draft review; accept and confirm the visible draft, then run it"
+            "`agentos new --run` cannot bypass draft review; accept and confirm the visible draft, then run it"
         );
     }
     println!("Planning: {request}\n");
@@ -1323,7 +1323,7 @@ fn cmd_new(cwd: &std::path::Path, args: NewArgs) -> Result<()> {
         }
     }
     println!(
-        "\nNext: `yardlet planning start` accepts the sole fresh proposal, confirms it, and starts the queue. If it refuses, use `yardlet planning show` and the detailed accept/reject/confirm flow."
+        "\nNext: `agentos planning start` accepts the sole fresh proposal, confirms it, and starts the queue. If it refuses, use `agentos planning show` and the detailed accept/reject/confirm flow."
     );
     Ok(())
 }
@@ -1351,7 +1351,7 @@ fn cmd_planning(cwd: &std::path::Path, args: PlanningArgs) -> Result<()> {
         PlanningCmd::Start => {
             let started = crate::planning::start_singleton(&ws).map_err(|error| {
                 anyhow::anyhow!(
-                    "planning start refused: {error}\nNext: `yardlet planning show` or open the TUI planning review for the detailed flow."
+                    "planning start refused: {error}\nNext: `agentos planning show` or open the TUI planning review for the detailed flow."
                 )
             })?;
             let transition = match started.stage {
@@ -1461,8 +1461,8 @@ fn cmd_planning(cwd: &std::path::Path, args: PlanningArgs) -> Result<()> {
                 expected_head, activation.confirmation_id
             );
             println!(
-                "Next: `yardlet run --auto --execute` drains the queue \
-                 (`yardlet run --next --execute` runs one task; add --execute or nothing runs)."
+                "Next: `agentos run --auto --execute` drains the queue \
+                 (`agentos run --next --execute` runs one task; add --execute or nothing runs)."
             );
             Ok(())
         }
@@ -1485,7 +1485,7 @@ fn cmd_planning(cwd: &std::path::Path, args: PlanningArgs) -> Result<()> {
                 report.task_count
             );
             println!(
-                "\nNext: `yardlet planning start` for a sole fresh proposal, or `yardlet planning show` for the detailed accept/confirm flow."
+                "\nNext: `agentos planning start` for a sole fresh proposal, or `agentos planning show` for the detailed accept/confirm flow."
             );
             Ok(())
         }
@@ -1560,7 +1560,7 @@ fn cmd_add(cwd: &std::path::Path, args: AddArgs) -> Result<()> {
     let ws = init::ensure_initialized(cwd)?.0;
     let request = args.request.join(" ");
     if request.trim().is_empty() {
-        anyhow::bail!("provide a task, e.g. `yardlet add \"add admin order search\"`");
+        anyhow::bail!("provide a task, e.g. `agentos add \"add admin order search\"`");
     }
     let task = ws.append_user_task(UserTaskInput {
         title: request.trim().to_string(),
@@ -1588,7 +1588,7 @@ fn cmd_queue(cwd: &std::path::Path) -> Result<()> {
     crate::planning::validate_active_activation(&ws)?;
     let snap = Snapshot::load(&ws)?;
     if snap.queue.tasks.is_empty() {
-        println!("Queue is empty. Run `yardlet new \"...\"` to create work.");
+        println!("Queue is empty. Run `agentos new \"...\"` to create work.");
         return Ok(());
     }
     for line in queue_lines(&snap) {
@@ -1693,7 +1693,7 @@ fn cmd_gc(cwd: &std::path::Path, args: GcArgs) -> Result<()> {
     match &target {
         Some(target) => println!("Integration target: {target}"),
         None => println!(
-            "Integration target: (unresolved — set one with `yardlet target <branch>`; \
+            "Integration target: (unresolved — set one with `agentos target <branch>`; \
              nothing can be judged without it)"
         ),
     }
@@ -1790,7 +1790,7 @@ fn cmd_gc(cwd: &std::path::Path, args: GcArgs) -> Result<()> {
                 )
             })
             .count();
-        println!("Dry run: nothing was removed. `yardlet gc --apply` would end {would}.");
+        println!("Dry run: nothing was removed. `agentos gc --apply` would end {would}.");
     }
     if report
         .entries
@@ -1857,11 +1857,11 @@ fn cmd_answer(cwd: &std::path::Path, args: AnswerArgs) -> Result<()> {
                 println!("{task_id} is waiting on you:\n");
                 println!("{q}\n");
                 println!(
-                    "Reply with `yardlet answer \"...\" --task {task_id}` \
+                    "Reply with `agentos answer \"...\" --task {task_id}` \
                      (ask a follow-up question, or give your decision)."
                 );
             }
-            None => println!("{task_id} has no recorded message. See `yardlet handoff`."),
+            None => println!("{task_id} has no recorded message. See `agentos handoff`."),
         }
         return Ok(());
     }
@@ -1895,7 +1895,7 @@ fn cmd_answer(cwd: &std::path::Path, args: AnswerArgs) -> Result<()> {
         if let Some(q) = run::latest_question_for(&ws, &task_id) {
             println!("\n{task_id} replied:\n");
             println!("{q}");
-            println!("\nStill needs you. Reply with `yardlet answer \"...\" --task {task_id}`.");
+            println!("\nStill needs you. Reply with `agentos answer \"...\" --task {task_id}`.");
         }
     } else if !report.run_id.is_empty() {
         println!("\nrun {} resumed", report.run_id);
@@ -2044,7 +2044,7 @@ fn cmd_approve(cwd: &std::path::Path, args: ApproveArgs) -> Result<()> {
     }
     crate::approvals::grant(&ws, &args.task)?;
     println!(
-        "Approved {} (single use). Run it with `yardlet run --task {} --execute`.",
+        "Approved {} (single use). Run it with `agentos run --task {} --execute`.",
         args.task, args.task
     );
     Ok(())
@@ -2087,11 +2087,11 @@ fn cmd_defer(cwd: &std::path::Path, args: DeferArgs) -> Result<()> {
             outcome.group_id,
             outcome.deferred.join(", ")
         );
-        println!("Revive the whole group:  yardlet revive {id} --group");
-        println!("Revive only {id}:       yardlet revive {id}");
+        println!("Revive the whole group:  agentos revive {id} --group");
+        println!("Revive only {id}:       agentos revive {id}");
     } else {
         println!(
-            "Deferred {id}: set aside, not pending and not done. Revive it with `yardlet revive {id}`."
+            "Deferred {id}: set aside, not pending and not done. Revive it with `agentos revive {id}`."
         );
     }
     if !args.cascade && !outcome.stranded.is_empty() {
@@ -2100,8 +2100,8 @@ fn cmd_defer(cwd: &std::path::Path, args: DeferArgs) -> Result<()> {
             outcome.stranded.len(),
             outcome.stranded.join(", ")
         );
-        println!("  Defer the stranded chain:  yardlet defer {id} --cascade");
-        println!("  Revive {id}:              yardlet revive {id}");
+        println!("  Defer the stranded chain:  agentos defer {id} --cascade");
+        println!("  Revive {id}:              agentos revive {id}");
     }
     Ok(())
 }
@@ -2133,7 +2133,7 @@ fn cmd_revive(cwd: &std::path::Path, args: ReviveArgs) -> Result<()> {
 
     if outcome.revived.len() == 1 {
         println!(
-            "Revived {}: queued again. Run it with `yardlet run --task {} --execute`.",
+            "Revived {}: queued again. Run it with `agentos run --task {} --execute`.",
             outcome.revived[0], outcome.revived[0]
         );
     } else {
@@ -2142,7 +2142,7 @@ fn cmd_revive(cwd: &std::path::Path, args: ReviveArgs) -> Result<()> {
             outcome.revived.len(),
             outcome.revived.join(", ")
         );
-        println!("Run the queue with `yardlet run --auto --execute`.");
+        println!("Run the queue with `agentos run --auto --execute`.");
     }
 
     if !outcome.blocked_dependencies.is_empty() {
@@ -2174,7 +2174,7 @@ fn cmd_resolve(cwd: &std::path::Path, args: ResolveArgs) -> Result<()> {
             if format!("{error:#}").contains("outputs_detected") {
                 error.context(format!(
                     "repository outputs were detected for {id}; integrate them and run \
-                     `yardlet resolve {id}` without --no-outputs"
+                     `agentos resolve {id}` without --no-outputs"
                 ))
             } else {
                 error
@@ -2189,7 +2189,7 @@ fn cmd_resolve(cwd: &std::path::Path, args: ResolveArgs) -> Result<()> {
                 error.context(format!(
                     "no dependency output proof could be captured for {id}; if this Partial \
                      genuinely produced no repository outputs (state-only), finalize it with \
-                     `yardlet resolve {id} --no-outputs`"
+                     `agentos resolve {id} --no-outputs`"
                 ))
             } else {
                 error
@@ -2218,7 +2218,7 @@ fn cmd_resolve(cwd: &std::path::Path, args: ResolveArgs) -> Result<()> {
     }
     if !outcome.unblocked.is_empty() {
         println!(
-            "  Unblocked {}: run the queue with `yardlet run --auto --execute`.",
+            "  Unblocked {}: run the queue with `agentos run --auto --execute`.",
             outcome.unblocked.join(", ")
         );
     }
@@ -2250,7 +2250,7 @@ fn cmd_access(cwd: &std::path::Path, args: AccessArgs) -> Result<()> {
 /// The #36 fix deliberately blocks a run whose configured `target_ref` does not
 /// match the checkout, rather than silently retargeting. That was the right
 /// call, but it left the prescribed remedy performable only by hand-editing
-/// Yardlet-owned state — which this project's own guidance tells operators not
+/// AgentOS-owned state — which this project's own guidance tells operators not
 /// to do (issue #42). The change goes through `state.rs` like every other
 /// canonical write, and is recorded so the retarget itself is auditable.
 fn cmd_target(cwd: &std::path::Path, args: TargetArgs) -> Result<()> {
@@ -2284,7 +2284,7 @@ fn cmd_target(cwd: &std::path::Path, args: TargetArgs) -> Result<()> {
                 if !current.is_empty() && &current != checkout {
                     println!(
                         "\nThese differ, so a run will be blocked before it spawns a worker.\n\
-                         Retarget with `yardlet target --to-checkout`, or name a ref explicitly."
+                         Retarget with `agentos target --to-checkout`, or name a ref explicitly."
                     );
                 }
             }
@@ -2378,7 +2378,7 @@ fn cmd_memory(cwd: &std::path::Path, args: MemoryArgs) -> Result<()> {
                 report.candidates, report.candidate_path
             );
             println!(
-                "  canonical memory unchanged; apply with `yardlet memory apply --run {}`",
+                "  canonical memory unchanged; apply with `agentos memory apply --run {}`",
                 report.run_id
             );
             Ok(())
@@ -2416,7 +2416,7 @@ fn cmd_watch(cwd: &std::path::Path, args: WatchArgs) -> Result<()> {
 fn cmd_memory_list(ws: &crate::state::Workspace) -> Result<()> {
     let memory = crate::memory::indexed(ws)?;
     if memory.is_empty() {
-        println!("No project memory yet. Run `yardlet memory init` or add markdown docs under .agents/memory/.");
+        println!("No project memory yet. Run `agentos memory init` or add markdown docs under .agents/memory/.");
         return Ok(());
     }
     let stale_count = memory.iter().filter(|m| m.stale).count();
@@ -2486,7 +2486,7 @@ fn cmd_handoff(cwd: &std::path::Path) -> Result<()> {
             Ok(())
         }
         None => {
-            println!("No runs yet. Run `yardlet run --next --execute` first.");
+            println!("No runs yet. Run `agentos run --next --execute` first.");
             Ok(())
         }
     }
@@ -2541,7 +2541,7 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
     }
     use crate::schemas::{RunnableClass, TaskState};
     let health = snap.health();
-    println!("Yardlet workspace: {}", snap.config.workspace_id);
+    println!("AgentOS workspace: {}", snap.config.workspace_id);
     println!("Intent: {}", snap.intent_summary());
     println!(
         "Queue: {} ready, {} running, {} awaiting-you, {} approval, {} deps, {} worker, {} held, {} set-aside, {} done, {} total",
@@ -2576,7 +2576,7 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
                 diagnostic.task_id, run, diagnostic.reason
             );
         }
-        println!("  recover with:  yardlet recover");
+        println!("  recover with:  agentos recover");
     }
     for line in harness_copy_warning_lines(&snap) {
         println!("{line}");
@@ -2586,12 +2586,12 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
         println!(
             "  {}",
             if q.is_empty() {
-                "(see `yardlet handoff`)"
+                "(see `agentos handoff`)"
             } else {
                 q
             }
         );
-        println!("  answer with:  yardlet answer \"<your reply>\"");
+        println!("  answer with:  agentos answer \"<your reply>\"");
     }
     // A task blocked on a capability no enabled worker declares is not "stuck"
     // you can retry — it is parked on a human decision or a new worker. Split it
@@ -2628,20 +2628,20 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
             awaiting.join(", ")
         );
         println!("  parked on a decision or a capability no worker declares —");
-        println!("  provide what they need or add a capable worker; see `yardlet handoff`.");
+        println!("  provide what they need or add a capable worker; see `agentos handoff`.");
     }
     if !blocked.is_empty() {
         println!("\nblocked: {}", blocked.join(", "));
-        println!("  see why and how to unblock:  yardlet handoff");
+        println!("  see why and how to unblock:  agentos handoff");
     }
     if !stuck.is_empty() {
         println!("\nstuck (failed/partial): {}", stuck.join(", "));
-        println!("  see why:   yardlet handoff");
+        println!("  see why:   agentos handoff");
         println!(
-            "  retry:     yardlet run --task <id> --execute   (add --full-access if it needs network/installs)"
+            "  retry:     agentos run --task <id> --execute   (add --full-access if it needs network/installs)"
         );
         println!(
-            "  replan:    yardlet planning replan \"<direction>\"   (once the queue is settled — same intent, replacement plan)"
+            "  replan:    agentos planning replan \"<direction>\"   (once the queue is settled — same intent, replacement plan)"
         );
     }
     let deferred: Vec<&str> = snap
@@ -2653,8 +2653,8 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
         .collect();
     if !deferred.is_empty() {
         println!("\ndeferred (set aside by you): {}", deferred.join(", "));
-        println!("  revive one:    yardlet revive <id>");
-        println!("  revive group:  yardlet revive <id> --group");
+        println!("  revive one:    agentos revive <id>");
+        println!("  revive group:  agentos revive <id> --group");
     }
     let needs_approval: Vec<&str> = snap
         .queue
@@ -2671,7 +2671,7 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
         .collect();
     if !needs_approval.is_empty() {
         println!("\nneeds approval: {}", needs_approval.join(", "));
-        println!("  approve:   yardlet approve <id>   then  yardlet run --task <id> --execute");
+        println!("  approve:   agentos approve <id>   then  agentos run --task <id> --execute");
     }
     let reasons: Vec<String> = snap
         .queue
@@ -2701,7 +2701,7 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
     }
     let suggestions = crate::review::pending_count(&ws);
     if suggestions > 0 {
-        println!("\nrouting: {suggestions} suggestion(s) \u{2014} run `yardlet routing review`");
+        println!("\nrouting: {suggestions} suggestion(s) \u{2014} run `agentos routing review`");
     }
     let memory = crate::packet::discover_harness(
         &ws.root,
@@ -2711,11 +2711,11 @@ fn cmd_status(cwd: &std::path::Path, args: StatusArgs) -> Result<()> {
     .memory
     .len();
     if memory > 0 {
-        println!("\nProject memory: {memory} doc(s) \u{2014} `yardlet memory`");
+        println!("\nProject memory: {memory} doc(s) \u{2014} `agentos memory`");
     }
     let runs = crate::telemetry::read_runs(&ws).len();
     if runs > 0 {
-        println!("Run telemetry: {runs} run(s) \u{2014} `yardlet trust`");
+        println!("Run telemetry: {runs} run(s) \u{2014} `agentos trust`");
     }
     Ok(())
 }
@@ -2749,13 +2749,13 @@ fn cmd_worker(cwd: &std::path::Path, args: WorkerArgs) -> Result<()> {
                         s.required_version.as_deref().unwrap_or("the declared minimum")
                     ),
                     guard::Readiness::Unauthenticated => println!(
-                        "  fix: sign in with '{}' itself (its own subscription account); Yardlet never asks for an API key",
+                        "  fix: sign in with '{}' itself (its own subscription account); AgentOS never asks for an API key",
                         s.command
                     ),
                     _ => {}
                 }
                 // Staged checklist: each readiness gate, with auth reported as
-                // unverifiable offline (Yardlet never makes a billed call).
+                // unverifiable offline (AgentOS never makes a billed call).
                 for stage in s.stages(&billing) {
                     println!(
                         "  [{:>5}] {:<11} {}",
@@ -2936,7 +2936,7 @@ mod tests {
     }
 
     const CONFIG_WITH_COMMENTS: &str = r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: cli-test
 created_at: "2026-07-03T00:00:00Z"
 state_dir: .agents

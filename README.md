@@ -6,10 +6,10 @@
   </a>
 </p>
 
-[![crates.io](https://img.shields.io/crates/v/agentos.svg)](https://crates.io/crates/agentos)
+[![crates.io](https://img.shields.io/crates/v/agentos-build01.svg)](https://crates.io/crates/agentos-build01)
 [![CI](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/vikasdeshmukh63/AgentOS/actions/workflows/ci.yml)
-[![downloads](https://img.shields.io/crates/d/agentos.svg)](https://crates.io/crates/agentos)
-[![license: MIT](https://img.shields.io/crates/l/agentos.svg)](LICENSE)
+[![downloads](https://img.shields.io/crates/d/agentos-build01.svg)](https://crates.io/crates/agentos-build01)
+[![license: MIT](https://img.shields.io/crates/l/agentos-build01.svg)](LICENSE)
 
 Built by [Build01](https://www.build01.com).
 
@@ -64,13 +64,13 @@ User intent (a few sentences)
 ## Install
 
 ```bash
-cargo install agentos --locked
+cargo install agentos-build01 --locked
 ```
 
 Prebuilt binaries for macOS and Linux are attached to each
 [GitHub release](https://github.com/zzunkie/agentos/releases); with
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) installed,
-`cargo binstall agentos` fetches one instead of compiling.
+`cargo binstall agentos-build01` fetches one instead of compiling.
 
 ## Your Claude Code and Codex, as they are
 

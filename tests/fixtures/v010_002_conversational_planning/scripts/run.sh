@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 3 ]]; then
-  echo "usage: $0 <yardlet-bin> <evidence-dir> <scenario>" >&2
+  echo "usage: $0 <agentos-bin> <evidence-dir> <scenario>" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCENARIO="$3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -25,14 +25,14 @@ fail() {
   exit 1
 }
 
-run_yardlet() {
-  (cd "$ROOT" && "$YARDLET_BIN" "$@")
+run_agentos() {
+  (cd "$ROOT" && "$AGENTOS_BIN" "$@")
 }
 
 run_in() {
   local root="$1"
   shift
-  (cd "$root" && "$YARDLET_BIN" "$@")
+  (cd "$root" && "$AGENTOS_BIN" "$@")
 }
 
 json_get() {
@@ -63,7 +63,7 @@ PY
 }
 
 show() {
-  run_yardlet planning show --json >"$EVIDENCE_DIR/show.json"
+  run_agentos planning show --json >"$EVIDENCE_DIR/show.json"
 }
 
 proposal() {
@@ -84,14 +84,14 @@ accept_proposal() {
   local proposal_id="$1"
   local expected="$2"
   local action_id="$3"
-  run_yardlet planning accept "$proposal_id" --expected-head "$expected" --action-id "$action_id"
+  run_agentos planning accept "$proposal_id" --expected-head "$expected" --action-id "$action_id"
 }
 
 answer_turn() {
   local text="$1"
   local expected="$2"
   local action_id="$3"
-  run_yardlet planning answer "$text" --expected-head "$expected" --action-id "$action_id" --worker fixture-planner
+  run_agentos planning answer "$text" --expected-head "$expected" --action-id "$action_id" --worker fixture-planner
 }
 
 write_summary() {
@@ -140,7 +140,7 @@ state_manifest() {
   (cd "$root" && find .agents -type f ! -name planning.lock -print0 | sort -z | xargs -0 shasum)
 }
 
-run_yardlet init >/dev/null
+run_agentos init >/dev/null
 cat >"$ROOT/.agents/workers.yaml" <<EOF
 schema_version: 1
 workers:
@@ -167,7 +167,7 @@ routing:
 EOF
 
 if [[ "$SCENARIO" == "confirmed_auto_runtime_envelope" ]]; then
-  python3 - "$ROOT/.agents/yardlet.yaml" "$ROOT/.agents/workers.yaml" <<'PY'
+  python3 - "$ROOT/.agents/agentos.yaml" "$ROOT/.agents/workers.yaml" <<'PY'
 import re
 import sys
 config_path, workers_path = sys.argv[1:]
@@ -194,23 +194,23 @@ if [[ "$SCENARIO" == "runtime_transition_provenance" ]]; then
   touch "$ROOT/.fixture-two-task"
 fi
 
-run_yardlet new "initial planning request" --worker fixture-planner >/dev/null
+run_agentos new "initial planning request" --worker fixture-planner >/dev/null
 p1="$(proposal)"
 
 case "$SCENARIO" in
   planning_start)
     (cd "$ROOT" && git init -q && git config user.name fixture && \
-      git config user.email fixture@example.invalid && git add .agents/yardlet.yaml && \
+      git config user.email fixture@example.invalid && git add .agents/agentos.yaml && \
       git commit -qm baseline)
     set +e
-    (cd "$ROOT" && YARDLET_TEST_PLANNING_CRASH=accept_after_revision_write \
-      "$YARDLET_BIN" planning start >"$EVIDENCE_DIR/start-crash.out" 2>"$EVIDENCE_DIR/start-crash.err")
+    (cd "$ROOT" && AGENTOS_TEST_PLANNING_CRASH=accept_after_revision_write \
+      "$AGENTOS_BIN" planning start >"$EVIDENCE_DIR/start-crash.out" 2>"$EVIDENCE_DIR/start-crash.err")
     crash_status=$?
     set -e
     [[ "$crash_status" -eq 86 ]] || fail "planning start did not stop at the accept crash seam"
     [[ "$(revision_count)" == "1" ]] || fail "interrupted planning start did not persist one exact revision"
 
-    run_yardlet planning start >"$EVIDENCE_DIR/start-retry.out"
+    run_agentos planning start >"$EVIDENCE_DIR/start-retry.out"
     show
     [[ "$(json_get "$EVIDENCE_DIR/show.json" session.lifecycle)" == "confirmed" ]] || fail "planning start did not confirm"
     [[ "$(json_get "$EVIDENCE_DIR/show.json" exact_active_parity)" == "true" ]] || fail "planning start lost exact activation parity"
@@ -219,7 +219,7 @@ case "$SCENARIO" in
     grep -q 'Starting the confirmed queue' "$EVIDENCE_DIR/start-retry.out" || fail "planning start did not announce auto-drain"
     [[ "$(find "$ROOT/.agents/runs" -path '*/result.json' -type f | wc -l | tr -d ' ')" -ge 1 ]] || fail "planning start did not enter the runtime worker"
 
-    run_yardlet planning start >"$EVIDENCE_DIR/start-confirmed-retry.out"
+    run_agentos planning start >"$EVIDENCE_DIR/start-confirmed-retry.out"
     [[ "$(revision_count)" == "1" ]] || fail "confirmed planning start retry duplicated the draft"
     confirmed_events="$(find "$ROOT/.agents/planning-sessions" -path '*/events/*.yaml' -type f -exec grep -l '^type: draft.confirmed$' {} + | wc -l | tr -d ' ')"
     [[ "$confirmed_events" == "1" ]] || fail "confirmed planning start retry duplicated the confirm effect"
@@ -238,7 +238,7 @@ case "$SCENARIO" in
     h1="$(visible_head)"
     answer_turn "scope correction" "$h1" act-answer-2 >/dev/null
     p2="$(proposal)"
-    run_yardlet planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
+    run_agentos planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
     [[ "$(visible_head)" == "$h1" ]] || fail "reject changed head"
     write_summary "proposal rejected and head preserved"
     ;;
@@ -249,7 +249,7 @@ case "$SCENARIO" in
     p2="$(proposal)"
     accept_proposal "$p2" "$h1" act-accept-2 >/dev/null
     h2="$(visible_head)"
-    run_yardlet planning undo --expected-head "$h2" --action-id act-undo-2 >/dev/null
+    run_agentos planning undo --expected-head "$h2" --action-id act-undo-2 >/dev/null
     [[ "$(visible_head)" == "$h1" ]] || fail "undo did not restore parent"
     write_summary "undo restored parent revision"
     ;;
@@ -268,10 +268,10 @@ case "$SCENARIO" in
   restart_confirm)
     accept_proposal "$p1" none act-accept-1 >/dev/null
     h1="$(visible_head)"
-    run_yardlet planning show --json >"$EVIDENCE_DIR/restarted.json"
+    run_agentos planning show --json >"$EVIDENCE_DIR/restarted.json"
     [[ "$(json_get "$EVIDENCE_DIR/restarted.json" session.current_head)" == "$h1" ]] || fail "restart lost head"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
     show
     [[ "$(json_get "$EVIDENCE_DIR/show.json" session.lifecycle)" == "confirmed" ]] || fail "session not confirmed"
     [[ "$(json_get "$EVIDENCE_DIR/show.json" activation.status)" == "committed" ]] || fail "activation not committed"
@@ -281,7 +281,7 @@ case "$SCENARIO" in
   runtime_transition_provenance)
     accept_proposal "$p1" none act-runtime-transition-accept >/dev/null
     head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$head" --action-id act-runtime-transition-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$head" --action-id act-runtime-transition-confirm >/dev/null
     queue_before="$EVIDENCE_DIR/runtime-transition-queue-before.yaml"
     cp "$ROOT/.agents/work-queue.yaml" "$queue_before"
     materialized_digest="$(sed -n 's/^materialized_queue_digest: //p' "$queue_before")"
@@ -289,47 +289,47 @@ case "$SCENARIO" in
     materialized_before="$(sed -n '/^materialized_queue:/,$p' "$queue_before" | shasum | awk '{print $1}')"
 
     (cd "$ROOT" && git init -q && git config user.name fixture && git config user.email fixture@example.invalid && \
-      git add .agents/yardlet.yaml && git commit -qm baseline)
-    run_yardlet run --task YARD-001 --execute >"$EVIDENCE_DIR/runtime-transition-run.out" 2>"$EVIDENCE_DIR/runtime-transition-run.err"
-    run_yardlet planning show --json >"$EVIDENCE_DIR/runtime-transition-restarted.json"
+      git add .agents/agentos.yaml && git commit -qm baseline)
+    run_agentos run --task YARD-001 --execute >"$EVIDENCE_DIR/runtime-transition-run.out" 2>"$EVIDENCE_DIR/runtime-transition-run.err"
+    run_agentos planning show --json >"$EVIDENCE_DIR/runtime-transition-restarted.json"
     [[ "$(json_get "$EVIDENCE_DIR/runtime-transition-restarted.json" activation.status)" == "committed" ]] || fail "fresh process lost committed activation"
     [[ "$(json_get "$EVIDENCE_DIR/runtime-transition-restarted.json" exact_active_parity)" == "true" ]] || fail "first runtime failure broke exact active parity"
     grep -q '^activation_required: true$' "$ROOT/.agents/work-queue.yaml" || fail "runtime transition stripped activation envelope"
     grep -q '^planning_session_id:' "$ROOT/.agents/work-queue.yaml" || fail "runtime transition stripped session provenance"
     [[ "$materialized_digest" == "$(sed -n 's/^materialized_queue_digest: //p' "$ROOT/.agents/work-queue.yaml")" ]] || fail "runtime transition changed immutable materialized digest"
     [[ "$materialized_before" == "$(sed -n '/^materialized_queue:/,$p' "$ROOT/.agents/work-queue.yaml" | shasum | awk '{print $1}')" ]] || fail "runtime transition changed immutable materialized snapshot"
-    run_yardlet queue >"$EVIDENCE_DIR/runtime-transition-queue.out"
+    run_agentos queue >"$EVIDENCE_DIR/runtime-transition-queue.out"
     grep -q 'evaluation status: failed' "$EVIDENCE_DIR/runtime-transition-run.out" || fail "first task did not execute a failed evaluation"
     sed -n '1,/^materialized_queue:/p' "$ROOT/.agents/work-queue.yaml" | \
       sed -n '/^- id: YARD-001$/,/^- id: YARD-002$/p' | grep -q '^  state: needs_user$' || fail "failed first task did not reach its terminal gate"
     sed -n '1,/^materialized_queue:/p' "$ROOT/.agents/work-queue.yaml" | \
       sed -n '/^- id: YARD-002$/,$p' | grep -q '^  state: queued$' || fail "second task did not remain Queued"
-    run_yardlet run --task YARD-002 >"$EVIDENCE_DIR/runtime-transition-next.out"
+    run_agentos run --task YARD-002 >"$EVIDENCE_DIR/runtime-transition-next.out"
     grep -q 'selected task YARD-002' "$EVIDENCE_DIR/runtime-transition-next.out" || fail "fresh process could not prepare second task"
     write_summary "2-task confirm 뒤 첫 실제 worker failure가 immutable activation provenance를 보존하고 fresh process에서 두 번째 task가 runnable함"
     ;;
   partial_promotion)
     accept_proposal "$p1" none act-accept-1 >/dev/null
     h1="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
     activation_path="$(find "$ROOT/.agents/activations" -type f -name '*.yaml' | head -n 1)"
     cp "$activation_path" "$EVIDENCE_DIR/activation.yaml"
     cp "$ROOT/.agents/intent-contract.yaml" "$EVIDENCE_DIR/intent.yaml"
     cp "$ROOT/.agents/work-queue.yaml" "$EVIDENCE_DIR/queue.yaml"
     rm "$activation_path"
-    if run_yardlet run --next >"$EVIDENCE_DIR/run.out" 2>"$EVIDENCE_DIR/run.err"; then
+    if run_agentos run --next >"$EVIDENCE_DIR/run.out" 2>"$EVIDENCE_DIR/run.err"; then
       fail "partial promotion became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/run.err" || fail "missing fail-closed reason"
     cp "$EVIDENCE_DIR/activation.yaml" "$activation_path"
     rm "$ROOT/.agents/work-queue.yaml"
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/missing-queue.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/missing-queue.err"; then
       fail "intent-only partial promotion became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/missing-queue.err" || fail "missing queue reason missing"
     cp "$EVIDENCE_DIR/queue.yaml" "$ROOT/.agents/work-queue.yaml"
     rm "$ROOT/.agents/intent-contract.yaml"
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/missing-intent.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/missing-intent.err"; then
       fail "queue-only partial promotion became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/missing-intent.err" || fail "missing intent reason missing"
@@ -341,7 +341,7 @@ text = open(path, encoding="utf-8").read()
 text = text.replace("confirmation_id: cnf_", "confirmation_id: forged_", 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/confirmation.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/confirmation.err"; then
       fail "confirmation id tamper became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/confirmation.err" || fail "confirmation tamper reason missing"
@@ -353,7 +353,7 @@ text = open(path, encoding="utf-8").read()
 text = text.replace("draft_revision_id: drv_", "draft_revision_id: forged_", 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/draft.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/draft.err"; then
       fail "draft id tamper became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/draft.err" || fail "draft tamper reason missing"
@@ -365,7 +365,7 @@ text = open(path, encoding="utf-8").read()
 text = text.replace("materialized_by_confirmation_id: cnf_", "materialized_by_confirmation_id: forged_", 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/materialized.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/materialized.err"; then
       fail "task materialization tamper became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/materialized.err" || fail "materialization tamper reason missing"
@@ -376,7 +376,7 @@ path = sys.argv[1]
 text = open(path, encoding="utf-8").read().replace("summary: 초기", "summary: 변조된", 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/digest.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/digest.err"; then
       fail "intent digest tamper became runnable"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/digest.err" || fail "digest tamper reason missing"
@@ -385,12 +385,12 @@ PY
   running_isolation)
     accept_proposal "$p1" none act-accept-1 >/dev/null
     h1="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
-    if run_yardlet planning answer "mutate confirmed queue" --expected-head "$h1" --action-id act-late --worker fixture-planner >"$EVIDENCE_DIR/late.out" 2>"$EVIDENCE_DIR/late.err"; then
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-1 >/dev/null
+    if run_agentos planning answer "mutate confirmed queue" --expected-head "$h1" --action-id act-late --worker fixture-planner >"$EVIDENCE_DIR/late.out" 2>"$EVIDENCE_DIR/late.err"; then
       fail "confirmed session accepted free-form mutation"
     fi
     grep -q "confirmed" "$EVIDENCE_DIR/late.err" || fail "confirmed mutation error missing"
-    run_yardlet new "plan while active work is isolated" --worker fixture-planner >/dev/null
+    run_agentos new "plan while active work is isolated" --worker fixture-planner >/dev/null
     p2="$(proposal)"
     accept_proposal "$p2" none act-accept-next >/dev/null
     h2="$(visible_head)"
@@ -400,7 +400,7 @@ path = sys.argv[1]
 text = open(path, encoding="utf-8").read().replace("state: queued", "state: running", 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet planning confirm --expected-head "$h2" --action-id act-confirm-running >"$EVIDENCE_DIR/running.out" 2>"$EVIDENCE_DIR/running.err"; then
+    if run_agentos planning confirm --expected-head "$h2" --action-id act-confirm-running >"$EVIDENCE_DIR/running.out" 2>"$EVIDENCE_DIR/running.err"; then
       fail "running queue was replaced by planning confirmation"
     fi
     grep -Eq "running_queue_isolated|unconfirmed_or_inconsistent" "$EVIDENCE_DIR/running.err" || fail "running isolation error missing"
@@ -408,27 +408,27 @@ PY
     ;;
   goal_regression)
     goal_default="$(mktemp -d "$EVIDENCE_DIR/goal-default.XXXXXX")"
-    (cd "$goal_default" && "$YARDLET_BIN" init >/dev/null)
+    (cd "$goal_default" && "$AGENTOS_BIN" init >/dev/null)
     cp "$ROOT/.agents/workers.yaml" "$goal_default/.agents/workers.yaml"
-    (cd "$goal_default" && "$YARDLET_BIN" goal "default express fixture" --plan-only >/dev/null)
+    (cd "$goal_default" && "$AGENTOS_BIN" goal "default express fixture" --plan-only >/dev/null)
     [[ ! -f "$goal_default/.fixture-planning-turn" ]] || fail "default goal invoked planner"
     [[ -n "$(find "$goal_default/.agents/activations" -type f -name '*.yaml' -print -quit)" ]] || fail "default goal activation missing"
-    (cd "$goal_default" && "$YARDLET_BIN" planning show --json) >"$EVIDENCE_DIR/goal-default.json"
+    (cd "$goal_default" && "$AGENTOS_BIN" planning show --json) >"$EVIDENCE_DIR/goal-default.json"
     [[ "$(json_len "$EVIDENCE_DIR/goal-default.json" current_draft.content.queue.tasks)" == "1" ]] || fail "default goal task count changed"
     [[ "$(json_get "$EVIDENCE_DIR/goal-default.json" exact_active_parity)" == "true" ]] || fail "default goal parity false"
-    (cd "$goal_default" && "$YARDLET_BIN" run --next) >"$EVIDENCE_DIR/goal-default-run.out"
+    (cd "$goal_default" && "$AGENTOS_BIN" run --next) >"$EVIDENCE_DIR/goal-default-run.out"
     grep -q "prepared" "$EVIDENCE_DIR/goal-default-run.out" || fail "default goal queue not runnable"
 
     goal_verify="$(mktemp -d "$EVIDENCE_DIR/goal-verify.XXXXXX")"
-    (cd "$goal_verify" && "$YARDLET_BIN" init >/dev/null)
+    (cd "$goal_verify" && "$AGENTOS_BIN" init >/dev/null)
     cp "$ROOT/.agents/workers.yaml" "$goal_verify/.agents/workers.yaml"
-    (cd "$goal_verify" && "$YARDLET_BIN" goal "verified express fixture" --verify "fixture verified" --plan-only >/dev/null)
+    (cd "$goal_verify" && "$AGENTOS_BIN" goal "verified express fixture" --verify "fixture verified" --plan-only >/dev/null)
     [[ ! -f "$goal_verify/.fixture-planning-turn" ]] || fail "verified goal invoked planner"
     [[ -n "$(find "$goal_verify/.agents/activations" -type f -name '*.yaml' -print -quit)" ]] || fail "verified goal activation missing"
-    (cd "$goal_verify" && "$YARDLET_BIN" planning show --json) >"$EVIDENCE_DIR/goal-verify.json"
+    (cd "$goal_verify" && "$AGENTOS_BIN" planning show --json) >"$EVIDENCE_DIR/goal-verify.json"
     [[ "$(json_len "$EVIDENCE_DIR/goal-verify.json" current_draft.content.queue.tasks)" == "2" ]] || fail "verified goal task count changed"
     [[ "$(json_get "$EVIDENCE_DIR/goal-verify.json" exact_active_parity)" == "true" ]] || fail "verified goal parity false"
-    (cd "$goal_verify" && "$YARDLET_BIN" run --next) >"$EVIDENCE_DIR/goal-verify-run.out"
+    (cd "$goal_verify" && "$AGENTOS_BIN" run --next) >"$EVIDENCE_DIR/goal-verify-run.out"
     grep -q "prepared" "$EVIDENCE_DIR/goal-verify-run.out" || fail "verified goal queue not runnable"
     write_summary "default and verified goal express paths confirmed without planner"
     ;;
@@ -441,15 +441,15 @@ PY
     h2="$(visible_head)"
     answer_turn "acceptance correction to reject" "$h2" act-answer-3 >/dev/null
     p3="$(proposal)"
-    run_yardlet planning reject "$p3" --expected-head "$h2" --action-id act-reject-3 >/dev/null
+    run_agentos planning reject "$p3" --expected-head "$h2" --action-id act-reject-3 >/dev/null
     answer_turn "final acceptance correction" "$h2" act-answer-4 >/dev/null
     p4="$(proposal)"
     accept_proposal "$p4" "$h2" act-accept-4 >/dev/null
     h4="$(visible_head)"
-    run_yardlet planning undo --expected-head "$h4" --action-id act-undo-4 >/dev/null
+    run_agentos planning undo --expected-head "$h4" --action-id act-undo-4 >/dev/null
     [[ "$(visible_head)" == "$h2" ]] || fail "dogfood undo did not restore visible head"
-    run_yardlet planning show --json >"$EVIDENCE_DIR/pre-confirm.json"
-    run_yardlet planning confirm --expected-head "$h2" --action-id act-confirm-final >/dev/null
+    run_agentos planning show --json >"$EVIDENCE_DIR/pre-confirm.json"
+    run_agentos planning confirm --expected-head "$h2" --action-id act-confirm-final >/dev/null
     show
     [[ "$(json_get "$EVIDENCE_DIR/show.json" exact_active_parity)" == "true" ]] || fail "dogfood exact parity false"
     [[ "$(json_get "$EVIDENCE_DIR/show.json" channel_turn_count)" -ge 4 ]] || fail "dogfood content turns missing"
@@ -463,30 +463,30 @@ PY
     h1="$(visible_head)"
     answer_turn "proposal to reject" "$h1" act-answer-2 >/dev/null
     p2="$(proposal)"
-    run_yardlet planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
+    run_agentos planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
     before_count="$(revision_count)"
     if accept_proposal "$p2" "$h1" act-reaccept-rejected >"$EVIDENCE_DIR/reaccept-rejected.out" 2>"$EVIDENCE_DIR/reaccept-rejected.err"; then
       fail "rejected proposal was accepted"
     fi
     [[ "$(visible_head)" == "$h1" ]] || fail "rejected proposal reaccept changed head"
     [[ "$(revision_count)" == "$before_count" ]] || fail "rejected proposal reaccept created revision"
-    if run_yardlet planning reject "$p2" --expected-head "$h1" --action-id act-rereject >"$EVIDENCE_DIR/rereject.out" 2>"$EVIDENCE_DIR/rereject.err"; then
+    if run_agentos planning reject "$p2" --expected-head "$h1" --action-id act-rereject >"$EVIDENCE_DIR/rereject.out" 2>"$EVIDENCE_DIR/rereject.err"; then
       fail "rejected proposal was rejected twice with a new action"
     fi
     [[ "$(visible_head)" == "$h1" ]] || fail "duplicate reject changed head"
     [[ "$(revision_count)" == "$before_count" ]] || fail "duplicate reject created revision"
-    run_yardlet planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
+    run_agentos planning reject "$p2" --expected-head "$h1" --action-id act-reject-2 >/dev/null
     answer_turn "proposal to accept once" "$h1" act-answer-3 >/dev/null
     p3="$(proposal)"
     accept_proposal "$p3" "$h1" act-accept-3 >/dev/null
     h3="$(visible_head)"
-    run_yardlet planning undo --expected-head "$h3" --action-id act-undo-3 >/dev/null
+    run_agentos planning undo --expected-head "$h3" --action-id act-undo-3 >/dev/null
     [[ "$(visible_head)" == "$h1" ]] || fail "setup undo did not restore head"
     before_count="$(revision_count)"
     if accept_proposal "$p3" "$h1" act-reaccept-accepted >"$EVIDENCE_DIR/reaccept-accepted.out" 2>"$EVIDENCE_DIR/reaccept-accepted.err"; then
       fail "accepted proposal was accepted twice"
     fi
-    if run_yardlet planning reject "$p3" --expected-head "$h1" --action-id act-reject-accepted >"$EVIDENCE_DIR/reject-accepted.out" 2>"$EVIDENCE_DIR/reject-accepted.err"; then
+    if run_agentos planning reject "$p3" --expected-head "$h1" --action-id act-reject-accepted >"$EVIDENCE_DIR/reject-accepted.out" 2>"$EVIDENCE_DIR/reject-accepted.err"; then
       fail "accepted proposal was later rejected"
     fi
     [[ "$(visible_head)" == "$h1" ]] || fail "disposed proposal mutation changed head"
@@ -515,7 +515,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^content_digest: .*?$", "content_digest: forged", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet planning undo --expected-head "$h2" --action-id act-undo-bad-digest >"$EVIDENCE_DIR/undo-digest.out" 2>"$EVIDENCE_DIR/undo-digest.err"; then
+    if run_agentos planning undo --expected-head "$h2" --action-id act-undo-bad-digest >"$EVIDENCE_DIR/undo-digest.out" 2>"$EVIDENCE_DIR/undo-digest.err"; then
       fail "undo accepted corrupt current digest"
     fi
     [[ "$(sed -n 's/^current_head: //p' "$session_dir/session.yaml")" == "$h2" ]] || fail "corrupt digest undo changed head"
@@ -529,7 +529,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^parent_revision_id: .*?$", "parent_revision_id: missing-parent", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet planning undo --expected-head "$h2" --action-id act-undo-missing-parent >"$EVIDENCE_DIR/undo-missing.out" 2>"$EVIDENCE_DIR/undo-missing.err"; then
+    if run_agentos planning undo --expected-head "$h2" --action-id act-undo-missing-parent >"$EVIDENCE_DIR/undo-missing.out" 2>"$EVIDENCE_DIR/undo-missing.err"; then
       fail "undo accepted missing parent"
     fi
     [[ "$(sed -n 's/^current_head: //p' "$session_dir/session.yaml")" == "$h2" ]] || fail "missing parent undo changed head"
@@ -543,7 +543,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^session_id: .*?$", "session_id: forged-session", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet planning undo --expected-head "$h2" --action-id act-undo-foreign-parent >"$EVIDENCE_DIR/undo-parent.out" 2>"$EVIDENCE_DIR/undo-parent.err"; then
+    if run_agentos planning undo --expected-head "$h2" --action-id act-undo-foreign-parent >"$EVIDENCE_DIR/undo-parent.out" 2>"$EVIDENCE_DIR/undo-parent.err"; then
       fail "undo accepted cross-session parent"
     fi
     [[ "$(sed -n 's/^current_head: //p' "$session_dir/session.yaml")" == "$h2" ]] || fail "cross-session parent undo changed head"
@@ -556,7 +556,7 @@ PY
   stripped_modern)
     accept_proposal "$p1" none act-accept-1 >/dev/null
     h1="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-strip >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-strip >/dev/null
     rm -rf "$ROOT/.agents/activations"
     rm -f "$ROOT/.agents/activation-required.yaml"
     python3 - "$ROOT/.agents/intent-contract.yaml" "$ROOT/.agents/work-queue.yaml" <<'PY'
@@ -581,7 +581,7 @@ for path in sys.argv[1:]:
         stripped.append(line)
     open(path, "w", encoding="utf-8").writelines(stripped)
 PY
-    if run_yardlet run --next >"$EVIDENCE_DIR/stripped.out" 2>"$EVIDENCE_DIR/stripped.err"; then
+    if run_agentos run --next >"$EVIDENCE_DIR/stripped.out" 2>"$EVIDENCE_DIR/stripped.err"; then
       fail "stripped modern activation fell back to Legacy"
     fi
     grep -q "unconfirmed_or_inconsistent" "$EVIDENCE_DIR/stripped.err" || fail "stripped modern failure reason missing"
@@ -590,7 +590,7 @@ PY
   legacy_v1)
     accept_proposal "$p1" none act-legacy-source-accept >/dev/null
     head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$head" --action-id act-legacy-source-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$head" --action-id act-legacy-source-confirm >/dev/null
     rm -rf "$ROOT/.agents/activations" "$ROOT/.agents/planning-sessions"
     rm -f "$ROOT/.agents/activation-required.yaml"
     python3 - "$ROOT/.agents/intent-contract.yaml" "$ROOT/.agents/work-queue.yaml" <<'PY'
@@ -616,22 +616,22 @@ for line in queue_lines:
     legacy.append(line)
 open(queue_path, "w", encoding="utf-8").writelines(legacy)
 PY
-    run_yardlet queue >"$EVIDENCE_DIR/legacy-v1-queue.out"
-    run_yardlet run --next >"$EVIDENCE_DIR/legacy-v1-run.out"
+    run_agentos queue >"$EVIDENCE_DIR/legacy-v1-queue.out"
+    run_agentos run --next >"$EVIDENCE_DIR/legacy-v1-run.out"
     grep -q 'selected task YARD-001' "$EVIDENCE_DIR/legacy-v1-run.out" || fail "plain legacy v1 queue stopped being runnable"
     write_summary "modern record가 전혀 없는 plain legacy v1 intent/queue는 기존 runnable semantics를 유지함"
     ;;
   activation_action_linkage)
     accept_proposal "$p1" none act-accept-1 >/dev/null
     h1="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-linkage >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-linkage >/dev/null
     activation_path="$(find "$ROOT/.agents/activations" -type f -name '*.yaml' -print -quit)"
     action_path="$(find "$ROOT/.agents/planning-sessions" -path '*/actions/act-confirm-linkage.yaml' -print -quit)"
     cp "$activation_path" "$EVIDENCE_DIR/linkage-activation.yaml"
     cp "$action_path" "$EVIDENCE_DIR/linkage-action.yaml"
 
     rm "$action_path"
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/action-missing.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/action-missing.err"; then
       fail "activation with missing action receipt became runnable"
     fi
     cp "$EVIDENCE_DIR/linkage-action.yaml" "$action_path"
@@ -643,7 +643,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^status: completed$", "status: rejected", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/action-rejected.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/action-rejected.err"; then
       fail "activation with rejected action receipt became runnable"
     fi
     cp "$EVIDENCE_DIR/linkage-action.yaml" "$action_path"
@@ -655,7 +655,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^request_digest: .*?$", "request_digest: forged", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/action-digest.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/action-digest.err"; then
       fail "activation with digest-conflicting action receipt became runnable"
     fi
     cp "$EVIDENCE_DIR/linkage-action.yaml" "$action_path"
@@ -667,7 +667,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^action_id: .*?$", "action_id: missing-action", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/activation-action.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/activation-action.err"; then
       fail "activation pointing to another action became runnable"
     fi
     cp "$EVIDENCE_DIR/linkage-activation.yaml" "$activation_path"
@@ -681,7 +681,7 @@ text = open(path, encoding="utf-8").read()
 text = re.sub(r"^session_id: .*?$", "session_id: forged-session", text, count=1, flags=re.M)
 open(path, "w", encoding="utf-8").write(text)
 PY
-    if run_yardlet run --next >/dev/null 2>"$EVIDENCE_DIR/draft-session.err"; then
+    if run_agentos run --next >/dev/null 2>"$EVIDENCE_DIR/draft-session.err"; then
       fail "confirmed draft with cross-session identity became runnable"
     fi
     cp "$EVIDENCE_DIR/linkage-draft.yaml" "$draft_path"
@@ -698,7 +698,7 @@ PY
     else
       touch "$EVIDENCE_DIR/pre-confirm-queue.missing"
     fi
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-confirm-crash >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-confirm-crash >/dev/null
     baseline="$EVIDENCE_DIR/confirm-baseline"
     cp -R "$ROOT" "$baseline"
     for window in prepare intent_only snapshots activation; do
@@ -795,8 +795,8 @@ PY
     write_summary "four confirm crash windows replay to one completed action and valid activation"
     ;;
   event_seq_crash)
-    if (cd "$ROOT" && YARDLET_TEST_PLANNING_CRASH=after_event_write_before_next_seq \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-event-crash \
+    if (cd "$ROOT" && AGENTOS_TEST_PLANNING_CRASH=after_event_write_before_next_seq \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-event-crash \
       >"$EVIDENCE_DIR/event-crash.out" 2>"$EVIDENCE_DIR/event-crash.err"); then
       fail "event/next_seq crash injection did not terminate the process"
     fi
@@ -830,8 +830,8 @@ PY
     for window in confirm_after_prepare confirm_after_intent_write confirm_after_activation_write confirm_after_effect_before_completion; do
       crash_root="$EVIDENCE_DIR/actual-$window"
       cp -R "$baseline" "$crash_root"
-      if (cd "$crash_root" && YARDLET_TEST_PLANNING_CRASH="$window" \
-        "$YARDLET_BIN" planning confirm --expected-head "$h1" --action-id act-actual-confirm \
+      if (cd "$crash_root" && AGENTOS_TEST_PLANNING_CRASH="$window" \
+        "$AGENTOS_BIN" planning confirm --expected-head "$h1" --action-id act-actual-confirm \
         >"$EVIDENCE_DIR/$window.out" 2>"$EVIDENCE_DIR/$window.err"); then
         fail "$window injection did not terminate the process"
       fi
@@ -862,32 +862,32 @@ PY
 
     accept_root="$EVIDENCE_DIR/action-accept"
     cp -R "$action_base" "$accept_root"
-    if (cd "$accept_root" && YARDLET_TEST_PLANNING_CRASH=action_after_effect \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-crash-accept >/dev/null 2>&1); then
+    if (cd "$accept_root" && AGENTOS_TEST_PLANNING_CRASH=action_after_effect \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-crash-accept >/dev/null 2>&1); then
       fail "accept effect crash injection did not terminate"
     fi
     run_in "$accept_root" planning accept "$p1" --expected-head none --action-id act-crash-accept >/dev/null
 
     reject_root="$EVIDENCE_DIR/action-reject"
     cp -R "$action_base" "$reject_root"
-    if (cd "$reject_root" && YARDLET_TEST_PLANNING_CRASH=action_after_effect \
-      "$YARDLET_BIN" planning reject "$p1" --expected-head none --action-id act-crash-reject >/dev/null 2>&1); then
+    if (cd "$reject_root" && AGENTOS_TEST_PLANNING_CRASH=action_after_effect \
+      "$AGENTOS_BIN" planning reject "$p1" --expected-head none --action-id act-crash-reject >/dev/null 2>&1); then
       fail "reject effect crash injection did not terminate"
     fi
     run_in "$reject_root" planning reject "$p1" --expected-head none --action-id act-crash-reject >/dev/null
 
     answer_root="$EVIDENCE_DIR/action-answer"
     cp -R "$action_base" "$answer_root"
-    if (cd "$answer_root" && YARDLET_TEST_PLANNING_CRASH=action_after_effect \
-      "$YARDLET_BIN" planning answer "crash answer" --expected-head none --action-id act-crash-answer --worker fixture-planner >/dev/null 2>&1); then
+    if (cd "$answer_root" && AGENTOS_TEST_PLANNING_CRASH=action_after_effect \
+      "$AGENTOS_BIN" planning answer "crash answer" --expected-head none --action-id act-crash-answer --worker fixture-planner >/dev/null 2>&1); then
       fail "answer effect crash injection did not terminate"
     fi
     run_in "$answer_root" planning answer "crash answer" --expected-head none --action-id act-crash-answer --worker fixture-planner >/dev/null
 
     rejected_root="$EVIDENCE_DIR/action-rejected-receipt"
     cp -R "$action_base" "$rejected_root"
-    if (cd "$rejected_root" && YARDLET_TEST_PLANNING_CRASH=action_after_rejected_effect \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head forged-head --action-id act-crash-rejected >/dev/null 2>&1); then
+    if (cd "$rejected_root" && AGENTOS_TEST_PLANNING_CRASH=action_after_rejected_effect \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head forged-head --action-id act-crash-rejected >/dev/null 2>&1); then
       fail "rejected receipt crash injection did not terminate"
     fi
     if run_in "$rejected_root" planning accept "$p1" --expected-head forged-head --action-id act-crash-rejected >"$EVIDENCE_DIR/rejected-replay.out" 2>"$EVIDENCE_DIR/rejected-replay.err"; then
@@ -906,8 +906,8 @@ PY
     run_in "$undo_root" planning accept "$up2" --expected-head "$uh1" --action-id act-undo-accept-2 >/dev/null
     run_in "$undo_root" planning show --json >"$EVIDENCE_DIR/undo-second.json"
     uh2="$(json_get "$EVIDENCE_DIR/undo-second.json" session.current_head)"
-    if (cd "$undo_root" && YARDLET_TEST_PLANNING_CRASH=action_after_effect \
-      "$YARDLET_BIN" planning undo --expected-head "$uh2" --action-id act-crash-undo >/dev/null 2>&1); then
+    if (cd "$undo_root" && AGENTOS_TEST_PLANNING_CRASH=action_after_effect \
+      "$AGENTOS_BIN" planning undo --expected-head "$uh2" --action-id act-crash-undo >/dev/null 2>&1); then
       fail "undo effect crash injection did not terminate"
     fi
     run_in "$undo_root" planning undo --expected-head "$uh2" --action-id act-crash-undo >/dev/null
@@ -999,9 +999,9 @@ PY
     ;;
   concurrent_action)
     set +e
-    (run_yardlet planning accept "$p1" --expected-head none --action-id act-concurrent >"$EVIDENCE_DIR/concurrent-1.out" 2>"$EVIDENCE_DIR/concurrent-1.err") &
+    (run_agentos planning accept "$p1" --expected-head none --action-id act-concurrent >"$EVIDENCE_DIR/concurrent-1.out" 2>"$EVIDENCE_DIR/concurrent-1.err") &
     pid1=$!
-    (run_yardlet planning accept "$p1" --expected-head none --action-id act-concurrent >"$EVIDENCE_DIR/concurrent-2.out" 2>"$EVIDENCE_DIR/concurrent-2.err") &
+    (run_agentos planning accept "$p1" --expected-head none --action-id act-concurrent >"$EVIDENCE_DIR/concurrent-2.out" 2>"$EVIDENCE_DIR/concurrent-2.err") &
     pid2=$!
     wait "$pid1"; status1=$?
     wait "$pid2"; status2=$?
@@ -1029,8 +1029,8 @@ PY
     write_summary "동시 CLI action이 하나의 revision receipt와 무충돌 journal로 수렴함"
     ;;
   accept_revision_crash)
-    if (cd "$ROOT" && YARDLET_TEST_PLANNING_CRASH=accept_after_revision_write \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-revision-crash \
+    if (cd "$ROOT" && AGENTOS_TEST_PLANNING_CRASH=accept_after_revision_write \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-revision-crash \
       >"$EVIDENCE_DIR/accept-revision.out" 2>"$EVIDENCE_DIR/accept-revision.err"); then
       fail "accept revision-write crash injection did not terminate"
     fi
@@ -1064,8 +1064,8 @@ PY
     write_summary "accept revision 저장 직후 crash가 prepared stable result/effect로 단일 draft와 completed receipt에 수렴함"
     ;;
   prepared_action_interlock)
-    if (cd "$ROOT" && YARDLET_TEST_PLANNING_CRASH=accept_after_revision_write \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-prepared-owner >/dev/null 2>&1); then
+    if (cd "$ROOT" && AGENTOS_TEST_PLANNING_CRASH=accept_after_revision_write \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-prepared-owner >/dev/null 2>&1); then
       fail "prepared interlock setup did not crash"
     fi
     for command in \
@@ -1076,7 +1076,7 @@ PY
       "planning confirm --expected-head forged --action-id act-other-confirm" \
       "new blocked-new-session --worker fixture-planner"; do
       set +e
-      run_yardlet $command >"$EVIDENCE_DIR/interlock.out" 2>"$EVIDENCE_DIR/interlock.err"
+      run_agentos $command >"$EVIDENCE_DIR/interlock.out" 2>"$EVIDENCE_DIR/interlock.err"
       status=$?
       set -e
       [[ "$status" -ne 0 ]] || fail "prepared action allowed another mutation: $command"
@@ -1158,13 +1158,13 @@ PY
   completed_active_mismatch)
     accept_proposal "$p1" none act-first-accept >/dev/null
     first_head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$first_head" --action-id act-first-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$first_head" --action-id act-first-confirm >/dev/null
     first_session="$(json_get "$EVIDENCE_DIR/show.json" session.session_id)"
-    run_yardlet goal "second express activation" --plan-only >/dev/null
-    run_yardlet planning show --json >"$EVIDENCE_DIR/second-active.json"
+    run_agentos goal "second express activation" --plan-only >/dev/null
+    run_agentos planning show --json >"$EVIDENCE_DIR/second-active.json"
     second_confirmation="$(json_get "$EVIDENCE_DIR/second-active.json" activation.confirmation_id)"
     printf '%s\n' "$first_session" >"$ROOT/.agents/planning-sessions/latest"
-    if run_yardlet planning confirm --expected-head "$first_head" --action-id act-first-confirm >"$EVIDENCE_DIR/completed-mismatch.out" 2>"$EVIDENCE_DIR/completed-mismatch.err"; then
+    if run_agentos planning confirm --expected-head "$first_head" --action-id act-first-confirm >"$EVIDENCE_DIR/completed-mismatch.out" 2>"$EVIDENCE_DIR/completed-mismatch.err"; then
       fail "completed confirm replay returned an activation that is no longer current"
     fi
     grep -q 'completed_confirmation_active_mismatch' "$EVIDENCE_DIR/completed-mismatch.err" || fail "completed active mismatch reason missing"
@@ -1175,14 +1175,14 @@ PY
   lock_timeout)
     barrier="$EVIDENCE_DIR/lock-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && YARDLET_TEST_MUTATION_BARRIER="$barrier" \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-lock-owner \
+    (cd "$ROOT" && AGENTOS_TEST_MUTATION_BARRIER="$barrier" \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-lock-owner \
       >"$EVIDENCE_DIR/lock-owner.out" 2>"$EVIDENCE_DIR/lock-owner.err") &
     owner_pid=$!
     wait_for_file "$barrier/entered" "$owner_pid" || { kill "$owner_pid" 2>/dev/null || true; fail "stable mutation-lock barrier was not reached"; }
     set +e
-    (cd "$ROOT" && YARDLET_TEST_LOCK_TIMEOUT_MS=100 \
-      "$YARDLET_BIN" planning reject "$p1" --expected-head none --action-id act-lock-contender \
+    (cd "$ROOT" && AGENTOS_TEST_LOCK_TIMEOUT_MS=100 \
+      "$AGENTOS_BIN" planning reject "$p1" --expected-head none --action-id act-lock-contender \
       >"$EVIDENCE_DIR/lock-contender.out" 2>"$EVIDENCE_DIR/lock-contender.err") &
     contender_pid=$!
     for _ in $(seq 1 100); do
@@ -1208,23 +1208,23 @@ PY
   runtime_queue_confirm_race)
     accept_proposal "$p1" none act-race-first-accept >/dev/null
     first_head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$first_head" --action-id act-race-first-confirm >/dev/null
-    run_yardlet new "replacement plan" --worker fixture-planner >/dev/null
+    run_agentos planning confirm --expected-head "$first_head" --action-id act-race-first-confirm >/dev/null
+    run_agentos new "replacement plan" --worker fixture-planner >/dev/null
     replacement="$(proposal)"
     accept_proposal "$replacement" none act-race-replacement-accept >/dev/null
     replacement_head="$(visible_head)"
     (cd "$ROOT" && git init -q && git config user.name fixture && git config user.email fixture@example.invalid && \
-      git add .agents/yardlet.yaml && git commit -qm baseline)
+      git add .agents/agentos.yaml && git commit -qm baseline)
     barrier="$EVIDENCE_DIR/runtime-race-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && YARDLET_TEST_MUTATION_BARRIER="$barrier" \
-      "$YARDLET_BIN" run --next --execute >"$EVIDENCE_DIR/runtime-race-run.out" 2>"$EVIDENCE_DIR/runtime-race-run.err") &
+    (cd "$ROOT" && AGENTOS_TEST_MUTATION_BARRIER="$barrier" \
+      "$AGENTOS_BIN" run --next --execute >"$EVIDENCE_DIR/runtime-race-run.out" 2>"$EVIDENCE_DIR/runtime-race-run.err") &
     run_pid=$!
     wait_for_file "$barrier/entered" "$run_pid" || { kill "$run_pid" 2>/dev/null || true; fail "runtime mutation barrier was not reached"; }
-    (run_yardlet planning confirm --expected-head "$replacement_head" --action-id act-race-confirm \
+    (run_agentos planning confirm --expected-head "$replacement_head" --action-id act-race-confirm \
       >"$EVIDENCE_DIR/runtime-race-confirm.out" 2>"$EVIDENCE_DIR/runtime-race-confirm.err") &
     confirm_pid=$!
-    (run_yardlet add "added during runtime transition" \
+    (run_agentos add "added during runtime transition" \
       >"$EVIDENCE_DIR/runtime-race-add.out" 2>"$EVIDENCE_DIR/runtime-race-add.err") &
     add_pid=$!
     touch "$barrier/release"
@@ -1237,7 +1237,7 @@ PY
     rm -f "$barrier/entered" "$barrier/release"
     touch "$barrier/worker-release"
     wait_for_file "$barrier/entered" "$run_pid" || { kill "$run_pid" 2>/dev/null || true; fail "finalize mutation barrier was not reached"; }
-    (run_yardlet add "added during finalize" \
+    (run_agentos add "added during finalize" \
       >"$EVIDENCE_DIR/finalize-race-add.out" 2>"$EVIDENCE_DIR/finalize-race-add.err") &
     finalize_add_pid=$!
     touch "$barrier/release"
@@ -1249,7 +1249,7 @@ PY
     grep -Eq 'active_queue_not_drained|running_queue_isolated' "$EVIDENCE_DIR/runtime-race-confirm.err" || fail "runtime race rejection reason missing"
     [[ "$run_status" -eq 0 ]] || fail "runtime process failed with $run_status"
     [[ "$finalize_add_status" -eq 0 ]] || fail "receipt-backed finalize add failed with $finalize_add_status"
-    run_yardlet queue >"$EVIDENCE_DIR/runtime-race-queue.out"
+    run_agentos queue >"$EVIDENCE_DIR/runtime-race-queue.out"
     grep -Eq 'running|failed|partial|done' "$EVIDENCE_DIR/runtime-race-queue.out" || fail "runtime queue state was lost"
     grep -q 'added during runtime transition' "$EVIDENCE_DIR/runtime-race-queue.out" || fail "runtime add was lost"
     grep -q 'added during finalize' "$EVIDENCE_DIR/runtime-race-queue.out" || fail "finalize add was lost"
@@ -1482,7 +1482,7 @@ PY
   runtime_envelope)
     accept_proposal "$p1" none act-runtime-envelope-accept >/dev/null
     head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$head" --action-id act-runtime-envelope-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$head" --action-id act-runtime-envelope-confirm >/dev/null
     runtime_base="$EVIDENCE_DIR/runtime-envelope-base"
     cp -R "$ROOT" "$runtime_base"
     for mode in title scope worker risk; do
@@ -1550,12 +1550,12 @@ PY
   runtime_origin_contract)
     accept_proposal "$p1" none act-runtime-origin-accept >/dev/null
     head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$head" --action-id act-runtime-origin-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$head" --action-id act-runtime-origin-confirm >/dev/null
     materialized_before="$(sed -n '/^materialized_queue:/,$p' "$ROOT/.agents/work-queue.yaml" | shasum | awk '{print $1}')"
 
-    run_yardlet add "explicit runtime follow-up" --scope src/state.rs >/dev/null
-    run_yardlet add "second runtime follow-up" --scope src/schemas.rs >/dev/null
-    run_yardlet planning show --json >"$EVIDENCE_DIR/runtime-origin-added.json"
+    run_agentos add "explicit runtime follow-up" --scope src/state.rs >/dev/null
+    run_agentos add "second runtime follow-up" --scope src/schemas.rs >/dev/null
+    run_agentos planning show --json >"$EVIDENCE_DIR/runtime-origin-added.json"
     [[ "$(json_get "$EVIDENCE_DIR/runtime-origin-added.json" exact_active_parity)" == "true" ]] || fail "provenanced user add broke active parity"
     [[ "$materialized_before" == "$(sed -n '/^materialized_queue:/,$p' "$ROOT/.agents/work-queue.yaml" | shasum | awk '{print $1}')" ]] || fail "user add rewrote immutable materialized queue"
     grep -Eq "materialized_by_confirmation_id: (''|\"\")" "$ROOT/.agents/work-queue.yaml" || fail "user-added task was disguised as confirmed materialization"
@@ -1563,11 +1563,11 @@ PY
     [[ -n "$receipt" && -f "$receipt" ]] || fail "user add did not persist an immutable origin receipt"
     [[ -f "${receipt%.yaml}.committed.yaml" ]] || fail "user add did not persist its committed ordinal marker"
 
-    run_yardlet defer YARD-001 "audit pause" >/dev/null
-    run_yardlet planning show --json >"$EVIDENCE_DIR/runtime-origin-deferred.json"
+    run_agentos defer YARD-001 "audit pause" >/dev/null
+    run_agentos planning show --json >"$EVIDENCE_DIR/runtime-origin-deferred.json"
     [[ "$(json_get "$EVIDENCE_DIR/runtime-origin-deferred.json" exact_active_parity)" == "true" ]] || fail "defer runtime overlay broke active parity"
-    run_yardlet revive YARD-001 >/dev/null
-    run_yardlet planning show --json >"$EVIDENCE_DIR/runtime-origin-revived.json"
+    run_agentos revive YARD-001 >/dev/null
+    run_agentos planning show --json >"$EVIDENCE_DIR/runtime-origin-revived.json"
     [[ "$(json_get "$EVIDENCE_DIR/runtime-origin-revived.json" exact_active_parity)" == "true" ]] || fail "revive runtime overlay broke active parity"
 
     origin_base="$EVIDENCE_DIR/runtime-origin-base"
@@ -1662,9 +1662,9 @@ PY
   confirmed_auto_runtime_envelope)
     accept_proposal "$p1" none act-confirmed-auto-accept >/dev/null
     head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$head" --action-id act-confirmed-auto-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$head" --action-id act-confirmed-auto-confirm >/dev/null
     (cd "$ROOT" && git init -q && git config user.name fixture && \
-      git config user.email fixture@example.invalid && git add .agents/yardlet.yaml && \
+      git config user.email fixture@example.invalid && git add .agents/agentos.yaml && \
       git commit -qm baseline)
 
     task_root="$EVIDENCE_DIR/confirmed-auto-task-control"
@@ -1750,13 +1750,13 @@ PY
     run_in "$express_root" init >/dev/null
     barrier="$EVIDENCE_DIR/express-barrier"
     mkdir -p "$barrier"
-    (cd "$express_root" && YARDLET_TEST_MUTATION_BARRIER="$barrier" \
-      "$YARDLET_BIN" goal "first concurrent express goal" --plan-only \
+    (cd "$express_root" && AGENTOS_TEST_MUTATION_BARRIER="$barrier" \
+      "$AGENTOS_BIN" goal "first concurrent express goal" --plan-only \
       >"$EVIDENCE_DIR/express-first.out" 2>"$EVIDENCE_DIR/express-first.err") &
     first_pid=$!
     wait_for_file "$barrier/entered" "$first_pid" || { kill "$first_pid" 2>/dev/null || true; fail "first express process missed stable barrier"; }
-    (cd "$express_root" && YARDLET_TEST_MUTATION_BARRIER="$barrier" \
-      "$YARDLET_BIN" goal "second concurrent express goal" --plan-only \
+    (cd "$express_root" && AGENTOS_TEST_MUTATION_BARRIER="$barrier" \
+      "$AGENTOS_BIN" goal "second concurrent express goal" --plan-only \
       >"$EVIDENCE_DIR/express-second.out" 2>"$EVIDENCE_DIR/express-second.err") &
     second_pid=$!
     sleep 0.1
@@ -1775,8 +1775,8 @@ PY
   same_request_multi_session_recovery)
     barrier="$EVIDENCE_DIR/same-request-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && exec env YARDLET_TEST_PLANNER_RESULT_BARRIER="$barrier" \
-      "$YARDLET_BIN" planning answer "delayed same-request turn" --expected-head none \
+    (cd "$ROOT" && exec env AGENTOS_TEST_PLANNER_RESULT_BARRIER="$barrier" \
+      "$AGENTOS_BIN" planning answer "delayed same-request turn" --expected-head none \
       --action-id act-same-request-delayed --worker fixture-planner \
       >"$EVIDENCE_DIR/same-request-delayed.out" 2>"$EVIDENCE_DIR/same-request-delayed.err") &
     delayed_pid=$!
@@ -1792,16 +1792,16 @@ PY
 
     accept_proposal "$p1" none act-same-request-accept >/dev/null
     old_head="$(visible_head)"
-    run_yardlet planning confirm --expected-head "$old_head" --action-id act-same-request-confirm >/dev/null
-    run_yardlet defer YARD-001 "finish baseline" >/dev/null
-    run_yardlet new "initial planning request" --worker fixture-planner >/dev/null
+    run_agentos planning confirm --expected-head "$old_head" --action-id act-same-request-confirm >/dev/null
+    run_agentos defer YARD-001 "finish baseline" >/dev/null
+    run_agentos new "initial planning request" --worker fixture-planner >/dev/null
     show
     current_session="$(json_get "$EVIDENCE_DIR/show.json" session.session_id)"
     [[ "$current_session" != "$delayed_session" ]] || fail "same-request fixture did not create a second session"
     current_proposals_before="$(find "$ROOT/.agents/planning-sessions/$current_session/proposals" -type f -name '*.yaml' | wc -l | tr -d ' ')"
     cp "$ROOT/.agents/intent-contract.yaml" "$EVIDENCE_DIR/same-request.intent.before"
     cp "$ROOT/.agents/work-queue.yaml" "$EVIDENCE_DIR/same-request.queue.before"
-    if run_yardlet recover >"$EVIDENCE_DIR/same-request-recover.out" 2>"$EVIDENCE_DIR/same-request-recover.err"; then
+    if run_agentos recover >"$EVIDENCE_DIR/same-request-recover.out" 2>"$EVIDENCE_DIR/same-request-recover.err"; then
       fail "stale exact-session result was recovered into another same-request session"
     fi
     grep -Eq 'stale_planner_output|stale_head|exact planning session' "$EVIDENCE_DIR/same-request-recover.err" || fail "same-request recovery error missing"
@@ -1820,8 +1820,8 @@ PY
     p2="$(proposal)"
     barrier="$EVIDENCE_DIR/stale-planner-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && exec env YARDLET_TEST_PLANNER_RESULT_BARRIER="$barrier" \
-      "$YARDLET_BIN" planning answer "slow correction" --expected-head "$h1" \
+    (cd "$ROOT" && exec env AGENTOS_TEST_PLANNER_RESULT_BARRIER="$barrier" \
+      "$AGENTOS_BIN" planning answer "slow correction" --expected-head "$h1" \
       --action-id act-stale-planner-slow --worker fixture-planner \
       >"$EVIDENCE_DIR/stale-planner.out" 2>"$EVIDENCE_DIR/stale-planner.err") &
     slow_pid=$!
@@ -1854,8 +1854,8 @@ PY
     h1="$(visible_head)"
     barrier="$EVIDENCE_DIR/corrupt-recovery-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && exec env YARDLET_TEST_PLANNER_RESULT_BARRIER="$barrier" \
-      "$YARDLET_BIN" planning answer "restart recovery candidate" --expected-head "$h1" \
+    (cd "$ROOT" && exec env AGENTOS_TEST_PLANNER_RESULT_BARRIER="$barrier" \
+      "$AGENTOS_BIN" planning answer "restart recovery candidate" --expected-head "$h1" \
       --action-id act-corrupt-recovery-answer --worker fixture-planner \
       >"$EVIDENCE_DIR/corrupt-recovery-worker.out" 2>"$EVIDENCE_DIR/corrupt-recovery-worker.err") &
     interrupted_pid=$!
@@ -1869,7 +1869,7 @@ PY
     printf '{invalid-json\n' >"$corrupt_run/planning-result.json"
     state_manifest "$ROOT" >"$EVIDENCE_DIR/corrupt-recovery.before.manifest"
     state_before="$(state_digest "$ROOT")"
-    if run_yardlet recover >"$EVIDENCE_DIR/corrupt-recovery.out" 2>"$EVIDENCE_DIR/corrupt-recovery.err"; then
+    if run_agentos recover >"$EVIDENCE_DIR/corrupt-recovery.out" 2>"$EVIDENCE_DIR/corrupt-recovery.err"; then
       fail "corrupt planning result recovery succeeded"
     fi
     grep -Eq 'parsing|planning-result.json|expected ident' "$EVIDENCE_DIR/corrupt-recovery.err" || fail "corrupt recovery parse error was swallowed"
@@ -1880,7 +1880,7 @@ PY
     fi
     [[ ! -e "$corrupt_run/consumed" ]] || fail "corrupt recovery was marked consumed"
     cp "$EVIDENCE_DIR/corrupt-recovery.valid-result.json" "$corrupt_run/planning-result.json"
-    run_yardlet planning confirm --expected-head "$h1" --action-id act-corrupt-recovery-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$h1" --action-id act-corrupt-recovery-confirm >/dev/null
     activation_path="$(find "$ROOT/.agents/activations" -type f -name '*.yaml' -print -quit)"
     python3 - "$activation_path" <<'PY'
 import pathlib
@@ -1891,7 +1891,7 @@ text = text.replace("queue_digest: ", "queue_digest: tampered-", 1)
 path.write_text(text, encoding="utf-8")
 PY
     corrupt_active_before="$(state_digest "$ROOT")"
-    if run_yardlet recover >"$EVIDENCE_DIR/corrupt-activation-recovery.out" 2>"$EVIDENCE_DIR/corrupt-activation-recovery.err"; then
+    if run_agentos recover >"$EVIDENCE_DIR/corrupt-activation-recovery.out" 2>"$EVIDENCE_DIR/corrupt-activation-recovery.err"; then
       fail "corrupt activation recovery succeeded"
     fi
     grep -q 'unconfirmed_or_inconsistent' "$EVIDENCE_DIR/corrupt-activation-recovery.err" || fail "corrupt activation recovery error was swallowed"
@@ -1904,8 +1904,8 @@ PY
     h1="$(visible_head)"
     barrier="$EVIDENCE_DIR/restart-recovery-barrier"
     mkdir -p "$barrier"
-    (cd "$ROOT" && exec env YARDLET_TEST_PLANNER_RESULT_BARRIER="$barrier" \
-      "$YARDLET_BIN" planning answer "recovered scope correction" --expected-head "$h1" \
+    (cd "$ROOT" && exec env AGENTOS_TEST_PLANNER_RESULT_BARRIER="$barrier" \
+      "$AGENTOS_BIN" planning answer "recovered scope correction" --expected-head "$h1" \
       --action-id act-restart-recovery-answer --worker fixture-planner \
       >"$EVIDENCE_DIR/restart-recovery-worker.out" 2>"$EVIDENCE_DIR/restart-recovery-worker.err") &
     interrupted_pid=$!
@@ -1919,7 +1919,7 @@ PY
     wait_for_worker_exit "$recovered_run" || fail "restart recovery orphan worker did not exit"
     [[ ! -e "$ROOT/.agents/intent-contract.yaml" ]] || fail "restart fixture unexpectedly has active intent"
     cp "$ROOT/.agents/work-queue.yaml" "$EVIDENCE_DIR/restart-recovery.queue.before"
-    run_yardlet recover >"$EVIDENCE_DIR/restart-recovery.out"
+    run_agentos recover >"$EVIDENCE_DIR/restart-recovery.out"
     [[ -e "$recovered_run/consumed" ]] || fail "successful canonical proposal apply was not marked consumed"
     recovered_proposal="$(find "$ROOT/.agents/planning-sessions/$exact_session/proposals" -type f -name '*.yaml' | sort | tail -n 1)"
     [[ -f "$recovered_proposal" ]] || fail "restart recovery did not create exact-session proposal"
@@ -1932,14 +1932,14 @@ PY
     h2="$(visible_head)"
     [[ ! -e "$ROOT/.agents/intent-contract.yaml" ]] || fail "proposal accept activated intent"
     cmp "$EVIDENCE_DIR/restart-recovery.queue.before" "$ROOT/.agents/work-queue.yaml" || fail "proposal accept activated queue"
-    run_yardlet planning confirm --expected-head "$h2" --action-id act-restart-recovery-confirm >/dev/null
+    run_agentos planning confirm --expected-head "$h2" --action-id act-restart-recovery-confirm >/dev/null
     show
     [[ "$(json_get "$EVIDENCE_DIR/show.json" exact_active_parity)" == "true" ]] || fail "explicit confirm after recovery lost exact parity"
     write_summary "restart recovery가 exact session/head proposal만 만들고 consumed는 성공 후, active state는 explicit confirm 후에만 기록함"
     ;;
   release_hook_disabled)
-    (cd "$ROOT" && YARDLET_TEST_PLANNING_CRASH=accept_after_revision_write \
-      "$YARDLET_BIN" planning accept "$p1" --expected-head none --action-id act-release-hook \
+    (cd "$ROOT" && AGENTOS_TEST_PLANNING_CRASH=accept_after_revision_write \
+      "$AGENTOS_BIN" planning accept "$p1" --expected-head none --action-id act-release-hook \
       >"$EVIDENCE_DIR/release-hook.out" 2>"$EVIDENCE_DIR/release-hook.err")
     action_path="$(find "$ROOT/.agents/planning-sessions" -path '*/actions/act-release-hook.yaml' -print -quit)"
     grep -q '^status: completed$' "$action_path" || fail "release binary exposed planning crash hook"

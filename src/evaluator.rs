@@ -1,6 +1,6 @@
 //! Deterministic evaluator.
 //!
-//! Yardlet does not trust a worker's claims blindly. After a run it checks the
+//! AgentOS does not trust a worker's claims blindly. After a run it checks the
 //! evidence on disk and decides the next task state. The first evaluator is
 //! intentionally shallow but honest: every check is mechanical.
 
@@ -196,7 +196,7 @@ pub fn evaluate(
                 // looks for diff entries the worker failed to name, so a report
                 // that names a file the diff does NOT contain passed it
                 // vacuously — which is how a run shipped a green summary over a
-                // deliverable written outside the tree Yardlet integrates
+                // deliverable written outside the tree AgentOS integrates
                 // (issue #55). Advisory here because finalization is what fails
                 // that case closed; this keeps the summary from asserting a file
                 // that is not in the evidence.
@@ -298,7 +298,7 @@ pub fn evaluate(
                 "worker reported done but also left question_for_user; keeping Done eligible while preserving the question in run artifacts".to_string(),
             ));
         }
-        // Structured review verdict: the quality signal Yardlet records instead
+        // Structured review verdict: the quality signal AgentOS records instead
         // of trusting prose. For a review/safety task it is the contract —
         // an empty verdict or any failed criterion blocks Done.
         let is_review = matches!(crate::packet::role_for(&task.kind), "reviewer" | "security");
@@ -378,7 +378,7 @@ fn is_current_run_artifact(path: &str, run_id: &str) -> bool {
 }
 
 /// Paths that are sensitive (secrets/keys), escape the workspace, or are
-/// Yardlet-owned canonical state a worker must never write directly. A worker
+/// AgentOS-owned canonical state a worker must never write directly. A worker
 /// touching any of these fails the run regardless of its self-report.
 #[cfg(test)]
 pub(crate) fn forbidden_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<String> {
@@ -407,13 +407,13 @@ fn forbidden_in<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<String> {
     bad
 }
 
-/// Is this path a Yardlet-owned canonical-state file a worker must NOT write
+/// Is this path an AgentOS-owned canonical-state file a worker must NOT write
 /// directly (it proposes follow-ups via result.json instead — propose ->
 /// ingest)? Scoped PRECISELY so legitimate worker writes are not false-failed:
 /// the harness assets (`.agents/rules|skills|agents/`) and a run's own
 /// artifacts (`.agents/runs/`) are NOT canonical and stay writable. Forbidden:
 /// the top-level config files (`work-queue.yaml`, `intent-contract.yaml`,
-/// `workers.yaml`, `*-policy.yaml`, `yardlet.yaml`, legacy `yard.yaml`) and the
+/// `workers.yaml`, `*-policy.yaml`, and `agentos.yaml`) and the
 /// whole telemetry tree.
 pub fn is_canonical_state_path(path: &str) -> bool {
     let p = path.trim_start_matches("./").trim_matches('"');
@@ -430,11 +430,11 @@ pub fn is_canonical_state_path(path: &str) -> bool {
     }
     matches!(
         rest,
-        "work-queue.yaml" | "intent-contract.yaml" | "workers.yaml" | "yardlet.yaml" | "yard.yaml"
+        "work-queue.yaml" | "intent-contract.yaml" | "workers.yaml" | "agentos.yaml"
     ) || rest.ends_with("-policy.yaml")
 }
 
-/// Is this path a repository deliverable that Yardlet may integrate from an
+/// Is this path a repository deliverable that AgentOS may integrate from an
 /// isolated worker worktree? Everything outside `.agents/` is deliverable. The
 /// only deliverables inside `.agents/` are the workspace-authored harness asset
 /// roots; canonical and runtime state remain main-process-owned.
@@ -560,8 +560,8 @@ fn fingerprint_regular_file(abs: &Path) -> std::io::Result<String> {
 
 /// Fingerprints used for a worker run. Git repositories prefer the existing
 /// status-based evidence path; if git evidence is unavailable for any reason,
-/// Yardlet falls back to a bounded folder scan. `excluded_roots` is for
-/// Yardlet-owned runtime output, especially the current run directory, so
+/// AgentOS falls back to a bounded folder scan. `excluded_roots` is for
+/// AgentOS-owned runtime output, especially the current run directory, so
 /// result/checkpoint/handoff writes are not attributed to the worker's
 /// deliverable diff.
 pub fn run_fingerprints(
@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_report_ignores_current_run_artifacts_owned_by_yardlet() {
+    fn diff_report_ignores_current_run_artifacts_owned_by_agentos() {
         let dir = temp_path("core-run-artifact-disclosure");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("handoff.md"), "h").unwrap();
@@ -1006,13 +1006,14 @@ mod tests {
             ".agents/intent-contract.yaml",
             ".agents/workers.yaml",
             ".agents/billing-policy.yaml",
-            ".agents/yardlet.yaml",
-            ".agents/yard.yaml",         // legacy
+            ".agents/agentos.yaml",
             "./.agents/work-queue.yaml", // normalized leading ./
             ".agents/telemetry/runs.jsonl",
         ] {
             assert!(is_canonical_state_path(p), "{p} should be canonical");
         }
+        let previous_config = format!(".agents/{}{}", "yard", "let.yaml");
+        assert!(!is_canonical_state_path(&previous_config));
         // Allowed: harness assets, a run's own artifacts, and normal source.
         for p in [
             ".agents/runs/run-x/result.json",
@@ -1101,14 +1102,14 @@ exit 89
         let baseline = run_fingerprints_with_git(
             &root,
             std::slice::from_ref(&run_dir),
-            OsStr::new("/definitely/missing/yardlet-git"),
+            OsStr::new("/definitely/missing/agentos-git"),
         )
         .unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn after() {}\n").unwrap();
         let after = run_fingerprints_with_git(
             &root,
             std::slice::from_ref(&run_dir),
-            OsStr::new("/definitely/missing/yardlet-git"),
+            OsStr::new("/definitely/missing/agentos-git"),
         )
         .unwrap();
 
@@ -1121,7 +1122,7 @@ exit 89
     fn workspace_scan_error_is_the_run_fingerprints_fail_closed_boundary() {
         let missing = temp_path("missing-workspace");
         let err =
-            run_fingerprints_with_git(&missing, &[], OsStr::new("/definitely/missing/yardlet-git"))
+            run_fingerprints_with_git(&missing, &[], OsStr::new("/definitely/missing/agentos-git"))
                 .unwrap_err();
 
         assert!(

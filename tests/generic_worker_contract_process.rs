@@ -20,7 +20,7 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let stem = format!(
-            "yardlet-generic-contract-{label}-{}-{nonce}",
+            "agentos-generic-contract-{label}-{}-{nonce}",
             std::process::id()
         );
         let root = std::env::temp_dir().join(&stem);
@@ -780,7 +780,7 @@ fn generic_worker_without_sandbox_declaration_is_rejected_under_sandboxed_access
         "{combined}"
     );
     assert!(
-        combined.contains("sandbox_args") && combined.contains("yardlet access full"),
+        combined.contains("sandbox_args") && combined.contains("agentos access full"),
         "the rejection must name both explicit ways out: {combined}"
     );
     assert!(

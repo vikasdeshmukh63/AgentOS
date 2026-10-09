@@ -1,6 +1,6 @@
 //! Workspace state layer.
 //!
-//! Yardlet owns canonical state under `.agents/` in the target repo. This module
+//! AgentOS owns canonical state under `.agents/` in the target repo. This module
 //! is the only place that reads and writes those files. Everything is durable
 //! and readable without any previous chat context.
 
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::planning::{PlanningCapabilityAudit, PlanningScoutCacheEntry};
 use crate::schemas::{
     ActionReceipt, ActivatedIntent, ActivatedQueue, ActivatedTask, ActivationReceipt,
-    ActivationRequirement, Answer, AnswerActionOutcome, AnswerActionRequest, Artifact,
+    ActivationRequirement, AgentConfig, Answer, AnswerActionOutcome, AnswerActionRequest, Artifact,
     ArtifactProposal, AttemptState, BillingPolicy, ChannelActionKind, ChannelActionStatus,
     ChannelEvent, ChannelEventType, ContinuationMode, Conversation, ConversationTurn,
     DependencyOutputAvailability, DraftRevision, EventActor, EventActorKind, FollowUpTask,
@@ -31,15 +31,13 @@ use crate::schemas::{
     RuntimeResource, RuntimeResourceProposal, RuntimeTaskCommit, RuntimeTaskReceipt,
     SelectionPolicy, Task, TaskChannel, TaskChannelIndex, TaskState, TransitionActor,
     TransitionCause, TransitionLog, TransitionRecord, TurnRole, WorkQueue, WorkerAttempt,
-    WorkersFile, YardConfig,
+    WorkersFile,
 };
 use crate::yaml;
 
 pub const STATE_DIR: &str = ".agents";
-/// Canonical config filename. `yard.yaml` is the pre-rename name, still read
-/// (and written in place) for back-compat so existing workspaces keep working.
-pub const CONFIG_FILE: &str = "yardlet.yaml";
-pub const LEGACY_CONFIG_FILE: &str = "yard.yaml";
+/// Canonical workspace config filename.
+pub const CONFIG_FILE: &str = "agentos.yaml";
 pub const CHANNEL_INDEX_EVENT_LIMIT: usize = 128;
 pub const RESOURCE_INDEX_ENTRY_LIMIT: usize = 128;
 
@@ -52,7 +50,7 @@ struct TaskChannelIdentity {
     task_id: String,
 }
 
-/// A located Yardlet workspace: the directory that owns `.agents/`.
+/// A located AgentOS workspace: the directory that owns `.agents/`.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
@@ -62,7 +60,6 @@ pub struct Workspace {
 /// The descriptor lifetime is the transaction lifetime, and process exit
 /// releases the lock without a stale PID cleanup protocol.
 pub struct PlanningLock {
-    #[cfg(unix)]
     file: fs::File,
     queue_snapshot: RefCell<Option<String>>,
 }
@@ -75,15 +72,12 @@ pub struct PlanningLock {
 /// descriptor lifetime IS the transaction lifetime, so process death releases
 /// it with no stale-PID protocol.
 pub struct RunFinalizeLock {
-    #[cfg(unix)]
     file: fs::File,
 }
 
-#[cfg(unix)]
 impl Drop for RunFinalizeLock {
     fn drop(&mut self) {
-        // SAFETY: `self.file` owns this descriptor until Drop finishes.
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+        let _ = crate::file_lock::unlock(&self.file);
     }
 }
 
@@ -92,17 +86,15 @@ struct RuntimeTaskPlacement {
     runs_before: Vec<String>,
 }
 
-#[cfg(unix)]
 impl Drop for PlanningLock {
     fn drop(&mut self) {
-        // SAFETY: `self.file` owns this descriptor until Drop finishes.
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+        let _ = crate::file_lock::unlock(&self.file);
     }
 }
 
 fn mutation_lock_timeout() -> Duration {
     #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var("YARDLET_TEST_LOCK_TIMEOUT_MS") {
+    if let Ok(value) = std::env::var("AGENTOS_TEST_LOCK_TIMEOUT_MS") {
         if let Ok(milliseconds) = value.parse::<u64>() {
             return Duration::from_millis(milliseconds.max(1));
         }
@@ -112,7 +104,7 @@ fn mutation_lock_timeout() -> Duration {
 
 fn wait_at_test_mutation_barrier() -> Result<()> {
     #[cfg(debug_assertions)]
-    if let Ok(directory) = std::env::var("YARDLET_TEST_MUTATION_BARRIER") {
+    if let Ok(directory) = std::env::var("AGENTOS_TEST_MUTATION_BARRIER") {
         let directory = PathBuf::from(directory);
         fs::create_dir_all(&directory)
             .with_context(|| format!("creating mutation barrier {}", directory.display()))?;
@@ -298,13 +290,12 @@ fn channel_action_digest<T: Serialize>(value: &T) -> Result<String> {
 }
 
 impl Workspace {
-    /// Walk up from `start` looking for an existing config file (the canonical
-    /// `.agents/yardlet.yaml` or the legacy `.agents/yard.yaml`).
+    /// Walk up from `start` looking for an existing AgentOS config.
     pub fn discover(start: &Path) -> Option<Workspace> {
         let mut dir = Some(start);
         while let Some(d) = dir {
             let agents = d.join(STATE_DIR);
-            if agents.join(CONFIG_FILE).is_file() || agents.join(LEGACY_CONFIG_FILE).is_file() {
+            if agents.join(CONFIG_FILE).is_file() {
                 return Some(Workspace {
                     root: d.to_path_buf(),
                 });
@@ -364,21 +355,11 @@ impl Workspace {
 
     pub fn is_initialized(&self) -> bool {
         self.agents_dir().join(CONFIG_FILE).is_file()
-            || self.agents_dir().join(LEGACY_CONFIG_FILE).is_file()
     }
 
-    /// The config file path. Prefers the canonical `yardlet.yaml`; falls back to
-    /// the legacy `yard.yaml` when that is the file a workspace already has, so
-    /// pre-rename workspaces are read and written in place rather than orphaned.
-    /// A fresh workspace gets the canonical name.
+    /// Resolve the canonical AgentOS config path.
     pub fn config_path(&self) -> PathBuf {
-        let canonical = self.agents_dir().join(CONFIG_FILE);
-        let legacy = self.agents_dir().join(LEGACY_CONFIG_FILE);
-        if !canonical.is_file() && legacy.is_file() {
-            legacy
-        } else {
-            canonical
-        }
+        self.agents_dir().join(CONFIG_FILE)
     }
     pub fn queue_path(&self) -> PathBuf {
         self.agents_dir().join("work-queue.yaml")
@@ -544,77 +525,48 @@ impl Workspace {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(&path)
-                .with_context(|| format!("opening planning lock {}", path.display()))?;
-            let timeout = mutation_lock_timeout();
-            let started = Instant::now();
-            loop {
-                // SAFETY: `file` stays alive in PlanningLock and flock only
-                // reads its valid descriptor. LOCK_NB prevents an unbounded
-                // wait; a crash releases the kernel-owned lock.
-                if unsafe {
-                    libc::flock(
-                        std::os::fd::AsRawFd::as_raw_fd(&file),
-                        libc::LOCK_EX | libc::LOCK_NB,
-                    )
-                } == 0
-                {
-                    break;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening planning lock {}", path.display()))?;
+        let timeout = mutation_lock_timeout();
+        let started = Instant::now();
+        loop {
+            match crate::file_lock::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if crate::file_lock::is_contention(&error) => {
+                    if started.elapsed() >= timeout {
+                        bail!(
+                            "workspace_mutation_lock_timeout after {}ms at {}",
+                            timeout.as_millis(),
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                let error = std::io::Error::last_os_error();
-                let retryable = error.raw_os_error().is_some_and(|code| {
-                    code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK
-                });
-                if !retryable {
+                Err(error) => {
                     return Err(error)
                         .with_context(|| format!("locking planning workspace {}", path.display()));
                 }
-                if started.elapsed() >= timeout {
-                    bail!(
-                        "workspace_mutation_lock_timeout after {}ms at {}",
-                        timeout.as_millis(),
-                        path.display()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
             }
-            let queue_snapshot = if self.queue_path().is_file() {
-                Some(
-                    fs::read_to_string(self.queue_path())
-                        .with_context(|| format!("reading {}", self.queue_path().display()))?,
-                )
-            } else {
-                None
-            };
-            let guard = PlanningLock {
-                file,
-                queue_snapshot: RefCell::new(queue_snapshot),
-            };
-            wait_at_test_mutation_barrier()?;
-            Ok(guard)
         }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            let queue_snapshot = if self.queue_path().is_file() {
-                Some(fs::read_to_string(self.queue_path())?)
-            } else {
-                None
-            };
-            Ok(PlanningLock {
-                queue_snapshot: RefCell::new(queue_snapshot),
-            })
-        }
+        let queue_snapshot = if self.queue_path().is_file() {
+            Some(
+                fs::read_to_string(self.queue_path())
+                    .with_context(|| format!("reading {}", self.queue_path().display()))?,
+            )
+        } else {
+            None
+        };
+        let guard = PlanningLock {
+            file,
+            queue_snapshot: RefCell::new(queue_snapshot),
+        };
+        wait_at_test_mutation_barrier()?;
+        Ok(guard)
     }
 
     /// Serialize finalization of one run across processes. The lock file lives
@@ -632,57 +584,35 @@ impl Workspace {
         let dir = self.agents_dir().join("locks");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("finalize-{run_id}.lock"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(&path)
-                .with_context(|| format!("opening run finalize lock {}", path.display()))?;
-            let timeout = mutation_lock_timeout();
-            let started = Instant::now();
-            loop {
-                // SAFETY: `file` stays alive in RunFinalizeLock and flock only
-                // reads its valid descriptor. LOCK_NB prevents an unbounded
-                // wait; a crash releases the kernel-owned lock.
-                if unsafe {
-                    libc::flock(
-                        std::os::fd::AsRawFd::as_raw_fd(&file),
-                        libc::LOCK_EX | libc::LOCK_NB,
-                    )
-                } == 0
-                {
-                    break;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening run finalize lock {}", path.display()))?;
+        let timeout = mutation_lock_timeout();
+        let started = Instant::now();
+        loop {
+            match crate::file_lock::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if crate::file_lock::is_contention(&error) => {
+                    if started.elapsed() >= timeout {
+                        bail!(
+                            "run_finalize_lock_timeout after {}ms at {}",
+                            timeout.as_millis(),
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                let error = std::io::Error::last_os_error();
-                let retryable = error.raw_os_error().is_some_and(|code| {
-                    code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK
-                });
-                if !retryable {
+                Err(error) => {
                     return Err(error)
                         .with_context(|| format!("locking run finalization {}", path.display()));
                 }
-                if started.elapsed() >= timeout {
-                    bail!(
-                        "run_finalize_lock_timeout after {}ms at {}",
-                        timeout.as_millis(),
-                        path.display()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
             }
-            Ok(RunFinalizeLock { file })
         }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Ok(RunFinalizeLock {})
-        }
+        Ok(RunFinalizeLock { file })
     }
 
     pub fn save_planning_session(&self, session: &PlanningSession) -> Result<()> {
@@ -1556,7 +1486,7 @@ impl Workspace {
         receipt: &RuntimeCapabilityReceipt,
     ) -> Result<()> {
         let expected_action_id = format!("runtime-capability:stale-decision:{}", receipt.task_id);
-        const QUESTION_PREFIX: &str = "This task needs your decision before Yardlet can run it: ";
+        const QUESTION_PREFIX: &str = "This task needs your decision before AgentOS can run it: ";
         const QUESTION_SUFFIX: &str = ". Reply with the decision or instructions to proceed.";
         let question_subject = receipt
             .decision_question
@@ -1598,7 +1528,7 @@ impl Workspace {
     ) -> Result<()> {
         self.validate_runtime_capability_receipt_record(queue, receipt)?;
         let expected_question = format!(
-            "This task needs your decision before Yardlet can run it: {}. Reply with the decision or instructions to proceed.",
+            "This task needs your decision before AgentOS can run it: {}. Reply with the decision or instructions to proceed.",
             planned.title
         );
         if receipt.task_id != planned.id
@@ -1640,7 +1570,7 @@ impl Workspace {
             action_id: format!("runtime-capability:stale-decision:{}", current.id),
             target_state: TaskState::NeedsUser,
             decision_question: format!(
-                "This task needs your decision before Yardlet can run it: {}. Reply with the decision or instructions to proceed.",
+                "This task needs your decision before AgentOS can run it: {}. Reply with the decision or instructions to proceed.",
                 planned.title
             ),
             original_required_capabilities: planned.required_capabilities.clone(),
@@ -2430,7 +2360,7 @@ impl Workspace {
 
     // ---- typed loaders -------------------------------------------------
 
-    pub fn load_config(&self) -> Result<YardConfig> {
+    pub fn load_config(&self) -> Result<AgentConfig> {
         load_yaml(&self.config_path())
     }
 
@@ -2676,7 +2606,7 @@ impl Workspace {
     }
 
     /// Append a user-authored task to the latest queue without re-planning or
-    /// rewriting existing tasks. This is the `yardlet add` path used while an
+    /// rewriting existing tasks. This is the `agentos add` path used while an
     /// auto-drain may already be running; always load the current queue first so
     /// a stale caller cannot clobber runtime state.
     pub fn append_user_task(&self, input: UserTaskInput) -> Result<Task> {
@@ -2713,7 +2643,7 @@ impl Workspace {
             validation: None,
             approval: None,
             interaction: None,
-            worker_rationale: Some("added directly by user with yardlet add".to_string()),
+            worker_rationale: Some("added directly by user with agentos add".to_string()),
             provenance: "user-added".to_string(),
             routing_provenance: None,
         };
@@ -3746,7 +3676,7 @@ impl Workspace {
                         Some("needs_user") => AttemptState::NeedsUser,
                         Some("succeeded") => AttemptState::Succeeded,
                         Some("timed_out") => AttemptState::TimedOut,
-                        // The operator stopping Yardlet cancels the attempt; it
+                        // The operator stopping AgentOS cancels the attempt; it
                         // is the same outcome as an explicit cancel, reached by
                         // Ctrl-C rather than by a command (issue #107).
                         Some("cancelled" | "stopped") => AttemptState::Cancelled,
@@ -4671,7 +4601,7 @@ impl Workspace {
                         );
                         append_rationale(task, &detail);
                         let question = format!(
-                            "This task needs your decision before Yardlet can run it: {}. Reply with the decision or instructions to proceed.",
+                            "This task needs your decision before AgentOS can run it: {}. Reply with the decision or instructions to proceed.",
                             task.title
                         );
                         pending_conversations.push((
@@ -4856,7 +4786,7 @@ impl Workspace {
         docs.sort_by(|a, b| a.path.cmp(&b.path));
         let index = MemoryIndex {
             schema_version: 1,
-            generated_by: "yardlet".to_string(),
+            generated_by: "agentos".to_string(),
             generated_at: Local::now().to_rfc3339(),
             documents: docs,
         };
@@ -4954,7 +4884,7 @@ fn render_memory_markdown(slug: &str, draft: &MemoryDocumentDraft) -> Result<Str
             .map(|p| p.trim().trim_start_matches("./").to_string())
             .filter(|p| !p.is_empty())
             .collect(),
-        source: "yardlet-memory-draft",
+        source: "agentos-memory-draft",
         updated_at: Local::now().to_rfc3339(),
     };
     Ok(format!(
@@ -5085,8 +5015,8 @@ pub(crate) fn save_private_yaml_atomic<T: serde::Serialize>(path: &Path, value: 
     write_private_str_atomic(path, &yaml::to_string(value)?)
 }
 
-pub fn save_config_preserving_format(path: &Path, config: &YardConfig) -> Result<bool> {
-    let current: YardConfig = load_yaml(path)?;
+pub fn save_config_preserving_format(path: &Path, config: &AgentConfig) -> Result<bool> {
+    let current: AgentConfig = load_yaml(path)?;
     let mut edits = Vec::new();
     if current.language != config.language {
         edits.push(LineEdit::string("language", &config.language));
@@ -5201,13 +5131,13 @@ pub fn save_git_finish_target_ref(path: &Path, target_ref: &str) -> Result<()> {
         fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let updated = apply_git_finish_target_edit(&original, target_ref);
     // Prove the edit before committing it. This is hand-rolled line editing of
-    // Yardlet-owned canonical state: a shape the editor mishandles (a flow
+    // AgentOS-owned canonical state: a shape the editor mishandles (a flow
     // mapping, a file with no trailing newline, a same-named key at another
     // depth) would otherwise write YAML that no longer parses, and every
-    // `yardlet` command in the workspace would fail with a parse error. There is
+    // `agentos` command in the workspace would fail with a parse error. There is
     // no backup to fall back on, so the recovery would be exactly the hand-edit
     // this writer exists to remove. Refusing is always better than corrupting.
-    let parsed: YardConfig = crate::yaml::from_str(&updated).map_err(|error| {
+    let parsed: AgentConfig = crate::yaml::from_str(&updated).map_err(|error| {
         anyhow::anyhow!(
             "refusing to write {}: the edit would not parse ({error}); \
              set git_finish.target_ref by hand and report this config shape",
@@ -5513,9 +5443,9 @@ fn leading_spaces(line: &str) -> usize {
     line.bytes().take_while(|b| *b == b' ').count()
 }
 
-/// Append a turn to a task's conversation transcript. Yardlet stays the sole
+/// Append a turn to a task's conversation transcript. AgentOS stays the sole
 /// writer of `.agents/`: the worker authors its message via `question_for_user`
-/// and the user replies through `yardlet answer`; the core records both here.
+/// and the user replies through `agentos answer`; the core records both here.
 /// Worker turns dedupe by `run_id`, and an identical consecutive turn is
 /// skipped, so a retried run never double-records.
 pub fn append_conversation_turn(
@@ -5637,7 +5567,7 @@ fn normalize_dependency_output_path(task_id: &str, raw: &str) -> Result<(String,
             }
             result
         });
-    let normalized_text = normalized.to_string_lossy().into_owned();
+    let normalized_text = normalized.to_string_lossy().replace('\\', "/");
     if normalized_text != raw {
         bail!("dependency_output_path_invalid:dependency={task_id}:path={raw}");
     }
@@ -6259,7 +6189,7 @@ fn finalize_partial(
     };
 
     queue.tasks[idx].state = TaskState::Done;
-    // Yardlet stays the sole queue writer. The snapshot manifest is durable
+    // AgentOS stays the sole queue writer. The snapshot manifest is durable
     // before this queue write, so no reader can observe Done without proof.
     ws.save_queue_locked(&lock, &queue)?;
     append_transition(
@@ -6612,7 +6542,7 @@ pub fn place_skill_files_no_clobber(
         .unwrap_or_default()
         .as_nanos();
     let staging = skills.join(format!(
-        ".yardlet-install-{name}-{}-{nonce}",
+        ".agentos-install-{name}-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir(&staging)?;
@@ -6698,12 +6628,12 @@ mod git_finish_target_tests {
         );
     }
 
-    /// The writer edits Yardlet-owned canonical state by hand, so every case
+    /// The writer edits AgentOS-owned canonical state by hand, so every case
     /// must round-trip to a loadable config. Substring assertions alone let a
-    /// shape through that produced YAML no `yardlet` command could parse.
+    /// shape through that produced YAML no `agentos` command could parse.
     #[test]
     fn every_edited_shape_still_parses_as_a_config() {
-        let base = "schema_version: 1\nproduct: yardlet\nworkspace_id: t\ncreated_at: \"2026-07-28T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: \"\"\n";
+        let base = "schema_version: 1\nproduct: agentos\nworkspace_id: t\ncreated_at: \"2026-07-28T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: \"\"\n";
         for (label, shape) in [
             ("block with the key", "git_finish:\n  auto_push: false\n  target_ref: 'refs/heads/old'\n"),
             ("block without the key", "git_finish:\n  auto_push: false\n"),
@@ -6715,7 +6645,7 @@ mod git_finish_target_tests {
         ] {
             let input = format!("{base}{shape}");
             let updated = super::apply_git_finish_target_edit(&input, "refs/heads/main");
-            match crate::yaml::from_str::<crate::schemas::YardConfig>(&updated) {
+            match crate::yaml::from_str::<crate::schemas::AgentConfig>(&updated) {
                 Ok(config) => assert_eq!(
                     config.git_finish.target_ref, "refs/heads/main",
                     "{label}: parsed but did not take the value:\n{updated}"
@@ -6775,6 +6705,38 @@ mod git_finish_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn dependency_output_path_uses_portable_slashes() {
+        let (normalized, path) =
+            normalize_dependency_output_path("YARD-TEST", "docs/note.md").unwrap();
+        assert_eq!(normalized, "docs/note.md");
+        assert_eq!(path, PathBuf::from("docs").join("note.md"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_finalize_lock_is_exclusive() {
+        let root = std::env::temp_dir().join(format!(
+            "yard-run-finalize-lock-windows-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agents")).unwrap();
+        let ws = Workspace::at(&root);
+
+        let held = ws.acquire_run_finalize_lock("run-a").unwrap();
+        assert!(
+            ws.acquire_run_finalize_lock("run-a").is_err(),
+            "a second Windows finalizer must not enter while the first holds the lock"
+        );
+
+        drop(held);
+        assert!(ws.acquire_run_finalize_lock("run-a").is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// Issue #69: two processes finalized the SAME run 840ms apart and the
     /// second demoted a correct Done to Partial. Finalization must be
@@ -6844,7 +6806,7 @@ mod tests {
     }
 
     const CONFIG_WITH_COMMENTS: &str = r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: test-workspace
 created_at: "2026-07-03T00:00:00Z"
 state_dir: .agents
@@ -6986,7 +6948,7 @@ routing:
         );
 
         let doc = fs::read_to_string(ws.memory_dir().join("runtime-routing.md")).unwrap();
-        assert!(doc.contains("source: yardlet-memory-draft"));
+        assert!(doc.contains("source: agentos-memory-draft"));
         assert!(doc.contains("look_at:"));
         assert!(doc.contains("- src/routing.rs"));
         assert!(doc.contains("# Runtime routing"));
@@ -8044,7 +8006,7 @@ records:
         fs::write(ws.config_path(), CONFIG_WITH_COMMENTS).unwrap();
         fs::write(ws.workers_path(), WORKERS_WITH_COMMENTS).unwrap();
 
-        let cfg: YardConfig = load_yaml(&ws.config_path()).unwrap();
+        let cfg: AgentConfig = load_yaml(&ws.config_path()).unwrap();
         save_yaml(&ws.config_path(), &cfg).unwrap();
         let rewritten_config = fs::read_to_string(ws.config_path()).unwrap();
         assert!(!rewritten_config.contains("language stays user-owned"));
@@ -8060,23 +8022,42 @@ records:
     }
 
     #[test]
-    fn config_preserving_save_noops_and_keeps_legacy_path() {
-        let dir = temp_root("legacy-config-preserve");
+    fn config_preserving_save_noops_for_canonical_config() {
+        let dir = temp_root("canonical-config-preserve");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(STATE_DIR)).unwrap();
         let ws = Workspace::at(&dir);
-        let legacy = ws.agents_dir().join(LEGACY_CONFIG_FILE);
-        fs::write(&legacy, CONFIG_WITH_COMMENTS).unwrap();
+        fs::write(ws.config_path(), CONFIG_WITH_COMMENTS).unwrap();
 
-        assert_eq!(ws.config_path(), legacy);
-        let before = fs::read(&legacy).unwrap();
+        assert_eq!(ws.config_path(), dir.join(STATE_DIR).join(CONFIG_FILE));
+        let before = fs::read(ws.config_path()).unwrap();
         let cfg = ws.load_config().unwrap();
         assert!(!cfg.git_finish.auto_push);
         assert!(cfg.git_finish.remote.is_empty());
         assert!(cfg.git_finish.target_ref.is_empty());
         assert!(!save_config_preserving_format(&ws.config_path(), &cfg).unwrap());
-        assert_eq!(fs::read(&legacy).unwrap(), before);
-        assert!(!ws.agents_dir().join(CONFIG_FILE).exists());
+        assert_eq!(fs::read(ws.config_path()).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_discovery_uses_only_the_agentos_config_name() {
+        let dir = temp_root("agentos-config-discovery");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(STATE_DIR)).unwrap();
+        let previous_name = format!("{}{}", "yard", "let.yaml");
+        fs::write(
+            dir.join(STATE_DIR).join(previous_name),
+            CONFIG_WITH_COMMENTS,
+        )
+        .unwrap();
+
+        assert!(Workspace::discover(&dir).is_none());
+        assert_eq!(
+            Workspace::at(&dir).config_path(),
+            dir.join(STATE_DIR).join(CONFIG_FILE)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -9049,6 +9030,7 @@ records:
         let _ = fs::remove_dir_all(ws.root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn downstream_accepts_matching_existing_destination_as_noop() {
         use std::os::unix::fs::MetadataExt;

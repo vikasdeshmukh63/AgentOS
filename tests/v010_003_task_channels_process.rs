@@ -30,7 +30,7 @@ mod unix {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const REQUIRED_CLI_CAPABILITIES: &[CliCapability] = &[CliCapability {
-        name: "yardlet answer --accept-deviation",
+        name: "agentos answer --accept-deviation",
         probe_args: &["answer", "--help"],
         marker: "--accept-deviation",
     }];
@@ -39,7 +39,7 @@ mod unix {
         preflight_process_binary(binary, REQUIRED_CLI_CAPABILITIES)
     }
 
-    fn yardlet_binary() -> PathBuf {
+    fn agentos_binary() -> PathBuf {
         let binary = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
         static PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
         if let Err(error) =
@@ -58,13 +58,13 @@ mod unix {
     impl FixtureWorkspace {
         fn new(label: &str) -> Self {
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let binary = yardlet_binary();
+            let binary = agentos_binary();
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "yardlet-v010-003-{label}-{}-{nonce}",
+                "agentos-v010-003-{label}-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();
@@ -290,18 +290,18 @@ mod unix {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "yardlet-v010-003-stale-cargo-bin-{}-{nonce}",
+            "agentos-v010-003-stale-cargo-bin-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
-        let stale_binary = root.join("yardlet");
+        let stale_binary = root.join("agentos");
         fs::write(
             &stale_binary,
             r#"#!/usr/bin/env bash
 set -euo pipefail
 marker="$(cd "$(dirname "$0")" && pwd)/body-started"
 if [[ "${1:-}" == "answer" && "${2:-}" == "--help" ]]; then
-  printf 'Usage: yardlet answer [OPTIONS]\n\nOptions:\n  --task <TASK>\n'
+  printf 'Usage: agentos answer [OPTIONS]\n\nOptions:\n  --task <TASK>\n'
   exit 0
 fi
 : >"$marker"
@@ -319,9 +319,9 @@ fi
         let diagnostic = preflight.expect_err("stale CARGO_BIN_EXE passed capability preflight");
         assert!(diagnostic.contains("process binary capability preflight failed"));
         assert!(diagnostic.contains(&stale_binary.display().to_string()));
-        assert!(diagnostic.contains("yardlet answer --accept-deviation"));
-        assert!(diagnostic.contains("cargo clean -p yardlet"));
-        assert!(diagnostic.contains("cargo build --bin yardlet"));
+        assert!(diagnostic.contains("agentos answer --accept-deviation"));
+        assert!(diagnostic.contains("cargo clean -p agentos"));
+        assert!(diagnostic.contains("cargo build --bin agentos"));
         assert!(diagnostic.contains("then retry"));
         assert!(
             !root.join("body-started").exists(),
@@ -813,7 +813,7 @@ printf '# Handoff\n\nPolicy-authorized failover completed.\n' >"$run_dir/handoff
         let fixture = FixtureWorkspace::new("confirmed-policy-failover-recover");
         confirm_policy_failover_task(&fixture);
         write_policy_failover_workers(&fixture);
-        let config_path = fixture.root.join(".agents/yardlet.yaml");
+        let config_path = fixture.root.join(".agents/agentos.yaml");
         let mut config = read_yaml(&config_path);
         config["auto_commit"] = Value::Bool(true);
         fs::write(config_path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
@@ -846,7 +846,7 @@ exit 1
         permissions.set_mode(0o755);
         fs::set_permissions(&hook, permissions).unwrap();
 
-        // The hook keeps polling after this test kills Yardlet — that IS the
+        // The hook keeps polling after this test kills AgentOS — that IS the
         // receipted-orphan state under test — so it cannot be group-killed with
         // the parent. It can still be reaped by pid if an assertion fires while it
         // is mid-loop, which otherwise leaves it running out its own 200s timeout.
@@ -1212,13 +1212,13 @@ printf 'primary intentionally omitted result.json\n' >&2
     #[test]
     fn text_worker_answer_creates_a_new_attempt_and_preserves_both_raw_streams() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let binary = yardlet_binary();
+        let binary = agentos_binary();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "yardlet-v010-003-process-{}-{nonce}",
+            "agentos-v010-003-process-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -2137,11 +2137,11 @@ mv "$YARD_RUN_DIR/run.yaml.tmp" "$YARD_RUN_DIR/run.yaml"
         let output = resumed.into_inner().wait_with_output().unwrap();
         assert!(
             exited,
-            "Yardlet parent exceeded the load-tolerant hard timeout"
+            "AgentOS parent exceeded the load-tolerant hard timeout"
         );
         assert!(
             result_seen.elapsed() < PROMPT_FINISH_BOUND,
-            "Yardlet parent did not complete promptly after result.json"
+            "AgentOS parent did not complete promptly after result.json"
         );
         assert!(
             output.status.success(),
@@ -2611,7 +2611,7 @@ mv "$YARD_RUN_DIR/run.yaml.tmp" "$YARD_RUN_DIR/run.yaml"
         );
         assert!(
             original.status.success(),
-            "original yardlet run failed\nstdout:\n{}\nstderr:\n{}",
+            "original agentos run failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&original.stdout),
             String::from_utf8_lossy(&original.stderr)
         );
@@ -2683,13 +2683,13 @@ mv "$YARD_RUN_DIR/run.yaml.tmp" "$YARD_RUN_DIR/run.yaml"
         assert!(text.contains("recovery required"));
         assert!(text.contains("YARD-DEAD-WORKER"));
         assert!(text.contains(run_id));
-        assert!(text.contains("yardlet recover"));
+        assert!(text.contains("agentos recover"));
         let json: serde_json::Value = serde_json::from_slice(&json_status.stdout).unwrap();
         let diagnostic = &json["recovery_required"][0];
         assert_eq!(diagnostic["task_id"], "YARD-DEAD-WORKER");
         assert_eq!(diagnostic["run_id"], run_id);
         assert_eq!(diagnostic["effective_state"], "interrupted");
-        assert_eq!(diagnostic["action"], "yardlet recover");
+        assert_eq!(diagnostic["action"], "agentos recover");
         assert_eq!(json["queue"]["running"], 1);
         assert_eq!(fs::read(&queue_path).unwrap(), queue_before);
         assert_eq!(fs::read(&run_path).unwrap(), run_before);
@@ -3134,7 +3134,7 @@ mv "$YARD_RUN_DIR/run.yaml.tmp" "$YARD_RUN_DIR/run.yaml"
             "  - id: YARD-FALLBACK\n    title: fallback owns answer continuation\n    state: queued\n    priority: 10\n    kind: implementation\n    preferred_worker: fixture-fallback-a\n",
         );
         fixture.run(&["run", "--task", "YARD-FALLBACK", "--execute"]);
-        write_workers(Path::new("yardlet-missing-question-producer"));
+        write_workers(Path::new("agentos-missing-question-producer"));
 
         fixture.run(&[
             "answer",
@@ -3213,7 +3213,7 @@ mv "$YARD_RUN_DIR/run.yaml.tmp" "$YARD_RUN_DIR/run.yaml"
                 "--action-id",
                 "act-redirect-crash",
             ])
-            .env("YARDLET_TEST_CRASH_AFTER_REDIRECT_RECEIPT", "1")
+            .env("AGENTOS_TEST_CRASH_AFTER_REDIRECT_RECEIPT", "1")
             .current_dir(&fixture.root)
             .output()
             .unwrap();

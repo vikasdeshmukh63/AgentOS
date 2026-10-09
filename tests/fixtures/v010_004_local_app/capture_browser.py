@@ -62,7 +62,7 @@ def main():
     metadata = Path(args.metadata).resolve()
     screenshot.parent.mkdir(parents=True, exist_ok=True)
     metadata.parent.mkdir(parents=True, exist_ok=True)
-    profile = tempfile.mkdtemp(prefix="yardlet-local-browser-")
+    profile = tempfile.mkdtemp(prefix="agentos-local-browser-")
     executable = browser_binary()
     version = subprocess.run(
         [executable, "--version"],

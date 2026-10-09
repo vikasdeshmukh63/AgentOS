@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -u
 
-: "${YARDLET_FIXTURE_REAL_GIT:?missing real git path}"
-: "${YARDLET_FIXTURE_GIT_LOG:?missing wrapper log path}"
-: "${YARDLET_FIXTURE_ROOT:?missing fixture root}"
-: "${YARDLET_FIXTURE_PYTHON:?missing python path}"
+: "${AGENTOS_FIXTURE_REAL_GIT:?missing real git path}"
+: "${AGENTOS_FIXTURE_GIT_LOG:?missing wrapper log path}"
+: "${AGENTOS_FIXTURE_ROOT:?missing fixture root}"
+: "${AGENTOS_FIXTURE_PYTHON:?missing python path}"
 
-mode="${YARDLET_FIXTURE_CRASH_MODE:-normal}"
+mode="${AGENTOS_FIXTURE_CRASH_MODE:-normal}"
 is_commit_start=0
 is_commit_publish=0
 is_native_commit=0
@@ -60,12 +60,12 @@ done
 
 if [[ "$is_push" -eq 1 ]]; then
   if [[ -z "$push_destination" ]]; then
-    printf 'PUSH_REJECTED\treason=unresolved_destination\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+    printf 'PUSH_REJECTED\treason=unresolved_destination\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
     exit 97
   fi
   if ! validated_destinations="$(
-    "$YARDLET_FIXTURE_PYTHON" - "$YARDLET_FIXTURE_ROOT" "$push_destination" \
-      "$YARDLET_FIXTURE_REAL_GIT" "${git_prefix[@]}" <<'PY'
+    "$AGENTOS_FIXTURE_PYTHON" - "$AGENTOS_FIXTURE_ROOT" "$push_destination" \
+      "$AGENTOS_FIXTURE_REAL_GIT" "${git_prefix[@]}" <<'PY'
 import os
 import subprocess
 import sys
@@ -154,22 +154,22 @@ for destination in destinations:
 print("\n".join(targets))
 PY
   )"; then
-    printf 'PUSH_REJECTED\treason=destination_outside_fixture\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+    printf 'PUSH_REJECTED\treason=destination_outside_fixture\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
     exit 97
   fi
   while IFS= read -r destination; do
-    printf 'PUSH_RESOLVED\t%q\n' "$destination" >>"$YARDLET_FIXTURE_GIT_LOG"
+    printf 'PUSH_RESOLVED\t%q\n' "$destination" >>"$AGENTOS_FIXTURE_GIT_LOG"
   done <<<"$validated_destinations"
 fi
 
-printf 'CALL\tpid=%s\tpgid=%s\t' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" >>"$YARDLET_FIXTURE_GIT_LOG"
-printf '%q ' "$@" >>"$YARDLET_FIXTURE_GIT_LOG"
-printf '\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+printf 'CALL\tpid=%s\tpgid=%s\t' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" >>"$AGENTOS_FIXTURE_GIT_LOG"
+printf '%q ' "$@" >>"$AGENTOS_FIXTURE_GIT_LOG"
+printf '\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
 
 stop_here() {
   local point="$1"
-  printf '%s\n' "$$" >"${YARDLET_FIXTURE_EVENT:?missing event path}.pid"
-  printf '%s\n' "$point" >"$YARDLET_FIXTURE_EVENT"
+  printf '%s\n' "$$" >"${AGENTOS_FIXTURE_EVENT:?missing event path}.pid"
+  printf '%s\n' "$point" >"$AGENTOS_FIXTURE_EVENT"
   while :; do sleep 1; done
 }
 
@@ -180,27 +180,27 @@ if [[ "$is_push" -eq 1 && "$mode" == "before_push" ]]; then
   stop_here before_push
 fi
 
-"$YARDLET_FIXTURE_REAL_GIT" "$@"
+"$AGENTOS_FIXTURE_REAL_GIT" "$@"
 status=$?
 
 if [[ "$status" -eq 0 && "$is_native_commit" -eq 1 ]]; then
-  printf 'TRANSACTION_COMMIT_SUCCESS\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+  printf 'TRANSACTION_COMMIT_SUCCESS\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
   [[ "$mode" == "after_transaction_commit" ]] && stop_here after_transaction_commit
 fi
 if [[ "$status" -eq 0 && "$is_commit_publish" -eq 1 ]]; then
-  printf 'COMMIT_SUCCESS\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+  printf 'COMMIT_SUCCESS\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
   [[ "$mode" == "after_commit" ]] && stop_here after_commit
 fi
 if [[ "$status" -eq 0 && "$is_merge" -eq 1 ]]; then
-  printf 'MERGE_SUCCESS\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+  printf 'MERGE_SUCCESS\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
   [[ "$mode" == "after_merge" ]] && stop_here after_merge
 fi
 if [[ "$status" -eq 0 && "$is_worktree_remove" -eq 1 ]]; then
-  printf 'WORKTREE_REMOVE_SUCCESS\n' >>"$YARDLET_FIXTURE_GIT_LOG"
+  printf 'WORKTREE_REMOVE_SUCCESS\n' >>"$AGENTOS_FIXTURE_GIT_LOG"
   [[ "$mode" == "after_worktree_remove" ]] && stop_here after_worktree_remove
 fi
 if [[ "$status" -eq 0 && "$is_push" -eq 1 ]]; then
-  printf 'PUSH_SUCCESS\t%s\n' "$refspec" >>"$YARDLET_FIXTURE_GIT_LOG"
+  printf 'PUSH_SUCCESS\t%s\n' "$refspec" >>"$AGENTOS_FIXTURE_GIT_LOG"
   [[ "$mode" == "after_push" ]] && stop_here after_push
 fi
 

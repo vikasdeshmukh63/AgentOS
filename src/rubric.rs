@@ -2,7 +2,7 @@
 //!
 //! `init` copies the binary's embedded worker template into a workspace's
 //! `.agents/workers.yaml` once, then never touches it again. When a later
-//! Yardlet improves a worker's *rubric* (its planner/routing policy:
+//! AgentOS improves a worker's *rubric* (its planner/routing policy:
 //! `capabilities`, `best_for`, `not_for`, `cost_weight`, `role_strengths`), an
 //! older workspace stays pinned to the rubric it was born with. A missing hard
 //! `capability` is the sharp case: a task whose `required_capabilities` lists it

@@ -1,5 +1,5 @@
 schema_version: 1
-library: yardlet-managed-builtins
+library: agentos-managed-builtins
 id: SPW-03
 name: verification-before-completion
 layer: core

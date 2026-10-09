@@ -82,7 +82,7 @@ local reference catalog 실측도 문서와 일치했다.
 | SPW-02 | 11 files | L93-105 env, keychain, `codesign` 예시 | 예시 블록과 fixture 5종 제외, 선택 script만 남김 |
 | SPW-03 | 1 file | local verification | 단일 문서 포함, 요구 없음 |
 | SPW-04 | 2 files | L61 등의 미채택 REQUIRED SUB-SKILL | 참조 제거와 task 내부 계획 재범위화 전 설치 금지 |
-| SPW-06 | 2 files | reviewer subagent dispatch | Yardlet review task로 번역 |
+| SPW-06 | 2 files | reviewer subagent dispatch | AgentOS review task로 번역 |
 | SPW-07 | 1 file | feedback 수신 시 trigger | `review-feedback` overlay로 단일 배정 |
 | SPW-08 | 1 file | L121-125 `git push`, PR 선택지 | NeedsUser와 기존 push gate 뒤로 이동 |
 | SPW-13 | 7 files | subagent pressure test, graphviz, `render-graphs.js` | script/asset/전제 문서 제외와 본문 재작성 전 설치 금지 |
@@ -150,7 +150,7 @@ YARD-004와 같은 위험 표본을 pinned source에서 다시 확인했다.
 | ANT-06 | 5 files, init script가 pnpm 전역 설치와 다수 package install 수행 | network 과다 제외 타당 |
 | ANT-07 | SKILL.md 1개, skill LICENSE 없음, repo license null | license 불명 제외 타당 |
 | ANT-08 | docx 61 files, 제한적 LICENSE 전문 | 재배포 제외 타당 |
-| SPW-11 | SKILL.md, parallel subagent dispatcher | Yardlet queue 경계 충돌 제외 타당 |
+| SPW-11 | SKILL.md, parallel subagent dispatcher | AgentOS queue 경계 충돌 제외 타당 |
 | SPW-12 | 6 files, subagent session과 실행 script 종속 | 제외 타당 |
 | SPW-14 | 4 files, 1% 가능성에도 skill 강제 invoke | packet catalog dispatcher 충돌 제외 타당 |
 | HDN-01 | `f7a43d8...`, repo license null | license/provenance 제외 타당 |

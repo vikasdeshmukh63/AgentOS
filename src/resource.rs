@@ -40,7 +40,7 @@ static TEST_RESOURCE_FAULT_FIRED: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 fn test_resource_fault(action_id: &str, point: &str) -> Result<()> {
     let expected = format!("{action_id}:{point}");
-    if std::env::var("YARDLET_TEST_RESOURCE_ACTION_FAULT")
+    if std::env::var("AGENTOS_TEST_RESOURCE_ACTION_FAULT")
         .ok()
         .as_deref()
         != Some(expected.as_str())
@@ -63,12 +63,12 @@ fn test_resource_fault(action_id: &str, point: &str) -> Result<()> {
 fn test_resource_spawn_gap_fault(action_id: &str, pid: u32) -> Result<()> {
     let point = "after_spawn_before_recovery";
     let expected = format!("{action_id}:{point}");
-    if std::env::var("YARDLET_TEST_RESOURCE_ACTION_FAULT")
+    if std::env::var("AGENTOS_TEST_RESOURCE_ACTION_FAULT")
         .ok()
         .as_deref()
         == Some(expected.as_str())
     {
-        if let Ok(path) = std::env::var("YARDLET_TEST_RESOURCE_ACTION_TRACE") {
+        if let Ok(path) = std::env::var("AGENTOS_TEST_RESOURCE_ACTION_TRACE") {
             std::fs::write(path, format!("{pid}\n"))?;
         }
     }
@@ -597,10 +597,11 @@ fn probe_resource(ws: &Workspace, resource: &RuntimeResource) -> Result<Probe> {
 fn owned_for_destructive_action(ownership: ResourceOwnership) -> bool {
     matches!(
         ownership,
-        ResourceOwnership::Yardlet | ResourceOwnership::Worker
+        ResourceOwnership::AgentOS | ResourceOwnership::Worker
     )
 }
 
+#[cfg(unix)]
 fn terminate_exact_process(probe: &Probe) -> Result<()> {
     if probe.status != ResourceStatus::Live {
         bail!("process is not live with a matching identity");
@@ -619,6 +620,11 @@ fn terminate_exact_process(probe: &Probe) -> Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
     bail!("owned process did not stop after SIGTERM")
+}
+
+#[cfg(not(unix))]
+fn terminate_exact_process(_probe: &Probe) -> Result<()> {
+    bail!("process termination is only supported on Unix hosts")
 }
 
 fn restart_command(resource: &RuntimeResource) -> &[String] {
@@ -1607,7 +1613,7 @@ mod tests {
                 worker_id: "fixture".to_string(),
             },
             causation_id: "attempt-delayed-health".to_string(),
-            ownership: ResourceOwnership::Yardlet,
+            ownership: ResourceOwnership::AgentOS,
             capabilities: vec![ResourceCapability::Restart],
             target: RuntimeResourceTarget::Service {
                 url: health_url.clone(),

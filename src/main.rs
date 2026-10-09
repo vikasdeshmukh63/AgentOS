@@ -1,8 +1,8 @@
-//! Yardlet: a local AI workbench.
+//! AgentOS: a local AI workbench.
 //!
 //! Plan, queue, route, validate, and hand off long-running work inside a local
 //! workspace using subscription-backed Codex and Claude Code CLIs as hidden
-//! workers. Yardlet core never requires, requests, stores, or calls AI provider
+//! workers. AgentOS core never requires, requests, stores, or calls AI provider
 //! API keys.
 
 mod approvals;
@@ -11,6 +11,7 @@ mod cli;
 mod compact;
 mod eval_fixtures;
 mod evaluator;
+mod file_lock;
 mod gc;
 mod git_finish;
 mod guard;

@@ -1,13 +1,13 @@
 ---
 name: writing-plans
-description: Use when a bounded Yardlet task needs a concrete implementation plan before code changes
+description: Use when a bounded AgentOS task needs a concrete implementation plan before code changes
 ---
 
 # Writing Task-Internal Plans
 
 ## Purpose
 
-Turn one accepted Yardlet task into a small, testable implementation plan. The
+Turn one accepted AgentOS task into a small, testable implementation plan. The
 intent contract and work queue already own project-level decomposition. Do not
 replace them, expand the task, or create a second queue.
 
@@ -49,7 +49,7 @@ refactors.
 
 Use [plan-document-reviewer-prompt.md](plan-document-reviewer-prompt.md) to
 check the completed plan against the task contract. If independent review is
-required, represent it as a normal Yardlet queue task with `kind: review`; do
+required, represent it as a normal AgentOS queue task with `kind: review`; do
 not invent another execution mechanism.
 
 ## Completion Checklist

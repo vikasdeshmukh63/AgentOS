@@ -24,7 +24,7 @@ if [[ -z "$run_dir" ]]; then
   printf 'fixture could not resolve run directory\n' >&2
   exit 65
 fi
-task_id="$(sed -n 's/^# Yardlet task packet: //p' <<<"$packet" | head -n 1)"
+task_id="$(sed -n 's/^# AgentOS task packet: //p' <<<"$packet" | head -n 1)"
 if [[ -z "$task_id" && -f "$run_dir/run.yaml" ]]; then
   task_id="$(sed -n 's/^task_id: //p' "$run_dir/run.yaml" | head -n 1)"
 fi

@@ -561,7 +561,7 @@ pub fn run_batch<F: FnMut(&str)>(
             continue;
         }
         // The worker's read anchors (`.agents/*.yaml`) resolve against its cwd
-        // (the worktree), and Yardlet's runtime state is not committed — copy the
+        // (the worktree), and AgentOS's runtime state is not committed — copy the
         // two contract files in so the packet's anchors hold.
         let wt_agents = p.wt_path.join(crate::state::STATE_DIR);
         let _ = std::fs::create_dir_all(&wt_agents);
@@ -749,7 +749,7 @@ pub fn run_batch<F: FnMut(&str)>(
     // declare the isolated worktree its prep created, canonicalized equal to
     // the spawn cwd. A tampered or corrupted receipt aborts the whole batch
     // here (issue #34's parallel twin of the serial pre-spawn attestation);
-    // `yardlet recover` reconciles the already-running-marked tasks.
+    // `agentos recover` reconciles the already-running-marked tasks.
     for p in &preps {
         run::attest_worker_cwd(&p.run_dir, &p.wt_path, false)?;
     }
@@ -1000,7 +1000,7 @@ pub fn run_batch<F: FnMut(&str)>(
             };
         // A finalize error for one task (e.g. a transient queue-write hiccup)
         // must not abort the whole batch and strand the other already-finished
-        // worktrees — log it and move on; `yardlet recover` salvages this one.
+        // worktrees — log it and move on; `agentos recover` salvages this one.
         let report = match run::finalize_run(run::FinalizeInput {
             ws,
             run_dir: &p.run_dir,
@@ -1032,7 +1032,7 @@ pub fn run_batch<F: FnMut(&str)>(
                 // later queue write), so don't claim the worktree is kept — just
                 // point at recover, which reconciles whatever state remains.
                 on_event(&format!(
-                    "{}: finalize failed ({e}); run `yardlet recover` to reconcile",
+                    "{}: finalize failed ({e}); run `agentos recover` to reconcile",
                     p.task.id
                 ));
                 continue;
@@ -1133,7 +1133,7 @@ enum TransactionPublish {
 }
 
 fn transaction_ref(branch: &str) -> String {
-    format!("refs/heads/yardlet-txn/{branch}")
+    format!("refs/heads/agentos-txn/{branch}")
 }
 
 fn transaction_path(run_dir: &Path) -> PathBuf {
@@ -1307,7 +1307,7 @@ fn publish_transaction_commit(
             &[
                 "symbolic-ref",
                 "-m",
-                "yardlet integration prepare",
+                "agentos integration prepare",
                 "HEAD",
                 &transaction,
             ],
@@ -1321,7 +1321,7 @@ fn publish_transaction_commit(
                     &[
                         "symbolic-ref",
                         "-m",
-                        "yardlet integration commit failed",
+                        "agentos integration commit failed",
                         "HEAD",
                         &target_ref,
                     ],
@@ -1407,7 +1407,7 @@ fn publish_transaction_commit(
         &[
             "symbolic-ref",
             "-m",
-            "yardlet integration published",
+            "agentos integration published",
             "HEAD",
             &target_ref,
         ],
@@ -1790,7 +1790,7 @@ fn commit_message(root: &Path, task_id: &str) -> String {
         .map(|t| single_line(&t))
         .filter(|t| !t.is_empty() && t != task_id)
         .unwrap_or_else(|| "task changes".to_string());
-    format!("yardlet({task_id}): {title}")
+    format!("agentos({task_id}): {title}")
 }
 
 fn task_title(root: &Path, task_id: &str) -> Option<String> {
@@ -2126,7 +2126,7 @@ pub(crate) struct ParallelWorkerEvidence {
     pub(crate) dependency_input_overlays: Vec<state::DependencyInputOverlay>,
 }
 
-/// Actual parallel-worktree changes with Yardlet's unchanged seeded harness
+/// Actual parallel-worktree changes with AgentOS's unchanged seeded harness
 /// copies removed. An unchanged copy that differs from worktree HEAD is a
 /// dispatcher-owned input overlay: it must stay in the tree with the exact
 /// bytes validation will read (issue #32), so instead of reverting it, each
@@ -2235,14 +2235,14 @@ pub(crate) fn parallel_worker_evidence(
         false
     });
     // Status-derived paths keep the harness-allowlist filter: a parallel
-    // worktree also carries Yardlet's OWN seeded copies of canonical state, and
+    // worktree also carries AgentOS's OWN seeded copies of canonical state, and
     // without a pre-worker snapshot to subtract them by content this filter is
     // what stops them being attributed to the worker.
     //
-    // Committed paths do NOT get that filter. Yardlet never commits its seeds,
+    // Committed paths do NOT get that filter. AgentOS never commits its seeds,
     // so a commit is unambiguously the worker's — and applying the allowlist to
     // it silently removed exactly the canonical-state set `forbidden_in` exists
-    // to catch, leaving `.agents/yardlet.yaml` invisible to the gate while the
+    // to catch, leaving `.agents/agentos.yaml` invisible to the gate while the
     // merge carried it into the workspace (issue #83).
     let mut paths = paths
         .into_iter()
@@ -2258,7 +2258,7 @@ pub(crate) fn parallel_worker_evidence(
     })
 }
 
-/// Keep `.agents/worktrees/` out of `git status` in any repo Yardlet runs in,
+/// Keep `.agents/worktrees/` out of `git status` in any repo AgentOS runs in,
 /// without touching the repo's own .gitignore: use the repo-local exclude file.
 pub(crate) fn ensure_worktrees_excluded(root: &Path) {
     let Ok(common) = git(root, &["rev-parse", "--git-common-dir"]) else {
@@ -2973,15 +2973,15 @@ mod tests {
         // rejects everything under `.agents/` outside the harness roots, which
         // is precisely what `forbidden_in` is looking for.
         std::fs::create_dir_all(worktree.join(".agents")).unwrap();
-        std::fs::write(worktree.join(".agents/yardlet.yaml"), "pwned: true\n").unwrap();
-        sh_git(&worktree, &["add", "-f", ".agents/yardlet.yaml"]);
+        std::fs::write(worktree.join(".agents/agentos.yaml"), "pwned: true\n").unwrap();
+        sh_git(&worktree, &["add", "-f", ".agents/agentos.yaml"]);
         sh_git(&worktree, &["commit", "-q", "-m", "canonical state"]);
         let evidence = parallel_worker_evidence(&root, &worktree, &run_dir).unwrap();
         assert!(
             evidence
                 .paths
                 .iter()
-                .any(|path| path == ".agents/yardlet.yaml"),
+                .any(|path| path == ".agents/agentos.yaml"),
             "a committed canonical-state file must reach the gate: {:?}",
             evidence.paths
         );
@@ -3014,8 +3014,8 @@ run_id=$(basename "$run_dir")
 cat >/dev/null
 printf "feature\n" > feature.txt
 mkdir -p .agents
-printf "pwned: true\n" > .agents/yardlet.yaml
-git add -f feature.txt .agents/yardlet.yaml
+printf "pwned: true\n" > .agents/agentos.yaml
+git add -f feature.txt .agents/agentos.yaml
 git -c user.name=w -c user.email=w@e.t commit -q -m "worker commit"
 cat > "$run_dir/result.json" <<EOF
 {
@@ -3084,7 +3084,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
             gate["note"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(".agents/yardlet.yaml"),
+                .contains(".agents/agentos.yaml"),
             "and it must name the committed path: {gate}"
         );
         assert_eq!(
@@ -3167,7 +3167,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
             ),
         )
         .unwrap();
-        // Yardlet's pre-worker seed snapshot: the same bytes it copied in.
+        // AgentOS's pre-worker seed snapshot: the same bytes it copied in.
         let seed = run_dir.join(run::HARNESS_SEED_DIR).join("rules");
         std::fs::create_dir_all(&seed).unwrap();
         std::fs::write(seed.join("seeded.md"), "seed bytes\n").unwrap();
@@ -3527,7 +3527,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
         let ws = Workspace::at(root);
         write_str(
             &ws.config_path(),
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\n# unit fixtures opt into full access explicitly: they exercise run/parallel\n# mechanics with bash fixture workers that declare no sandbox contract\ndefault_access: full\n",
+            "schema_version: 1\nproduct: agentos\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\n# unit fixtures opt into full access explicitly: they exercise run/parallel\n# mechanics with bash fixture workers that declare no sandbox contract\ndefault_access: full\n",
         )
         .unwrap();
         write_str(&ws.billing_path(), "schema_version: 1\n").unwrap();
@@ -3581,7 +3581,7 @@ run_dir="$1"
 spawn_marker="$2"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 touch "$spawn_marker"
 cat > "$run_dir/result.json" <<EOF
 {
@@ -4525,7 +4525,7 @@ exit 0
         );
         assert_eq!(
             worker_commit.trim(),
-            "Local User|local@example.test|yardlet(YARD-001): 병렬 worktree 정리"
+            "Local User|local@example.test|agentos(YARD-001): 병렬 worktree 정리"
         );
         let merge_commit = sh_git(&root, &["log", "--format=%an|%ae", "-1", "HEAD"]);
         assert_eq!(merge_commit.trim(), "Local User|local@example.test");
@@ -5413,7 +5413,7 @@ exit 0
             Some(false)
         );
 
-        // Yardlet tries to integrate a worktree meanwhile: it must report and
+        // AgentOS tries to integrate a worktree meanwhile: it must report and
         // leave the user's merge state intact.
         let wt = root.join(".agents/worktrees/yard-009");
         let baseline = sh_git(&root, &["rev-parse", "HEAD"]).trim().to_string();

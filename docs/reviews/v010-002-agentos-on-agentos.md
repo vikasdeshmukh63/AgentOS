@@ -1,16 +1,16 @@
-# V010-002 Yardlet-on-Yardlet 증거
+# V010-002 AgentOS-on-AgentOS 증거
 
 - 대상: 대화형 planning, immutable draft revision, semantic diff, explicit confirm, exact promotion
 - 실행일: 2026-07-14 (Asia/Seoul)
 - 실행 루트: `.agents/runs/run-20260714-011920/dogfood-v010-002/workspace`
-- 실행 주체: 이 worktree에서 빌드한 실제 `yardlet`과 로컬 `codex` planning worker
+- 실행 주체: 이 worktree에서 빌드한 실제 `agentos`과 로컬 `codex` planning worker
 - 원래 dogfood 판정: 세 content turn, accept, reject, undo, fresh-process 복원, explicit confirm을 거친 뒤 visible draft와 active intent/queue가 field와 digest 양쪽에서 일치했다.
 - 보수 판정: terminal proposal, undo linkage, stripped provenance, stable prepared effect, immutable journal 검증, completed-active 일치, bounded process lock, runtime queue 경쟁, receipt/session/runtime envelope, exact planner turn CAS를 포함한 결정적 process test 37개가 통과했다. YARD-008 독립 재검토와 YARD-006 recovery 보수가 blocker 없이 통과했고, YARD-002 최종 독립 리뷰도 AC-001부터 AC-007까지 PASS했다.
 
 ## 1. 증거 경계
 
 dogfood는 격리 workspace에서 실행했다. planning session, proposal, draft,
-event, action receipt, active intent, active queue, activation은 모두 Yardlet
+event, action receipt, active intent, active queue, activation은 모두 AgentOS
 core가 `.agents/`에 기록했다. 이 문서를 만들기 위해 기존 운영 state를
 수동 편집하지 않았다.
 
@@ -32,7 +32,7 @@ core가 `.agents/`에 기록했다. 이 문서를 만들기 위해 기존 운영
 
 ### 1.1 roadmap task anchor projection
 
-`docs/yardlet-roadmap.md`는 `.gitignore` 대상이라 run-owned review worktree에
+`docs/agentos-roadmap.md`는 `.gitignore` 대상이라 run-owned review worktree에
 자동 투영되지 않는다. reviewer가 parent checkout의 ignored 파일에 의존하지 않도록,
 이 문서가 2026-07-14 parent SOT의 V010-002 task anchor를 다음과 같이 투영한다.
 parent 파일 SHA-256은
@@ -42,16 +42,16 @@ parent 파일 SHA-256은
 ### V010-002: Multi-turn conversational planning
 
 **Intent:** Let a user and planner jointly produce a bounded intent and plan
-without leaving Yardlet or rewriting the request from scratch.
+without leaving AgentOS or rewriting the request from scratch.
 
 In scope:
 
-- `yardlet new` starts or resumes a planning session.
+- `agentos new` starts or resumes a planning session.
 - The planning worker streams its investigation and messages into a planning
   channel.
 - Each turn may propose a patch to summary, scope, out-of-scope, acceptance,
   ambiguity, tasks, dependencies, routing, and validation.
-- Yardlet validates and records the patch, then shows a semantic before/after
+- AgentOS validates and records the patch, then shows a semantic before/after
   diff beside the conversation.
 - The user can revise, undo/reject a proposal, answer a planning question, and
   explicitly confirm the final contract and queue.
@@ -61,7 +61,7 @@ Out of scope:
 
 - Letting free-form chat silently mutate an active running queue.
 - Auto-confirming a plan merely because ambiguity is low.
-- Replacing `yardlet goal` as the express path.
+- Replacing `agentos goal` as the express path.
 
 Acceptance:
 
@@ -75,7 +75,7 @@ Acceptance:
 
 Dogfood proof:
 
-- Plan one real Yardlet slice through at least three turns: initial request,
+- Plan one real AgentOS slice through at least three turns: initial request,
   scope correction, and acceptance correction. Confirm that the active intent
   and queue match the visible final draft exactly.
 ```
@@ -92,7 +92,7 @@ production code를 추가하기 전에 아래 process test 9개를 먼저 만들
 cargo test --test v010_002_conversational_planning_process
 ```
 
-첫 실행은 `yardlet planning` subcommand가 없어 9/9가 동일하게 실패했고
+첫 실행은 `agentos planning` subcommand가 없어 9/9가 동일하게 실패했고
 exit 101이었다. 구현 뒤 같은 명령은 9/9 pass, exit 0이 되었다. 시나리오는
 accept, reject, undo, stale head, restart-confirm, partial promotion,
 running isolation, goal regression, multi-turn dogfood다.
@@ -143,7 +143,7 @@ new transaction scenarios:
 - concurrent_cli_actions_converge_to_one_receipt_and_collision_free_journal
 ```
 
-`YARDLET_TEST_PLANNING_CRASH` fixture hook가 실제 binary를 다음 위치에서 exit 86으로
+`AGENTOS_TEST_PLANNING_CRASH` fixture hook가 실제 binary를 다음 위치에서 exit 86으로
 종료했다.
 
 - event file atomic create 직후, session `next_seq` CAS 전
@@ -161,7 +161,7 @@ valid activation을 복원했다. 두 동시 CLI process는 모두 같은 canoni
 
 ### 2.3 YARD-007 transaction blocker RED에서 GREEN까지
 
-YARD-007은 수동 YAML로 만든 baseline을 사용하지 않고 실제 `yardlet init` 상태에서
+YARD-007은 수동 YAML로 만든 baseline을 사용하지 않고 실제 `agentos init` 상태에서
 confirm write order를 재현하도록 fixture를 교체했다. 구현 전에 추가한 여섯 process
 scenario의 RED는 다음 fail-open을 직접 드러냈다.
 
@@ -291,7 +291,7 @@ YARD-008 자체 검증 뒤 별도 read-only auditor가 실제 구버전 파일�
 | 2 | allowed path를 정확히 제한하는 scope correction 뒤 proposal reject | `prp_20260713164610725475000_000004` reject. visible head는 turn 1 revision 그대로 유지 |
 | 3 | 세 turn, accept/reject/undo, restart, confirm, field/digest parity를 acceptance에 추가한 proposal accept 후 undo | `prp_20260713164840156315000_000004`를 `drv_20260713164850875518000_000002`로 revise한 뒤 undo해 turn 1 revision 복원 |
 
-undo 뒤 별도 `yardlet planning show --json` process를 실행해 session과
+undo 뒤 별도 `agentos planning show --json` process를 실행해 session과
 visible head가 복원됨을 확인했다. 그 fresh process에서 복원한 head를
 `--expected-head`로 넘겨 `dogfood-confirm-final` action을 명시적으로
 confirm했다. confirm action을 같은 action id로 한 번 더 호출했을 때 같은
@@ -353,47 +353,47 @@ digest다. `queue_digest`는 같은 provenance와 confirm 당시 immutable
 cargo build
 cargo test --test v010_002_conversational_planning_process
 evidence="$(mktemp -d)"
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" dogfood
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" terminal_proposal
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" undo_integrity
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" stripped_modern
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" activation_action_linkage
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" confirm_crash_replay
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" event_seq_crash
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" confirm_write_order_crash
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" action_effect_crash
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" active_queue_guard
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" concurrent_action
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" accept_revision_crash
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" prepared_action_interlock
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" journal_corruption
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" completed_active_mismatch
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" lock_timeout
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" runtime_queue_confirm_race
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" receipt_v2_integrity
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" session_storage_integrity
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" runtime_envelope
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" runtime_origin_contract
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" writer_inventory
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/yardlet "$evidence" express_concurrency
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" dogfood
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" terminal_proposal
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" undo_integrity
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" stripped_modern
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" activation_action_linkage
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" confirm_crash_replay
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" event_seq_crash
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" confirm_write_order_crash
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" action_effect_crash
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" active_queue_guard
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" concurrent_action
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" accept_revision_crash
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" prepared_action_interlock
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" journal_corruption
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" completed_active_mismatch
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" lock_timeout
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" runtime_queue_confirm_race
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" receipt_v2_integrity
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" session_storage_integrity
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" runtime_envelope
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" runtime_origin_contract
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" writer_inventory
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/debug/agentos "$evidence" express_concurrency
 cargo build --release
-bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/release/yardlet "$evidence" release_hook_disabled
+bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh target/release/agentos "$evidence" release_hook_disabled
 ```
 
 live planning은 격리 workspace에서 로컬 subscription CLI worker를 사용해
 다음 action 순서로 실행했다.
 
 ```bash
-yardlet new "<initial request>" --worker codex
-yardlet planning accept <proposal-1> --expected-head none --action-id dogfood-accept-1
-yardlet planning answer "<scope correction>" --expected-head <revision-1> --action-id dogfood-answer-2 --worker codex
-yardlet planning reject <proposal-2> --expected-head <revision-1> --action-id dogfood-reject-2
-yardlet planning answer "<acceptance correction>" --expected-head <revision-1> --action-id dogfood-answer-3 --worker codex
-yardlet planning accept <proposal-3> --expected-head <revision-1> --action-id dogfood-accept-3
-yardlet planning undo --expected-head <revision-2> --action-id dogfood-undo-3
-yardlet planning show --json
-yardlet planning confirm --expected-head <revision-1> --action-id dogfood-confirm-final
-yardlet planning show --json
+agentos new "<initial request>" --worker codex
+agentos planning accept <proposal-1> --expected-head none --action-id dogfood-accept-1
+agentos planning answer "<scope correction>" --expected-head <revision-1> --action-id dogfood-answer-2 --worker codex
+agentos planning reject <proposal-2> --expected-head <revision-1> --action-id dogfood-reject-2
+agentos planning answer "<acceptance correction>" --expected-head <revision-1> --action-id dogfood-answer-3 --worker codex
+agentos planning accept <proposal-3> --expected-head <revision-1> --action-id dogfood-accept-3
+agentos planning undo --expected-head <revision-2> --action-id dogfood-undo-3
+agentos planning show --json
+agentos planning confirm --expected-head <revision-1> --action-id dogfood-confirm-final
+agentos planning show --json
 ```
 
 ## 7. 안전 경계
@@ -446,7 +446,7 @@ yardlet planning show --json
 - activation guard parse 또는 linkage 오류는 inactive로 fail-open하지 않고 호출자에게
   `unconfirmed_or_inconsistent` 오류로 전파된다.
 - confirmed 또는 running queue에 대한 free-form planning mutation은 거절된다.
-- `yardlet goal` 기본 및 verifier 포함 express path는 planning worker 없이
+- `agentos goal` 기본 및 verifier 포함 express path는 planning worker 없이
   동작하면서 draft와 confirmation provenance를 기록한다.
 - V010-003 이상의 task channel, runtime resource, TUI, adapter, GUI 범위는
   이 구현에서 확장하지 않았다.
@@ -493,11 +493,11 @@ cargo test -q
 cargo build --release
   exit 0
 bash tests/fixtures/v010_002_conversational_planning/scripts/run.sh \
-  target/release/yardlet <fresh-evidence-dir> release_hook_disabled
+  target/release/agentos <fresh-evidence-dir> release_hook_disabled
   status passed
 ```
 
-README parity도 fresh 확인했다. 두 파일은 같은 순서의 section 19개, `yardlet` command
+README parity도 fresh 확인했다. 두 파일은 같은 순서의 section 19개, `agentos` command
 row 34개, 같은 canonical state tree entry를 가지며 `README.md`와 `README.ko.md` 모두
 em dash가 0개다. 필수 read anchor로 지정된
 `.agents/runs/run-20260714-035949/evidence/repo-summary.md`는 이 worker가 시작할 때 존재하지
@@ -565,7 +565,7 @@ cargo test
   V010-002 process 35 passed
 ```
 
-README parity도 다시 확인했다. 두 파일은 같은 순서의 section 19개와 `yardlet` command row
+README parity도 다시 확인했다. 두 파일은 같은 순서의 section 19개와 `agentos` command row
 34개를 유지하고 em dash가 없다. 구현 독립 판정은 기존 queue의 `YARD-002` review task가
 criterion별 실제 workspace 검증으로 소유한다.
 
@@ -584,7 +584,7 @@ cargo test --test v010_002_conversational_planning_process \
 
 별도 RED에서는 `activation-required.yaml`, activation receipt, active intent/queue의 linkage와
 materialized snapshot을 모두 제거하되 confirmed session과 draft는 남겼다. 기존 guard는 이를
-`Legacy`로 강등해 `yardlet run --next`를 허용했다.
+`Legacy`로 강등해 `agentos run --next`를 허용했다.
 
 ```text
 cargo test --test v010_002_conversational_planning_process \
@@ -602,12 +602,12 @@ confirmation, draft linkage가 유지된다. runtime validation은 snapshot을 �
 legacy 판정 전에는 active intent/queue id와 일치하는 activation receipt, planning session,
 draft revision을 별도 durable discriminator로 검색한다. 하나라도 남으면 active provenance를
 전량 strip한 상태를 `unconfirmed_or_inconsistent`로 거절한다. 반대로 modern record와 marker가
-전혀 없는 plain schema v1 intent/queue fixture는 기존과 같이 `yardlet run --next`에서
+전혀 없는 plain schema v1 intent/queue fixture는 기존과 같이 `agentos run --next`에서
 `YARD-001`을 선택해 legacy compatibility를 명시적으로 증명한다.
 
 최종 process fixture는 첫 task의 failed evaluation 뒤 fresh process로 projection을 다시 열어
 committed activation과 exact parity를 확인한다. materialized snapshot과 digest의 confirm 전후
-byte가 같고 `YARD-002`는 Queued로 남으며, 또 다른 fresh `yardlet run --task YARD-002`가 해당
+byte가 같고 `YARD-002`는 Queued로 남으며, 또 다른 fresh `agentos run --task YARD-002`가 해당
 task를 정상 준비한다. V010-002 process matrix는 총 37개가 모두 통과했다.
 
 2026-07-14 최종 source에서 fresh completion gate도 모두 통과했다.

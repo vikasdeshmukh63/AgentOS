@@ -1,6 +1,6 @@
 # 제네릭 워커 세션 재개 계약 독립 검토 (YARD-002)
 
-- 검토 대상 구현: `f181b61` "yardlet(YARD-001): 제네릭 워커의 opt-in native session resume 구현" (현재 브랜치에 머지됨)
+- 검토 대상 구현: `f181b61` "agentos(YARD-001): 제네릭 워커의 opt-in native session resume 구현" (현재 브랜치에 머지됨)
 - 검토 유형: read-only 독립 검토 (제품 코드 미수정)
 - 검토 HEAD: `1b44827`
 - 판정 요약: **AC-001 ~ AC-005 전부 PASS → status: done**

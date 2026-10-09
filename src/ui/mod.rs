@@ -1,7 +1,7 @@
 //! Terminal UI (Ratatui).
 //!
 //! The TUI is the normal interface, but it is never the canonical state store:
-//! it reads and writes through Yardlet's state layer. Long worker runs happen on a
+//! it reads and writes through AgentOS's state layer. Long worker runs happen on a
 //! background thread so the UI stays responsive; the event loop polls a channel
 //! for completion and animates a spinner meanwhile.
 
@@ -48,7 +48,7 @@ pub enum Screen {
 }
 
 /// One editable settings row. `key` routes the value back to the right file:
-/// "access"/"language" -> yard.yaml; "model:<id>"/"effort:<id>" -> workers.yaml.
+/// "access"/"language" -> agentos.yaml; "model:<id>"/"effort:<id>" -> workers.yaml.
 /// `options` are the Space-cycle presets ("" = default); typing still works.
 pub struct Field {
     pub label: String,
@@ -442,10 +442,10 @@ where
 fn fixture_recovery_delay() {
     #[cfg(debug_assertions)]
     {
-        if std::env::var("YARDLET_PROCESS_FIXTURE").as_deref() != Ok("1") {
+        if std::env::var("AGENTOS_PROCESS_FIXTURE").as_deref() != Ok("1") {
             return;
         }
-        let delay = std::env::var("YARDLET_FIXTURE_RECOVERY_DELAY_MS")
+        let delay = std::env::var("AGENTOS_FIXTURE_RECOVERY_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
@@ -1010,15 +1010,15 @@ fn title_for(app: &App) -> String {
     let clip = |s: &str| -> String { s.chars().take(50).collect() };
     if app.is_busy() {
         match &app.progress {
-            Some(p) => format!("Yardlet \u{00b7} {}", clip(p)),
-            None => format!("Yardlet \u{00b7} {}", app.lang.l().run_word),
+            Some(p) => format!("AgentOS \u{00b7} {}", clip(p)),
+            None => format!("AgentOS \u{00b7} {}", app.lang.l().run_word),
         }
     } else {
         match app.snapshot.as_ref().map(|s| s.intent_summary()) {
             Some(intent) if !intent.starts_with('(') => {
-                format!("Yardlet \u{00b7} {}", clip(intent))
+                format!("AgentOS \u{00b7} {}", clip(intent))
             }
-            _ => format!("Yardlet v{}", env!("CARGO_PKG_VERSION")),
+            _ => format!("AgentOS v{}", env!("CARGO_PKG_VERSION")),
         }
     }
 }
@@ -1183,7 +1183,7 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<bo
         }
         terminal.draw(|frame| view::render(frame, &mut app))?;
 
-        // Reflect Yardlet's state in the terminal title (OSC sequence), only when
+        // Reflect AgentOS's state in the terminal title (OSC sequence), only when
         // it changes.
         let title = title_for(&app);
         if app.last_title.as_deref() != Some(title.as_str()) {
@@ -1632,7 +1632,7 @@ fn handle_home_key(app: &mut App, code: KeyCode) -> bool {
             app.scroll = 0;
             app.screen = Screen::Handoff;
         }
-        // Trust + autonomy panel: same numbers as `yardlet trust --json`.
+        // Trust + autonomy panel: same numbers as `agentos trust --json`.
         HomeKey::Trust => {
             app.trust_text = build_trust_view(app);
             app.scroll = 0;
@@ -2366,7 +2366,7 @@ fn open_answer_target(app: &mut App, target: (String, String)) {
 }
 
 /// Run one specific task by id (Enter on a Queued/Partial/Failed/Blocked row).
-/// A named target is an explicit human override, same as `yardlet run --task`;
+/// A named target is an explicit human override, same as `agentos run --task`;
 /// run_next's approval gate still refuses an ungranted approval-required task,
 /// so this path cannot bypass approval.
 fn start_run_target(app: &mut App, target_id: String) {
@@ -2761,7 +2761,7 @@ fn handle_trust_key(app: &mut App, code: KeyCode) {
 }
 
 /// Render the trust + autonomy panel text — the same v1 table + v2 autonomy
-/// block `yardlet trust` prints, so the TUI and CLI never diverge.
+/// block `agentos trust` prints, so the TUI and CLI never diverge.
 fn build_trust_view(app: &App) -> String {
     crate::trust::report_text(&app.ws)
         .unwrap_or_else(|e| format!("{} {e}", app.lang.l().trust_report_failed))
@@ -3142,7 +3142,7 @@ fn stop_running_worker(app: &mut App) {
     app.toast = Some((true, app.lang.l().stopping.into()));
 }
 
-/// Flip the UI language between English and Korean and persist it to yard.yaml.
+/// Flip the UI language between English and Korean and persist it to agentos.yaml.
 fn toggle_language(app: &mut App) {
     if let Ok(mut cfg) = app.ws.load_config() {
         cfg.language = match app.lang {
@@ -4858,7 +4858,7 @@ mod tests {
     }
 
     const CONFIG_WITH_COMMENTS: &str = r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: ui-test
 created_at: "2026-07-03T00:00:00Z"
 state_dir: .agents

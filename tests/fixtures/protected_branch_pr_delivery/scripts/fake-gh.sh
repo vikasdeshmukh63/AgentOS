@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${YARDLET_FIXTURE_GH_LOG:?missing gh call log}"
-: "${YARDLET_FIXTURE_GH_STATE:?missing gh state path}"
-: "${YARDLET_FIXTURE_EXPECTED_OID:?missing expected OID}"
-: "${YARDLET_FIXTURE_EXPECTED_HOST:?missing expected GitHub host}"
+: "${AGENTOS_FIXTURE_GH_LOG:?missing gh call log}"
+: "${AGENTOS_FIXTURE_GH_STATE:?missing gh state path}"
+: "${AGENTOS_FIXTURE_EXPECTED_OID:?missing expected OID}"
+: "${AGENTOS_FIXTURE_EXPECTED_HOST:?missing expected GitHub host}"
 
 printf 'CALL\tpid=%s\tpgid=%s\t' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" \
-  >>"$YARDLET_FIXTURE_GH_LOG"
-printf '%q ' "$@" >>"$YARDLET_FIXTURE_GH_LOG"
-printf '\n' >>"$YARDLET_FIXTURE_GH_LOG"
+  >>"$AGENTOS_FIXTURE_GH_LOG"
+printf '%q ' "$@" >>"$AGENTOS_FIXTURE_GH_LOG"
+printf '\n' >>"$AGENTOS_FIXTURE_GH_LOG"
 
 explicit_host=""
 previous=""
@@ -17,17 +17,17 @@ for arg in "$@"; do
   [[ "$previous" != "--hostname" ]] || explicit_host="$arg"
   previous="$arg"
 done
-if [[ "$explicit_host" != "$YARDLET_FIXTURE_EXPECTED_HOST" ]]; then
+if [[ "$explicit_host" != "$AGENTOS_FIXTURE_EXPECTED_HOST" ]]; then
   printf 'HOST_MISMATCH\texpected=%s\tactual=%s\n' \
-    "$YARDLET_FIXTURE_EXPECTED_HOST" "$explicit_host" >>"$YARDLET_FIXTURE_GH_LOG"
+    "$AGENTOS_FIXTURE_EXPECTED_HOST" "$explicit_host" >>"$AGENTOS_FIXTURE_GH_LOG"
   exit 92
 fi
-printf 'HOST_OK\t%s\n' "$explicit_host" >>"$YARDLET_FIXTURE_GH_LOG"
+printf 'HOST_OK\t%s\n' "$explicit_host" >>"$AGENTOS_FIXTURE_GH_LOG"
 
-mode="${YARDLET_FIXTURE_GH_MODE:-normal}"
-protected="${YARDLET_FIXTURE_PROTECTED:-true}"
-crash_mode="${YARDLET_FIXTURE_CRASH_MODE:-normal}"
-event="${YARDLET_FIXTURE_EVENT:-}"
+mode="${AGENTOS_FIXTURE_GH_MODE:-normal}"
+protected="${AGENTOS_FIXTURE_PROTECTED:-true}"
+crash_mode="${AGENTOS_FIXTURE_CRASH_MODE:-normal}"
+event="${AGENTOS_FIXTURE_EVENT:-}"
 
 if [[ "${1:-}" == "auth" ]]; then
   [[ "$mode" != "unauthenticated" ]] || exit 1
@@ -71,15 +71,15 @@ if [[ "$endpoint" == "repos/fixture-owner/fixture-repo/branches/main" ]]; then
 fi
 
 if [[ "$endpoint" == "repos/fixture-owner/fixture-repo/pulls" && "$method" == "POST" ]]; then
-  printf 'PR_CREATE_BEGIN\n' >>"$YARDLET_FIXTURE_GH_LOG"
+  printf 'PR_CREATE_BEGIN\n' >>"$AGENTOS_FIXTURE_GH_LOG"
   if [[ "$crash_mode" == "before_pr_create" ]]; then
     printf '%s\n' "$$" >"${event:?missing event path}.pid"
     : >"$event"
     while :; do sleep 1; done
   fi
-  if [[ ! -e "$YARDLET_FIXTURE_GH_STATE" ]]; then
-    printf 'open\n' >"$YARDLET_FIXTURE_GH_STATE"
-    printf 'PR_CREATE_SUCCESS\n' >>"$YARDLET_FIXTURE_GH_LOG"
+  if [[ ! -e "$AGENTOS_FIXTURE_GH_STATE" ]]; then
+    printf 'open\n' >"$AGENTOS_FIXTURE_GH_STATE"
+    printf 'PR_CREATE_SUCCESS\n' >>"$AGENTOS_FIXTURE_GH_LOG"
   fi
   if [[ "$crash_mode" == "after_pr_create" ]]; then
     printf '%s\n' "$$" >"${event:?missing event path}.pid"
@@ -92,8 +92,8 @@ fi
 
 if [[ "$endpoint" == "repos/fixture-owner/fixture-repo/pulls" && "$method" == "GET" ]]; then
   printf 'PR_LOOKUP\thead=%s\tbase=%s\n' "$head_filter" "$base_filter" \
-    >>"$YARDLET_FIXTURE_GH_LOG"
-  if [[ ! -e "$YARDLET_FIXTURE_GH_STATE" ]]; then
+    >>"$AGENTOS_FIXTURE_GH_LOG"
+  if [[ ! -e "$AGENTOS_FIXTURE_GH_STATE" ]]; then
     printf '[]\n'
     exit 0
   fi
@@ -102,7 +102,7 @@ if [[ "$endpoint" == "repos/fixture-owner/fixture-repo/pulls" && "$method" == "G
   [[ "$mode" != "pr_head_mismatch" ]] || head="other-run-head"
   [[ "$mode" != "pr_base_mismatch" ]] || base="other-base"
   printf '[{"number":17,"state":"open","head":{"ref":"%s","sha":"%s"},"base":{"ref":"%s","sha":"unused"}}]\n' \
-    "$head" "$YARDLET_FIXTURE_EXPECTED_OID" "$base"
+    "$head" "$AGENTOS_FIXTURE_EXPECTED_OID" "$base"
   exit 0
 fi
 

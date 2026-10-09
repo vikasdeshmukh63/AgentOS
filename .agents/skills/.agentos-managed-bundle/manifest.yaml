@@ -1,5 +1,5 @@
 schema_version: 1
-library: yardlet-managed-builtins
+library: agentos-managed-builtins
 sources:
   obra-superpowers:
     repository: https://github.com/obra/superpowers
@@ -92,7 +92,7 @@ members:
     excluded: []
     adaptation:
       - project-level planning이 아닌 accepted task 내부 구현 계획으로 재범위화했다.
-      - 미채택 execution skill과 별도 dispatcher 참조를 제거하고 Yardlet review task로 번역했다.
+      - 미채택 execution skill과 별도 dispatcher 참조를 제거하고 AgentOS review task로 번역했다.
     residual_requirements: []
 
   - id: SPW-06
@@ -109,7 +109,7 @@ members:
       - { source_file: code-reviewer.md, bundle_file: code-reviewer.md, upstream_blob: db84ae2a0f91834f93de9cf9f9cf8602bbd78a11, mode: adapted }
     excluded: []
     adaptation:
-      - hidden dispatch 절차를 explicit Yardlet queue task(kind review)와 criterion verdict로 번역했다.
+      - hidden dispatch 절차를 explicit AgentOS queue task(kind review)와 criterion verdict로 번역했다.
     residual_requirements:
       - configured review worker cost through the existing queue
 
@@ -171,7 +171,7 @@ members:
       - external documentation, provider-specific runtime, extra dispatcher, rendering tool, package install, remote mutation 표면을 제거했다.
       - 검증을 기존 skill author, evaluator, apply, review 경로로 번역했다.
     residual_requirements:
-      - configured skill author, evaluator, and review worker cost through existing Yardlet paths
+      - configured skill author, evaluator, and review worker cost through existing AgentOS paths
 
   - id: ANT-02
     name: mcp-builder

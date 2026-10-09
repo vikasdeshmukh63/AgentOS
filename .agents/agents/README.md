@@ -1,6 +1,6 @@
 # Role profiles
 
-A Yard task runs under a **role** — a prompt mode over the hidden worker,
+An AgentOS task runs under a **role** — a prompt mode over the hidden worker,
 derived from the task's `kind`:
 
 | kind | role |

@@ -1,8 +1,8 @@
 //! Planning gate.
 //!
 //! Turns a short natural-language request into canonical state: a worker writes
-//! a structured `planning-result.json`, and Yardlet derives the
-//! `intent-contract.yaml` + `work-queue.yaml` from it. Yardlet owns the canonical
+//! a structured `planning-result.json`, and AgentOS derives the
+//! `intent-contract.yaml` + `work-queue.yaml` from it. AgentOS owns the canonical
 //! files; the worker only authors plan content.
 
 use std::path::{Path, PathBuf};
@@ -106,7 +106,7 @@ fn sanitize_deps(depends_on: &[String], prior_ids: &[String]) -> Vec<String> {
 /// A worker may emit `questions_for_user` either as plain strings or as objects
 /// (e.g. `{ "id": ..., "question": ..., "topic": ... }`) when it mirrors the
 /// object style of the `acceptance` hint. Accept both shapes and keep only the
-/// human-readable text — Yardlet surfaces just the question string.
+/// human-readable text — AgentOS surfaces just the question string.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum PlanQuestion {
@@ -158,7 +158,7 @@ struct PlanMeta {
     request_digest: String,
 }
 
-/// Marker file written into a plan run dir once Yardlet has derived the canonical
+/// Marker file written into a plan run dir once AgentOS has derived the canonical
 /// intent/queue from its result. Absent + result present = unconsumed.
 const CONSUMED_MARKER: &str = "consumed";
 
@@ -265,7 +265,7 @@ fn contains_signal_term(lower_request: &str, term: &str) -> bool {
 /// Fixture-only signal markers (`weak-context:` etc.) stay out of the
 /// production default path; process fixtures opt in explicitly.
 fn fixture_signal_markers_enabled() -> bool {
-    std::env::var("YARDLET_TEST_PLANNING_SIGNAL_MARKERS").as_deref() == Ok("1")
+    std::env::var("AGENTOS_TEST_PLANNING_SIGNAL_MARKERS").as_deref() == Ok("1")
 }
 
 fn request_capability_signals(
@@ -413,7 +413,7 @@ impl DisposablePlanningScoutWorkspace {
         let workspace_key = crate::planning::digest(&live_root.to_string_lossy().as_ref())?;
         let workspace_key = workspace_key.trim_start_matches("fnv1a64:");
         let root = std::env::temp_dir().join(format!(
-            "yardlet-planning-{run_id}-{workspace_key}-{}",
+            "agentos-planning-{run_id}-{workspace_key}-{}",
             std::process::id()
         ));
         if root.exists() {
@@ -579,7 +579,7 @@ fn invoke_planning_scout(
     let (scout_run_id, live_run_dir) = ws.claim_run_dir(&base_run_id)?;
     let disposable = DisposablePlanningScoutWorkspace::create(&ws.root, &scout_run_id)?;
     let live_aliases = live_workspace_path_aliases(profile, bin, &ws.root);
-    let disposable_run_dir = disposable.root.join(".yardlet-scout-output");
+    let disposable_run_dir = disposable.root.join(".agentos-scout-output");
     std::fs::create_dir_all(&disposable_run_dir).with_context(|| {
         format!(
             "creating planning scout output {}",
@@ -593,7 +593,7 @@ fn invoke_planning_scout(
         policy,
         workspace_skills,
         user_library_skills,
-        run_dir_rel: ".yardlet-scout-output",
+        run_dir_rel: ".agentos-scout-output",
     })?;
     if contains_live_workspace_path(&scout_packet, &live_aliases) {
         bail!("planning scout packet contains the live workspace path");
@@ -927,7 +927,7 @@ pub fn plan_goal_with_report(
 ) -> Result<GoalPlanningReport> {
     let goal = goal.trim();
     if goal.is_empty() {
-        bail!("describe the goal, e.g. `yardlet goal \"fix the login redirect\"`");
+        bail!("describe the goal, e.g. `agentos goal \"fix the login redirect\"`");
     }
     let intent_id = format!(
         "intent-{}-{}",
@@ -960,7 +960,7 @@ pub fn plan_goal_with_report(
         validation: None,
         approval: None,
         interaction: None,
-        worker_rationale: Some("express goal (yardlet goal)".to_string()),
+        worker_rationale: Some("express goal (agentos goal)".to_string()),
         provenance: String::new(),
         routing_provenance: None,
     }];
@@ -1328,7 +1328,7 @@ fn plan_core(
     ws: &Workspace,
     workers: &WorkersFile,
     billing: &crate::schemas::BillingPolicy,
-    config: &crate::schemas::YardConfig,
+    config: &crate::schemas::AgentConfig,
     packet_request: &str,
     store_request: &str,
     images: &[String],
@@ -1485,7 +1485,7 @@ fn plan_core(
         );
     }
 
-    // Derive canonical state. Yardlet owns these files.
+    // Derive canonical state. AgentOS owns these files.
     let intent_id = planning_session
         .map(|session| session.intent_id.clone())
         .unwrap_or_else(|| format!("intent-{}", Local::now().format("%Y%m%d-%H%M%S")));
@@ -1868,17 +1868,17 @@ fn reconcile_queue_capabilities_inner(
 }
 
 /// Ingest worker-PROPOSED follow-up tasks into a queue (propose -> ingest).
-/// The worker proposes follow-ups in its `result.json`; Yardlet assigns ids,
+/// The worker proposes follow-ups in its `result.json`; AgentOS assigns ids,
 /// sanitizes deps to backward-only, dedups by title, and tags each
 /// `provenance: worker-proposed` so an enqueued follow-up is a visible, tracked
 /// CANDIDATE rather than a silent expansion of the current task (CLAUDE.md: an
 /// adjacent idea becomes a queue candidate, never a silent scope broadening).
-/// Yardlet stays the sole writer of the queue — the worker never edits
+/// AgentOS stays the sole writer of the queue — the worker never edits
 /// `.agents/work-queue.yaml` itself.
 ///
 /// Placement: `insert: "next"` slots the task's priority below every currently
 /// queued task so the selector prefers it (soft ordering); the default appends
-/// after the current max. `runs_before: [ids]` is the HARD form — Yardlet
+/// after the current max. `runs_before: [ids]` is the HARD form — AgentOS
 /// injects a dependency so each named existing task waits for this one (true
 /// "insert between"), dropping self/unknown/cycle-forming targets.
 ///
@@ -1980,7 +1980,7 @@ fn ingest_follow_ups_inner(
         // A follow-up that is a HUMAN DECISION (a choice/approval only the user
         // can make) is ingested as NeedsUser with its question seeded into the
         // conversation, and any `required_capabilities` is dropped: the decision
-        // is resolved by `yardlet answer`, not routed to a worker that "declares"
+        // is resolved by `agentos answer`, not routed to a worker that "declares"
         // some invented approval capability (which only parks it Blocked with no
         // clean resolver). Reserve capabilities for a worker's tool/license need.
         let decision = fu.decision_question.trim();
@@ -2324,7 +2324,7 @@ fn depends_transitively(queue: &WorkQueue, from: &str, target: &str) -> bool {
 }
 
 /// Recover a planning result left unconsumed by an interrupted session: the
-/// worker finished and wrote `planning-result.json`, but Yardlet exited before
+/// worker finished and wrote `planning-result.json`, but AgentOS exited before
 /// deriving the canonical intent/queue from it. Safe to call on every startup.
 ///
 /// Guards against stale or double application: only the newest unconsumed plan
@@ -2600,7 +2600,7 @@ fn build_queue(intent_id: &str, plan: &PlanningResult) -> WorkQueue {
 /// guarantee: a risky plan (any high-risk task) or a sizable one (3+ tasks)
 /// must end in a review-kind task that verifies the intent's acceptance
 /// criteria against the actual workspace. The planner is asked to include
-/// one; if it forgot, Yardlet appends it — planner forgetfulness cannot skip
+/// one; if it forgot, AgentOS appends it — planner forgetfulness cannot skip
 /// verification, and the verifier is never the doer (a separate reviewer-
 /// role run, not a smarter evaluator).
 fn ensure_review_task(tasks: &mut Vec<Task>) {
@@ -2702,9 +2702,9 @@ fn build_worker_guidance(workers: &WorkersFile) -> String {
              no special tool is needed. Do NOT conflate two different off-list cases: (1) a pure \
              HUMAN DECISION / choice / approval that a worker can carry out once answered (pick A \
              vs B, sign off on a direction) is NOT a capability — never invent one for it; raise \
-             it in `questions_for_user` so Yardlet asks the user, not as a dead-end. (2) work that \
+             it in `questions_for_user` so AgentOS asks the user, not as a dead-end. (2) work that \
              needs a TOOL / ASSET / LICENSE / external resource NO listed worker has — THEN name \
-             that needed capability even though it is not in [{list}], so Yardlet parks it for a \
+             that needed capability even though it is not in [{list}], so AgentOS parks it for a \
              human to add a worker or provide the resource. So: a capability IN [{list}] routes to \
              a worker; an off-list capability flags a genuine tool/resource gap; a human decision \
              is a question, never a capability.\n"
@@ -2755,8 +2755,8 @@ pub(crate) fn pick_ready_worker(
     }
 
     Err(anyhow!(
-        "no invocable planning worker among {tried:?} ({failures:?}). Run `yardlet worker status` to diagnose. \
-         Yardlet did not call an AI API and did not ask for an API key."
+        "no invocable planning worker among {tried:?} ({failures:?}). Run `agentos worker status` to diagnose. \
+         AgentOS did not call an AI API and did not ask for an API key."
     ))
 }
 
@@ -3509,7 +3509,7 @@ routing:
             .collect::<Vec<_>>();
         assert_eq!(scout_dirs.len(), 1);
         let packet = std::fs::read_to_string(workers::packet_path(&scout_dirs[0])).unwrap();
-        assert!(packet.contains(".yardlet-scout-output/scout-result.json"));
+        assert!(packet.contains(".agentos-scout-output/scout-result.json"));
         assert!(
             !packet.contains(&root.to_string_lossy().to_string()),
             "scout packet leaked the live workspace"
@@ -4115,7 +4115,7 @@ routing:
         std::fs::create_dir_all(&run_dir).unwrap();
         write_str(
             &workers::packet_path(&run_dir),
-            "# Yardlet planning gate\n\n## Request (verbatim)\n\n\
+            "# AgentOS planning gate\n\n## Request (verbatim)\n\n\
              make the game feel like a game\n\n## Rules\n\n- ...\n",
         )
         .unwrap();
@@ -4604,7 +4604,7 @@ routing:
             vec!["YARD-002".to_string(), "YARD-003".to_string()]
         );
         // A human decision parks as NeedsUser with NO capability (resolved by
-        // `yardlet answer`), not Blocked behind an invented capability.
+        // `agentos answer`), not Blocked behind an invented capability.
         let decision = queue.tasks.iter().find(|t| t.id == "YARD-002").unwrap();
         assert_eq!(decision.state, TaskState::NeedsUser);
         assert!(

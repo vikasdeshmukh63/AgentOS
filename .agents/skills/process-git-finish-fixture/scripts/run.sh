@@ -2,14 +2,14 @@
 set -eu
 
 if [ "$#" -ne 2 ]; then
-  printf 'usage: %s <yardlet-bin> <evidence-dir>\n' "$0" >&2
+  printf 'usage: %s <agentos-bin> <evidence-dir>\n' "$0" >&2
   exit 2
 fi
 
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 evidence=$2
 scripts=$(cd "$(dirname "$0")" && pwd)
-root=$(mktemp -d /tmp/yardlet-process-git-finish.XXXXXX)
+root=$(mktemp -d /tmp/agentos-process-git-finish.XXXXXX)
 mkdir -p "$evidence"
 printf '%s\n' "$root" > "$evidence/fixture-root.txt"
 
@@ -21,8 +21,8 @@ make_workspace() {
   ws="$root/$name-work"
   mkdir -p "$seed"
   /usr/bin/git -C "$seed" init -q -b main
-  /usr/bin/git -C "$seed" config user.name 'Yardlet Fixture'
-  /usr/bin/git -C "$seed" config user.email 'yardlet-fixture@example.test'
+  /usr/bin/git -C "$seed" config user.name 'AgentOS Fixture'
+  /usr/bin/git -C "$seed" config user.email 'agentos-fixture@example.test'
   printf 'seed\n' > "$seed/seed.txt"
   printf 'outside\n' > "$seed/outside.txt"
   /usr/bin/git -C "$seed" add seed.txt outside.txt
@@ -30,14 +30,14 @@ make_workspace() {
   /usr/bin/git clone -q --bare "$seed" "$remote"
   /usr/bin/git clone -q "$remote" "$ws"
   /usr/bin/git -C "$ws" remote rename origin fixture
-  /usr/bin/git -C "$ws" config user.name 'Yardlet Fixture'
-  /usr/bin/git -C "$ws" config user.email 'yardlet-fixture@example.test'
+  /usr/bin/git -C "$ws" config user.name 'AgentOS Fixture'
+  /usr/bin/git -C "$ws" config user.email 'agentos-fixture@example.test'
   (cd "$ws" && "$bin" init >/dev/null)
   cp "$scripts/workers.yaml" "$ws/.agents/workers.yaml"
   perl -0pi -e "s#__WORKER__#$scripts/worker.sh#g" "$ws/.agents/workers.yaml"
-  perl -0pi -e "s/auto_push: false/auto_push: true/; s/remote: ''/remote: fixture/; s#target_ref: ''#target_ref: refs/heads/main#" "$ws/.agents/yardlet.yaml"
+  perl -0pi -e "s/auto_push: false/auto_push: true/; s/remote: ''/remote: fixture/; s#target_ref: ''#target_ref: refs/heads/main#" "$ws/.agents/agentos.yaml"
   if [ -n "$check" ]; then
-    perl -0pi -e "s#pre_push_checks: \[\]#pre_push_checks:\n  - name: fixture\n    command: '$check'#" "$ws/.agents/yardlet.yaml"
+    perl -0pi -e "s#pre_push_checks: \[\]#pre_push_checks:\n  - name: fixture\n    command: '$check'#" "$ws/.agents/agentos.yaml"
   fi
   (cd "$ws" && "$bin" goal '격리 Git finish 실제 프로세스 검증' --worker fixture --plan-only >/dev/null)
   (cd "$ws" && "$bin" add '격리 병렬 보조 작업' --worker fixture >/dev/null)

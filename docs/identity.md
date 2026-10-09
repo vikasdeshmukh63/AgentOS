@@ -13,7 +13,7 @@ already-installed coding agents as interchangeable workers.
 The orchestrator does only deterministic, auditable operations — compiling
 packets from state, routing by rules, evaluating by checks, merging by git,
 running hooks. Anything that *generates or judges* work goes through the
-worker contract: packet in → process → result files out. A AgentOS-shipped
+worker contract: packet in → process → result files out. An AgentOS-shipped
 worker (a native API adapter, someday) is identity-compatible exactly when
 it sits behind that same contract, routable like any other worker.
 

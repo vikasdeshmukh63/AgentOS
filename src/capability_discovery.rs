@@ -576,7 +576,7 @@ mod tests {
         let workspace = crate::state::Workspace::at(&root);
         let library = crate::skills::Library::open("").unwrap();
         let workers: crate::schemas::WorkersFile = crate::yaml::from_str(
-            "schema_version: 1\nworkers:\n  - id: ready\n    capabilities: [shell]\n    invocation: { command: bash }\n  - id: unavailable\n    capabilities: [browser-control]\n    invocation: { command: yardlet-definitely-missing-command }\n",
+            "schema_version: 1\nworkers:\n  - id: ready\n    capabilities: [shell]\n    invocation: { command: bash }\n  - id: unavailable\n    capabilities: [browser-control]\n    invocation: { command: agentos-definitely-missing-command }\n",
         )
         .unwrap();
         let task = task(

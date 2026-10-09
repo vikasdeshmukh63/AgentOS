@@ -1,4 +1,4 @@
-//! Screen rendering for the Yardlet TUI. All user-visible strings come from the
+//! Screen rendering for the AgentOS TUI. All user-visible strings come from the
 //! active language's label table (`super::i18n`).
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -532,7 +532,7 @@ fn render_home(frame: &mut Frame, app: &App) {
         }
         None => {
             let p =
-                Paragraph::new(l.no_workspace_state).block(Block::bordered().title(" Yardlet "));
+                Paragraph::new(l.no_workspace_state).block(Block::bordered().title(" AgentOS "));
             frame.render_widget(p, chunks[0]);
         }
     }
@@ -663,7 +663,7 @@ fn render_bootstrap(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(" Yardlet ")),
+            .block(Block::bordered().title(" AgentOS ")),
         chunks[0],
     );
     let footer = match &app.bootstrap {
@@ -862,7 +862,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, l: &L) {
         status,
     ];
     let block = Block::bordered().title(format!(
-        " Yardlet v{} \u{00b7} {} ",
+        " AgentOS v{} \u{00b7} {} ",
         env!("CARGO_PKG_VERSION"),
         l.subtitle
     ));
@@ -1065,7 +1065,7 @@ fn render_workers(frame: &mut Frame, area: Rect, snap: &Snapshot, l: &L, selecte
                 id_style
             };
             // Read-only billing/auth posture: clean / N scrubbed / blocked.
-            // Mirrors `yardlet worker status`: auth itself is never claimed
+            // Mirrors `agentos worker status`: auth itself is never claimed
             // verified (it cannot be checked offline); this only reflects how
             // the billing env will be handled at spawn under the current policy.
             let (posture, posture_color) = if !w.enabled {
@@ -1721,7 +1721,7 @@ mod tests {
         let mut app = App::new_bootstrapping(crate::state::Workspace::at(&root), false);
 
         let loading = rendered_home(&app);
-        assert!(loading.contains("Starting Yardlet safely"));
+        assert!(loading.contains("Starting AgentOS safely"));
         assert!(loading.contains("Validating activation and recovering interrupted work"));
         assert!(loading.contains("startup in progress  q quit"));
         assert!(!loading.contains("r run"));

@@ -11,7 +11,7 @@ mod unix {
             .expect("system clock before Unix epoch")
             .as_nanos();
         let evidence = std::env::temp_dir().join(format!(
-            "yardlet-fixture-binary-freshness-{scenario}-{}-{nonce}",
+            "agentos-fixture-binary-freshness-{scenario}-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&evidence)

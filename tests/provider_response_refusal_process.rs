@@ -21,7 +21,7 @@ mod unix {
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "yardlet-provider-refusal-{label}-{}-{nonce}",
+                "agentos-provider-refusal-{label}-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();

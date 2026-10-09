@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 <yardlet-bin> <evidence-dir>" >&2
+  echo "usage: $0 <agentos-bin> <evidence-dir>" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REAL_GIT="$(command -v git)"
@@ -51,9 +51,9 @@ head_oid() {
 write_config() {
   local ws="$1"
   local remote="$2"
-  cat >"$ws/.agents/yardlet.yaml" <<EOF
+  cat >"$ws/.agents/agentos.yaml" <<EOF
 schema_version: 1
-product: yardlet-fixture
+product: agentos-fixture
 workspace_id: fixture
 created_at: 2099-01-01T00:00:00Z
 state_dir: .agents
@@ -79,7 +79,7 @@ git_finish:
   target_ref: refs/heads/main
   pre_push_checks:
     - name: fixture-gate
-      command: 'test "\${YARDLET_FIXTURE_CHECK:-fail}" = pass'
+      command: 'test "\${AGENTOS_FIXTURE_CHECK:-fail}" = pass'
 EOF
 }
 
@@ -228,7 +228,7 @@ new_workspace() {
   local ws="$scenario/clone"
   mkdir -p "$seed"
   "$REAL_GIT" -C "$seed" init -q -b main
-  "$REAL_GIT" -C "$seed" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$seed" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$seed" config user.email "fixture@example.test"
   printf 'baseline\n' >"$seed/owned.txt"
   "$REAL_GIT" -C "$seed" add owned.txt
@@ -237,15 +237,15 @@ new_workspace() {
   "$REAL_GIT" -C "$seed" remote add local-fixture "$remote"
   "$REAL_GIT" -C "$seed" push -q local-fixture HEAD:refs/heads/main
   "$REAL_GIT" clone -q -b main "$remote" "$ws"
-  "$REAL_GIT" -C "$ws" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$ws" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$ws" config user.email "fixture@example.test"
   (
     cd "$ws"
     PATH="$WRAPPER_DIR:$PATH" \
-      YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-      YARDLET_FIXTURE_GIT_LOG="$scenario/init-wrapper.log" \
-      YARDLET_FIXTURE_WORKER_LOG="$scenario/worker.log" \
-      "$YARDLET_BIN" init >/dev/null
+      AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+      AGENTOS_FIXTURE_GIT_LOG="$scenario/init-wrapper.log" \
+      AGENTOS_FIXTURE_WORKER_LOG="$scenario/worker.log" \
+      "$AGENTOS_BIN" init >/dev/null
   )
   write_config "$ws" origin
   write_queue "$ws" partial partial
@@ -270,7 +270,7 @@ commit_owned() {
   printf '%s\n' "$merge_oid"
 }
 
-run_yardlet() {
+run_agentos() {
   local scenario="$1"
   local ws="$2"
   local check="$3"
@@ -279,13 +279,13 @@ run_yardlet() {
   (
     cd "$ws"
     PATH="$WRAPPER_DIR:$PATH" \
-      YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-      YARDLET_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
-      YARDLET_FIXTURE_WORKER_LOG="$scenario/worker.log" \
-      YARDLET_FIXTURE_CHECK="$check" \
-      YARDLET_FIXTURE_CRASH_MODE="$mode" \
-      YARDLET_FIXTURE_EVENT="$event" \
-      "$YARDLET_BIN" recover
+      AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+      AGENTOS_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
+      AGENTOS_FIXTURE_WORKER_LOG="$scenario/worker.log" \
+      AGENTOS_FIXTURE_CHECK="$check" \
+      AGENTOS_FIXTURE_CRASH_MODE="$mode" \
+      AGENTOS_FIXTURE_EVENT="$event" \
+      "$AGENTOS_BIN" recover
   )
 }
 
@@ -296,27 +296,27 @@ launch_grouped_recover() {
   local mode="$4"
   local event="$5"
   local stdout="$6"
-  "$PYTHON" - "$YARDLET_BIN" "$ws" "$WRAPPER_DIR" "$REAL_GIT" \
+  "$PYTHON" - "$AGENTOS_BIN" "$ws" "$WRAPPER_DIR" "$REAL_GIT" \
     "$scenario/wrapper.log" "$scenario/worker.log" "$check" "$mode" "$event" "$stdout" <<'PY' &
 import os
 import sys
 
-yardlet, workspace, wrapper, real_git, git_log, worker_log, check, mode, event, stdout = sys.argv[1:]
+agentos, workspace, wrapper, real_git, git_log, worker_log, check, mode, event, stdout = sys.argv[1:]
 os.setsid()
 os.chdir(workspace)
 env = os.environ.copy()
 env["PATH"] = wrapper + os.pathsep + env.get("PATH", "")
-env["YARDLET_FIXTURE_REAL_GIT"] = real_git
-env["YARDLET_FIXTURE_GIT_LOG"] = git_log
-env["YARDLET_FIXTURE_WORKER_LOG"] = worker_log
-env["YARDLET_FIXTURE_CHECK"] = check
-env["YARDLET_FIXTURE_CRASH_MODE"] = mode
-env["YARDLET_FIXTURE_EVENT"] = event
+env["AGENTOS_FIXTURE_REAL_GIT"] = real_git
+env["AGENTOS_FIXTURE_GIT_LOG"] = git_log
+env["AGENTOS_FIXTURE_WORKER_LOG"] = worker_log
+env["AGENTOS_FIXTURE_CHECK"] = check
+env["AGENTOS_FIXTURE_CRASH_MODE"] = mode
+env["AGENTOS_FIXTURE_EVENT"] = event
 fd = os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.dup2(fd, 1)
 os.dup2(fd, 2)
 os.close(fd)
-os.execve(yardlet, [yardlet, "recover"], env)
+os.execve(agentos, [agentos, "recover"], env)
 PY
   GROUP_PID=$!
 }
@@ -420,7 +420,7 @@ for record in latest.values():
 PY
   (
     cd "$ws"
-    "$YARDLET_BIN" report >"$scenario/final-report.md"
+    "$AGENTOS_BIN" report >"$scenario/final-report.md"
   )
   grep -q '2/2 tasks done' "$scenario/final-report.md" || fail "final report progress did not converge"
   [[ "$(grep -c 'pushed and verified\|already applied and verified' "$scenario/final-report.md")" -eq 2 ]] || fail "final report missing two verified finishes"
@@ -430,11 +430,11 @@ run_concurrent_recovery() {
   local scenario="$1"
   local snapshot="$2"
   (
-    run_yardlet "$scenario" "$snapshot" pass normal >"$scenario/recover-a.log" 2>&1
+    run_agentos "$scenario" "$snapshot" pass normal >"$scenario/recover-a.log" 2>&1
   ) &
   local a=$!
   (
-    run_yardlet "$scenario" "$snapshot" pass normal >"$scenario/recover-b.log" 2>&1
+    run_agentos "$scenario" "$snapshot" pass normal >"$scenario/recover-b.log" 2>&1
   ) &
   local b=$!
   wait "$a"
@@ -452,7 +452,7 @@ run_crash_scenario() {
   first_oid="$(commit_owned "$ws" first)"
   write_run "$ws" 1 YARD-001 "$baseline" "$first_oid"
 
-  run_yardlet "$scenario" "$ws" fail normal >"$scenario/pre-push-failure.log" 2>&1
+  run_agentos "$scenario" "$ws" fail normal >"$scenario/pre-push-failure.log" 2>&1
   first_record="$ws/.agents/runs/run-20990101-000001-YARD-001/git-finish.json"
   assert_eq "$(json_field "$first_record" status)" check_blocked "leading pre-push check"
   assert_eq "$(remote_oid "$remote")" "$baseline" "remote after leading check failure"
@@ -485,8 +485,8 @@ run_crash_scenario() {
   assert_eq "$(remote_oid "$remote")" "$second_oid" "independent final remote OID"
 
   push_before="$(grep -c '^PUSH_SUCCESS' "$scenario/wrapper.log" || true)"
-  run_yardlet "$scenario" "$snapshot" pass normal >"$scenario/repeated-recover-1.log" 2>&1
-  run_yardlet "$scenario" "$snapshot" pass normal >"$scenario/repeated-recover-2.log" 2>&1
+  run_agentos "$scenario" "$snapshot" pass normal >"$scenario/repeated-recover-1.log" 2>&1
+  run_agentos "$scenario" "$snapshot" pass normal >"$scenario/repeated-recover-2.log" 2>&1
   push_after="$(grep -c '^PUSH_SUCCESS' "$scenario/wrapper.log" || true)"
   assert_eq "$push_after" "$push_before" "repeated recovery adds no push"
   assert_eq "$(grep -c "PUSH_SUCCESS.*${first_oid}:refs/heads/main" "$scenario/wrapper.log" || true)" 1 "first exact OID successful push count"
@@ -526,7 +526,7 @@ run_block_case() {
       printf 'dirty\n' >"$ws/dirty.txt"
       ;;
     retarget)
-      run_yardlet "$scenario" "$ws" fail normal >"$scenario/seed-record.log" 2>&1
+      run_agentos "$scenario" "$ws" fail normal >"$scenario/seed-record.log" 2>&1
       record="$ws/.agents/runs/run-20990101-000001-YARD-001/git-finish.json"
       assert_eq "$(json_field "$record" status)" check_blocked "retarget seed record"
       other="$scenario/other.git"
@@ -537,7 +537,7 @@ run_block_case() {
     *) fail "unknown block case $kind" ;;
   esac
 
-  run_yardlet "$scenario" "$ws" pass normal >"$scenario/recover.log" 2>&1
+  run_agentos "$scenario" "$ws" pass normal >"$scenario/recover.log" 2>&1
   record="$ws/.agents/runs/run-20990101-000001-YARD-001/git-finish.json"
   assert_eq "$(head_oid "$ws")" "$oid" "$kind clone HEAD advanced"
   assert_eq "$(remote_oid "$remote")" "$baseline" "$kind remote unchanged"

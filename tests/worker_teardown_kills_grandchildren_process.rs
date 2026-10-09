@@ -42,7 +42,7 @@ fn must_succeed(cwd: &Path, program: &Path, args: &[&str]) {
 /// in — records its pid, and then waits. Killing the launcher alone leaves the
 /// grandchild behind.
 ///
-/// `yardlet redirect` runs the replacement attempt synchronously, so the second
+/// `agentos redirect` runs the replacement attempt synchronously, so the second
 /// invocation returns a finished result immediately instead of making the test
 /// wait out another 120s sleep.
 fn write_launcher(path: &Path) {
@@ -106,7 +106,7 @@ fn stopping_a_worker_takes_down_the_cli_it_launched() {
         .unwrap()
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "yardlet-worker-teardown-{}-{nonce}",
+        "agentos-worker-teardown-{}-{nonce}",
         std::process::id()
     ));
     let _cleanup = TempRoot(root.clone());
@@ -147,22 +147,22 @@ fn stopping_a_worker_takes_down_the_cli_it_launched() {
     )
     .unwrap();
 
-    let yardlet = Command::new(&binary)
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            std::fs::File::create(root.join("yardlet.err")).unwrap(),
+            std::fs::File::create(root.join("agentos.err")).unwrap(),
         ))
         .spawn()
         .unwrap();
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let mut agentos = common::ChildGuard::new(agentos);
 
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
-        "the fixture launcher never started; yardlet said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "the fixture launcher never started; agentos said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
     let recorded = fs::read_to_string(&ids).unwrap();
     let mut parts = recorded.split_whitespace();
@@ -190,7 +190,7 @@ fn stopping_a_worker_takes_down_the_cli_it_launched() {
     );
 
     // Drive a REAL production stop rather than sending the signal ourselves.
-    // `yardlet redirect` verifies the worker's process identity and then calls
+    // `agentos redirect` verifies the worker's process identity and then calls
     // the shared `terminate_worker_tree`; the TUI's stop key reaches the same
     // helper through its own verification.
     let redirect = Command::new(&binary)
@@ -200,7 +200,7 @@ fn stopping_a_worker_takes_down_the_cli_it_launched() {
         .unwrap();
     assert!(
         redirect.status.success(),
-        "yardlet redirect failed: {}{}",
+        "agentos redirect failed: {}{}",
         String::from_utf8_lossy(&redirect.stdout),
         String::from_utf8_lossy(&redirect.stderr)
     );
@@ -214,7 +214,7 @@ fn stopping_a_worker_takes_down_the_cli_it_launched() {
         "the worker itself outlived the stop"
     );
 
-    yardlet.shutdown(Duration::from_secs(10), || {});
+    agentos.shutdown(Duration::from_secs(10), || {});
 }
 
 /// The wall-clock timeout is the most destructive of the three paths: before
@@ -229,7 +229,7 @@ fn a_wall_clock_timeout_does_not_hang_on_a_grandchild_holding_the_pipes() {
         .unwrap()
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "yardlet-worker-timeout-{}-{nonce}",
+        "agentos-worker-timeout-{}-{nonce}",
         std::process::id()
     ));
     let _cleanup = TempRoot(root.clone());
@@ -276,8 +276,8 @@ fn a_wall_clock_timeout_does_not_hang_on_a_grandchild_holding_the_pipes() {
     let run = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
-        .env("YARDLET_PROCESS_FIXTURE", "1")
-        .env("YARDLET_FIXTURE_WALL_MS", "3000")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_FIXTURE_WALL_MS", "3000")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

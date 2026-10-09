@@ -131,7 +131,7 @@ struct EventFields<'a> {
 fn maybe_crash(point: &str) {
     #[cfg(debug_assertions)]
     {
-        if std::env::var("YARDLET_TEST_PLANNING_CRASH").as_deref() == Ok(point) {
+        if std::env::var("AGENTOS_TEST_PLANNING_CRASH").as_deref() == Ok(point) {
             std::process::exit(86);
         }
     }
@@ -389,7 +389,7 @@ pub fn begin_new_planning_session_exact(
 /// intent after its queue settled with failure holds — Failed/Partial, or a
 /// NeedsUser hold typed `GoalFeedbackExhausted` (the goal-feedback loop ran
 /// out of automatic retries; the approach failed, so replanning is the honest
-/// exit). Worker-authored questions stay `yardlet answer`-only. The
+/// exit). Worker-authored questions stay `agentos answer`-only. The
 /// fresh session reuses the confirmed intent and queue ids, so plan-time
 /// capability discovery reads this intent's real run history (typed failures)
 /// instead of starting blind under a fresh intent id. Everything after this —
@@ -404,7 +404,7 @@ pub fn begin_replan_session_exact(
     let _lock = ws.acquire_planning_lock()?;
     if validate_active_activation(ws)? != ActivationGate::Confirmed {
         bail!(
-            "same-intent replan requires a confirmed active intent; plan fresh work with `yardlet new`"
+            "same-intent replan requires a confirmed active intent; plan fresh work with `agentos new`"
         );
     }
     let intent = ws
@@ -435,7 +435,7 @@ pub fn begin_replan_session_exact(
         .collect();
     if !waiting.is_empty() {
         bail!(
-            "active queue is settled but a worker question is waiting on you ({}); reply with `yardlet answer \"...\" --task <id>` instead of replanning",
+            "active queue is settled but a worker question is waiting on you ({}); reply with `agentos answer \"...\" --task <id>` instead of replanning",
             waiting.join(", ")
         );
     }
@@ -450,13 +450,13 @@ pub fn begin_replan_session_exact(
                     == Some(crate::schemas::NeedsUserOrigin::GoalFeedbackExhausted))
     }) {
         bail!(
-            "active queue settled without failed or partial tasks; nothing to replan — start follow-up work with `yardlet new`"
+            "active queue settled without failed or partial tasks; nothing to replan — start follow-up work with `agentos new`"
         );
     }
     if let Some(latest) = ws.load_latest_planning_session()? {
         if latest.lifecycle == PlanningLifecycle::Open {
             bail!(
-                "an open planning session ({}) already exists; continue it with `yardlet planning answer` or resolve it before replanning",
+                "an open planning session ({}) already exists; continue it with `agentos planning answer` or resolve it before replanning",
                 latest.session_id
             );
         }
@@ -485,7 +485,7 @@ pub fn begin_user_turn(ws: &Workspace, message: &str) -> Result<PlanningSession>
 pub fn latest_open_session(ws: &Workspace) -> Result<PlanningSession> {
     let session = ws
         .load_latest_planning_session()?
-        .ok_or_else(|| anyhow!("no planning session; run `yardlet new \"...\"` first"))?;
+        .ok_or_else(|| anyhow!("no planning session; run `agentos new \"...\"` first"))?;
     if session.lifecycle != PlanningLifecycle::Open {
         bail!(
             "planning session {} is {:?}; confirmed sessions reject free-form mutation",
@@ -2011,7 +2011,7 @@ fn confirm_with_policy_locked(
 ) -> Result<ActivationReceipt> {
     let mut session = ws
         .load_latest_planning_session()?
-        .ok_or_else(|| anyhow!("no planning session; run `yardlet new \"...\"` first"))?;
+        .ok_or_else(|| anyhow!("no planning session; run `agentos new \"...\"` first"))?;
     let requested_digest = action_request_digest(
         PlanningActionKind::Confirm,
         action_id,
@@ -2275,7 +2275,7 @@ fn pending_proposals_for_session(
 
 fn validate_singleton_start_content(content: &PlanningDraftContent) -> Result<()> {
     if content.intent.ambiguity.eq_ignore_ascii_case("high") {
-        bail!("high_ambiguity: review and answer the plan in `yardlet planning show` or the TUI");
+        bail!("high_ambiguity: review and answer the plan in `agentos planning show` or the TUI");
     }
     if !content.intent.open_questions.is_empty() {
         bail!(
@@ -2354,7 +2354,7 @@ pub fn start_singleton(ws: &Workspace) -> Result<PlanningStartOutcome> {
     loop {
         let session = ws
             .load_latest_planning_session()?
-            .ok_or_else(|| anyhow!("no_planning_session: run `yardlet new \"...\"` first"))?;
+            .ok_or_else(|| anyhow!("no_planning_session: run `agentos new \"...\"` first"))?;
         let actions = ws.load_planning_actions(&session.session_id)?;
         for receipt in actions
             .iter()
@@ -2432,7 +2432,7 @@ pub fn start_singleton(ws: &Workspace) -> Result<PlanningStartOutcome> {
                     .any(|task| task.state == TaskState::Running)
                 {
                     bail!(
-                        "active_queue_running: inspect the current run before retrying `yardlet planning start`"
+                        "active_queue_running: inspect the current run before retrying `agentos planning start`"
                     );
                 }
                 let confirmation_id = session.confirmation_id.as_deref().ok_or_else(|| {
@@ -2468,7 +2468,7 @@ pub fn start_singleton(ws: &Workspace) -> Result<PlanningStartOutcome> {
             [proposal] => {
                 if proposal.expected_head != session.current_head {
                     bail!(
-                        "stale_singleton_proposal: open `yardlet planning show` and use the detailed accept/reject flow"
+                        "stale_singleton_proposal: open `agentos planning show` and use the detailed accept/reject flow"
                     );
                 }
                 validate_draft(&session, &proposal.content)?;
@@ -2490,7 +2490,7 @@ pub fn start_singleton(ws: &Workspace) -> Result<PlanningStartOutcome> {
             [] => {
                 let head = session.current_head.as_deref().ok_or_else(|| {
                     anyhow!(
-                        "no_startable_plan: no pending proposal or accepted draft; run `yardlet planning show`"
+                        "no_startable_plan: no pending proposal or accepted draft; run `agentos planning show`"
                     )
                 })?;
                 let revision = ws.load_draft_revision(&session.session_id, head)?;
@@ -2509,7 +2509,7 @@ pub fn start_singleton(ws: &Workspace) -> Result<PlanningStartOutcome> {
                 });
             }
             many => bail!(
-                "multiple_pending_proposals: {} proposals require an explicit target in `yardlet planning show`",
+                "multiple_pending_proposals: {} proposals require an explicit target in `agentos planning show`",
                 many.len()
             ),
         }
@@ -2541,7 +2541,7 @@ pub fn activate_express_draft(
         ws,
         &lock,
         &turn,
-        "yardlet-core",
+        "agentos-core",
         "express-goal",
         "Express goal draft generated deterministically without a planning worker.",
         "The goal command is the user's explicit confirmation operation.",
@@ -2607,7 +2607,7 @@ where
         ws,
         &lock,
         &turn,
-        "yardlet-core",
+        "agentos-core",
         &audit.attempt_id,
         "Express goal draft generated deterministically with capability coverage.",
         "Covered capability audit retained the express activation path.",
@@ -2646,7 +2646,7 @@ pub fn materialize_core_draft(
         ws,
         &lock,
         turn,
-        "yardlet-core",
+        "agentos-core",
         attempt_id,
         "Express goal draft generated deterministically with capability coverage.",
         "Capability coverage and any bounded scout disposition are visible before promotion.",
@@ -2990,7 +2990,7 @@ pub fn projection(ws: &Workspace) -> Result<PlanningProjection> {
     let _lock = ws.acquire_planning_lock()?;
     let session = ws
         .load_latest_planning_session()?
-        .ok_or_else(|| anyhow!("no planning session; run `yardlet new \"...\"` first"))?;
+        .ok_or_else(|| anyhow!("no planning session; run `agentos new \"...\"` first"))?;
     for receipt in ws.load_planning_actions(&session.session_id)? {
         if receipt.status != PlanningActionStatus::Prepared {
             validate_terminal_action_effect(ws, &receipt)?;
@@ -3097,7 +3097,7 @@ queue:
     fn temp_workspace(label: &str) -> Workspace {
         let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "yardlet-planning-{label}-{}-{counter}",
+            "agentos-planning-{label}-{}-{counter}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -3972,7 +3972,7 @@ queue:
         assert_eq!(
             crate::run::latest_question_for(&ws, "YARD-001").as_deref(),
             Some(
-                "This task needs your decision before Yardlet can run it: implement exact promotion. Reply with the decision or instructions to proceed."
+                "This task needs your decision before AgentOS can run it: implement exact promotion. Reply with the decision or instructions to proceed."
             )
         );
         crate::state::save_yaml(
@@ -3991,7 +3991,7 @@ queue:
         assert_eq!(
             crate::run::latest_question_for(&ws, "YARD-001").as_deref(),
             Some(
-                "This task needs your decision before Yardlet can run it: implement exact promotion. Reply with the decision or instructions to proceed."
+                "This task needs your decision before AgentOS can run it: implement exact promotion. Reply with the decision or instructions to proceed."
             ),
             "a stale unattributed conversation must not mask the current receipt-backed question"
         );
@@ -4367,12 +4367,12 @@ queue:
         activate_express_draft(&ws, "bounded test", draft()).unwrap();
 
         // Unmarked NeedsUser (legacy queues, worker questions): answer-only,
-        // and the refusal must name the `yardlet answer` path and the task.
+        // and the refusal must name the `agentos answer` path and the task.
         set_active_task_state(&ws, TaskState::NeedsUser);
         let error = begin_replan_session_exact(&ws, "재계획")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("yardlet answer"), "{error}");
+        assert!(error.contains("agentos answer"), "{error}");
         assert!(error.contains("YARD-001"), "{error}");
 
         // An explicit worker-question marker keeps the same answer-only path.
@@ -4382,9 +4382,9 @@ queue:
         let error = begin_replan_session_exact(&ws, "재계획")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("yardlet answer"), "{error}");
+        assert!(error.contains("agentos answer"), "{error}");
 
-        // An all-Done queue keeps the follow-up (`yardlet new`) guidance.
+        // An all-Done queue keeps the follow-up (`agentos new`) guidance.
         set_active_task_state(&ws, TaskState::Done);
         let error = begin_replan_session_exact(&ws, "재계획")
             .unwrap_err()
@@ -4441,7 +4441,7 @@ queue:
             let error = begin_replan_session_exact(&ws, "재계획")
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("yardlet answer"), "{case}: {error}");
+            assert!(error.contains("agentos answer"), "{case}: {error}");
             assert!(error.contains("YARD-001"), "{case}: {error}");
             let _ = std::fs::remove_dir_all(&ws.root);
         }

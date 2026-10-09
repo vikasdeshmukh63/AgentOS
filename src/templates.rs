@@ -1,6 +1,6 @@
 //! Templates embedded into the binary at compile time.
 //!
-//! `yardlet init` writes these into a target repo's `.agents/` directory. The
+//! `agentos init` writes these into a target repo's `.agents/` directory. The
 //! binary is therefore self-contained and does not need a source checkout to
 //! initialize a workspace.
 

@@ -22,7 +22,7 @@ use crate::schemas::{
 };
 use crate::state::Workspace;
 
-/// Machine-managed learned overrides (written by `yardlet routing apply`), kept in
+/// Machine-managed learned overrides (written by `agentos routing apply`), kept in
 /// a separate file so the human-owned `workers.yaml` keeps its comments.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RoutingOverrides {
@@ -419,8 +419,8 @@ fn resolve_order(
         failures.push(format!("{id}: {}", status.detail));
     }
     Err(anyhow!(
-        "no invocable worker among {tried:?} ({failures:?}). Run `yardlet worker status` to diagnose. \
-         Yardlet did not call an AI API and did not ask for an API key."
+        "no invocable worker among {tried:?} ({failures:?}). Run `agentos worker status` to diagnose. \
+         AgentOS did not call an AI API and did not ask for an API key."
     ))
 }
 
@@ -466,7 +466,7 @@ fn candidate_for_task(
 
 /// Normalize a capability name for matching: trimmed, lowercase, with spaces and
 /// hyphens folded to underscores. Keeps matching exact without forcing an enum
-/// (a new worker capability needs no Yardlet code change). Shared with the
+/// (a new worker capability needs no AgentOS code change). Shared with the
 /// rubric diff/merge so both compare capabilities the same way routing gates do.
 pub(crate) fn norm_cap(s: &str) -> String {
     s.trim().to_lowercase().replace([' ', '-'], "_")
@@ -528,7 +528,7 @@ pub enum GateShape {
 
 /// Legacy queues sometimes encoded a human decision as a fake capability
 /// (`user_creative_direction_approval`, `stakeholder_choice`, ...). Current
-/// Yardlet represents that as `decision_question` -> NeedsUser. This classifier
+/// AgentOS represents that as `decision_question` -> NeedsUser. This classifier
 /// is deliberately structural: it only recognizes words that name a human
 /// judgment/approval, and leaves real tool/license gaps parked as capability
 /// gaps. Actor prefixes such as `user_` or `human_` are not enough by
@@ -669,8 +669,8 @@ mod tests {
         let ws = Workspace::at(&root);
         std::fs::create_dir_all(root.join(".agents")).unwrap();
         std::fs::write(
-            root.join(".agents/yardlet.yaml"),
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
+            root.join(".agents/agentos.yaml"),
+            "schema_version: 1\nproduct: agentos\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
         )
         .unwrap();
         let billing = BillingPolicy::default();
@@ -731,8 +731,8 @@ mod tests {
         let ws = Workspace::at(&root);
         std::fs::create_dir_all(root.join(".agents")).unwrap();
         std::fs::write(
-            root.join(".agents/yardlet.yaml"),
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
+            root.join(".agents/agentos.yaml"),
+            "schema_version: 1\nproduct: agentos\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
         )
         .unwrap();
 
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn preferred_worker_initial_resolution_requires_explicit_fallback_opt_in() {
         let mut workers: WorkersFile = crate::yaml::from_str(
-            "schema_version: 1\nrouting:\n  default_worker: ready\n  fallback_order: [missing, ready]\nworkers:\n  - id: missing\n    invocation: { command: yardlet-definitely-missing-worker-command, supports_noninteractive: true, output_contract: files }\n  - id: ready\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n",
+            "schema_version: 1\nrouting:\n  default_worker: ready\n  fallback_order: [missing, ready]\nworkers:\n  - id: missing\n    invocation: { command: agentos-definitely-missing-worker-command, supports_noninteractive: true, output_contract: files }\n  - id: ready\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n",
         )
         .unwrap();
         let task: Task = crate::yaml::from_str(
@@ -871,8 +871,8 @@ mod tests {
         let workspace = Workspace::at(&root);
         std::fs::create_dir_all(root.join(".agents")).unwrap();
         std::fs::write(
-            root.join(".agents/yardlet.yaml"),
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
+            root.join(".agents/agentos.yaml"),
+            "schema_version: 1\nproduct: agentos\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\ndefault_access: full\n",
         )
         .unwrap();
 
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn failover_uses_remaining_order_for_readiness_without_readding_failed_worker() {
         let w: WorkersFile = crate::yaml::from_str(
-            "schema_version: 1\nrouting:\n  default_worker: failed\n  fallback_order: [failed, missing, ready]\nworkers:\n  - id: failed\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n  - id: missing\n    invocation: { command: yardlet-definitely-missing-worker-command, supports_noninteractive: true, output_contract: files }\n  - id: ready\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n",
+            "schema_version: 1\nrouting:\n  default_worker: failed\n  fallback_order: [failed, missing, ready]\nworkers:\n  - id: failed\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n  - id: missing\n    invocation: { command: agentos-definitely-missing-worker-command, supports_noninteractive: true, output_contract: files }\n  - id: ready\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n",
         )
         .unwrap();
         let task: Task = crate::yaml::from_str("id: T\ntitle: t\n").unwrap();

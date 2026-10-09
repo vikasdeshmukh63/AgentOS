@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 <yardlet-bin> <evidence-dir>" >&2
+  echo "usage: $0 <agentos-bin> <evidence-dir>" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REAL_GIT="$(command -v git)"
@@ -129,7 +129,7 @@ head_oid() {
 write_config() {
   local ws="$1"
   local remote="${2:-origin}"
-  cat >"$ws/.agents/yardlet.yaml" <<EOF
+  cat >"$ws/.agents/agentos.yaml" <<EOF
 schema_version: 1
 product: protected-branch-fixture
 workspace_id: fixture
@@ -158,7 +158,7 @@ git_finish:
   target_ref: refs/heads/main
   pre_push_checks:
     - name: fixture-check
-      command: 'printf "check\n" >> "\$YARDLET_FIXTURE_CHECK_LOG"'
+      command: 'printf "check\n" >> "\$AGENTOS_FIXTURE_CHECK_LOG"'
 EOF
 }
 
@@ -300,7 +300,7 @@ new_workspace() {
   local raw_url="https://$github_host/fixture-owner/fixture-repo.git"
   mkdir -p "$seed"
   "$REAL_GIT" -C "$seed" init -q -b main
-  "$REAL_GIT" -C "$seed" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$seed" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$seed" config user.email "fixture@example.test"
   printf 'baseline\n' >"$seed/owned.txt"
   "$REAL_GIT" -C "$seed" add owned.txt
@@ -309,7 +309,7 @@ new_workspace() {
   "$REAL_GIT" -C "$seed" remote add fixture "$remote"
   "$REAL_GIT" -C "$seed" push -q fixture HEAD:refs/heads/main
   "$REAL_GIT" clone -q -b main "$remote" "$ws"
-  "$REAL_GIT" -C "$ws" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$ws" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$ws" config user.email "fixture@example.test"
   "$REAL_GIT" -C "$ws" remote set-url origin "$raw_url"
   "$REAL_GIT" -C "$ws" config "url.$remote.insteadOf" "$raw_url"
@@ -317,13 +317,13 @@ new_workspace() {
   (
     cd "$ws"
     PATH="$WRAPPER_DIR:$SAFE_SYSTEM_PATH" \
-      YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-      YARDLET_FIXTURE_GIT_LOG="$scenario/init-git.log" \
-      YARDLET_FIXTURE_GH_LOG="$scenario/init-gh.log" \
-      YARDLET_FIXTURE_GH_STATE="$scenario/init-pr-state" \
-      YARDLET_FIXTURE_EXPECTED_OID="$(head_oid "$ws")" \
-      YARDLET_FIXTURE_EXPECTED_HOST="$github_host" \
-      "$YARDLET_BIN" init >/dev/null
+      AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+      AGENTOS_FIXTURE_GIT_LOG="$scenario/init-git.log" \
+      AGENTOS_FIXTURE_GH_LOG="$scenario/init-gh.log" \
+      AGENTOS_FIXTURE_GH_STATE="$scenario/init-pr-state" \
+      AGENTOS_FIXTURE_EXPECTED_OID="$(head_oid "$ws")" \
+      AGENTOS_FIXTURE_EXPECTED_HOST="$github_host" \
+      "$AGENTOS_BIN" init >/dev/null
   )
   write_config "$ws"
   write_state "$ws"
@@ -334,7 +334,7 @@ new_workspace() {
   printf '%s\n' "$scenario"
 }
 
-run_yardlet() {
+run_agentos() {
   local scenario="$1"
   local gh_mode="${2:-normal}"
   local protected="${3:-true}"
@@ -348,19 +348,19 @@ run_yardlet() {
   (
     cd "$scenario/clone"
     PATH="$path_dir:$system_path" \
-      YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-      YARDLET_FIXTURE_GIT_LOG="$scenario/git.log" \
-      YARDLET_FIXTURE_GH_LOG="$scenario/gh.log" \
-      YARDLET_FIXTURE_GH_STATE="$scenario/pr-state" \
-      YARDLET_FIXTURE_EXPECTED_OID="$expected" \
-      YARDLET_FIXTURE_EXPECTED_HOST="$expected_host" \
-      YARDLET_FIXTURE_GH_MODE="$gh_mode" \
-      YARDLET_FIXTURE_PROTECTED="$protected" \
-      YARDLET_FIXTURE_CRASH_MODE="$crash_mode" \
-      YARDLET_FIXTURE_EVENT="$event" \
-      YARDLET_FIXTURE_WORKER_LOG="$scenario/worker.log" \
-      YARDLET_FIXTURE_CHECK_LOG="$scenario/check.log" \
-      "$YARDLET_BIN" recover
+      AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+      AGENTOS_FIXTURE_GIT_LOG="$scenario/git.log" \
+      AGENTOS_FIXTURE_GH_LOG="$scenario/gh.log" \
+      AGENTOS_FIXTURE_GH_STATE="$scenario/pr-state" \
+      AGENTOS_FIXTURE_EXPECTED_OID="$expected" \
+      AGENTOS_FIXTURE_EXPECTED_HOST="$expected_host" \
+      AGENTOS_FIXTURE_GH_MODE="$gh_mode" \
+      AGENTOS_FIXTURE_PROTECTED="$protected" \
+      AGENTOS_FIXTURE_CRASH_MODE="$crash_mode" \
+      AGENTOS_FIXTURE_EVENT="$event" \
+      AGENTOS_FIXTURE_WORKER_LOG="$scenario/worker.log" \
+      AGENTOS_FIXTURE_CHECK_LOG="$scenario/check.log" \
+      "$AGENTOS_BIN" recover
   )
 }
 
@@ -371,43 +371,43 @@ launch_grouped_recovery() {
   local expected expected_host
   expected="$(head_oid "$scenario/clone")"
   expected_host="$(cat "$scenario/expected-host")"
-  "$PYTHON" - "$YARDLET_BIN" "$scenario/clone" "$WRAPPER_DIR" \
+  "$PYTHON" - "$AGENTOS_BIN" "$scenario/clone" "$WRAPPER_DIR" \
     "$SAFE_SYSTEM_PATH" "$REAL_GIT" "$scenario" "$expected" "$expected_host" \
     "$crash_mode" "$event" <<'PY' &
 import os
 import sys
 
-yardlet, workspace, wrapper, safe_path, real_git, scenario, expected, host, mode, event = sys.argv[1:]
+agentos, workspace, wrapper, safe_path, real_git, scenario, expected, host, mode, event = sys.argv[1:]
 os.setsid()
 os.chdir(workspace)
 env = os.environ.copy()
 env["PATH"] = wrapper + os.pathsep + safe_path
-env["YARDLET_FIXTURE_REAL_GIT"] = real_git
-env["YARDLET_FIXTURE_GIT_LOG"] = scenario + "/git.log"
-env["YARDLET_FIXTURE_GH_LOG"] = scenario + "/gh.log"
-env["YARDLET_FIXTURE_GH_STATE"] = scenario + "/pr-state"
-env["YARDLET_FIXTURE_EXPECTED_OID"] = expected
-env["YARDLET_FIXTURE_EXPECTED_HOST"] = host
-env["YARDLET_FIXTURE_GH_MODE"] = "normal"
-env["YARDLET_FIXTURE_PROTECTED"] = "true"
-env["YARDLET_FIXTURE_CRASH_MODE"] = mode
-env["YARDLET_FIXTURE_EVENT"] = event
-env["YARDLET_FIXTURE_WORKER_LOG"] = scenario + "/worker.log"
-env["YARDLET_FIXTURE_CHECK_LOG"] = scenario + "/check.log"
+env["AGENTOS_FIXTURE_REAL_GIT"] = real_git
+env["AGENTOS_FIXTURE_GIT_LOG"] = scenario + "/git.log"
+env["AGENTOS_FIXTURE_GH_LOG"] = scenario + "/gh.log"
+env["AGENTOS_FIXTURE_GH_STATE"] = scenario + "/pr-state"
+env["AGENTOS_FIXTURE_EXPECTED_OID"] = expected
+env["AGENTOS_FIXTURE_EXPECTED_HOST"] = host
+env["AGENTOS_FIXTURE_GH_MODE"] = "normal"
+env["AGENTOS_FIXTURE_PROTECTED"] = "true"
+env["AGENTOS_FIXTURE_CRASH_MODE"] = mode
+env["AGENTOS_FIXTURE_EVENT"] = event
+env["AGENTOS_FIXTURE_WORKER_LOG"] = scenario + "/worker.log"
+env["AGENTOS_FIXTURE_CHECK_LOG"] = scenario + "/check.log"
 fd = os.open(scenario + "/crashed-recover.log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.dup2(fd, 1)
 os.dup2(fd, 2)
 os.close(fd)
-os.execve(yardlet, [yardlet, "recover"], env)
+os.execve(agentos, [agentos, "recover"], env)
 PY
   ACTIVE_GROUP_PID=$!
 }
 
 run_concurrent_recovery() {
   local scenario="$1"
-  (run_yardlet "$scenario" normal true normal >"$scenario/recover-a.log" 2>&1) &
+  (run_agentos "$scenario" normal true normal >"$scenario/recover-a.log" 2>&1) &
   local first=$!
-  (run_yardlet "$scenario" normal true normal >"$scenario/recover-b.log" 2>&1) &
+  (run_agentos "$scenario" normal true normal >"$scenario/recover-b.log" 2>&1) &
   local second=$!
   wait "$first"
   wait "$second"
@@ -431,7 +431,7 @@ assert records[-1]["git_finish_status"] == "pull_request_open", records[-1]
 PY
   (
     cd "$scenario/clone"
-    "$YARDLET_BIN" report >"$scenario/final-report.md"
+    "$AGENTOS_BIN" report >"$scenario/final-report.md"
   )
   grep -q '1/1 tasks done' "$scenario/final-report.md" || fail "success report progress"
   grep -q 'pull request #17 open and verified' "$scenario/final-report.md" \
@@ -446,7 +446,7 @@ run_direct_case() {
   baseline="$(head_oid "$ws")"
   expected="$(commit_owned "$ws" direct)"
   write_integrated_run "$ws" "$baseline" "$expected"
-  run_yardlet "$scenario" normal false normal >"$scenario/recover.log" 2>&1
+  run_agentos "$scenario" normal false normal >"$scenario/recover.log" 2>&1
   assert_eq "$(remote_oid "$remote" refs/heads/main)" "$expected" "direct base OID"
   assert_eq "$(grep -c "PUSH_SUCCESS.*${expected}:refs/heads/main" "$scenario/git.log" || true)" 1 "direct base push count"
   assert_eq "$(yaml_task_state "$ws/.agents/work-queue.yaml")" done "direct queue Done"
@@ -462,8 +462,8 @@ run_protected_case() {
   baseline="$(head_oid "$ws")"
   expected="$(commit_owned "$ws" "$name")"
   write_integrated_run "$ws" "$baseline" "$expected"
-  run_yardlet "$scenario" normal true normal >"$scenario/recover.log" 2>&1
-  head_ref="refs/heads/yardlet/runs/run-20990101-000001-YARD-001"
+  run_agentos "$scenario" normal true normal >"$scenario/recover.log" 2>&1
+  head_ref="refs/heads/agentos/runs/run-20990101-000001-YARD-001"
   assert_eq "$(remote_oid "$remote" refs/heads/main)" "$baseline" "protected base unchanged"
   assert_eq "$(remote_oid "$remote" "$head_ref")" "$expected" "protected exact head OID"
   assert_eq "$(grep -c 'PUSH_SUCCESS.*:refs/heads/main' "$scenario/git.log" || true)" 0 "protected base push count"
@@ -506,7 +506,7 @@ run_crash_case() {
   ! kill -0 -- "-$pgid" 2>/dev/null || fail "$crash_mode process group survived"
   worker_before="$(wc -l <"$scenario/worker.log" | tr -d ' ')"
   run_concurrent_recovery "$scenario"
-  head_ref="refs/heads/yardlet/runs/run-20990101-000001-YARD-001"
+  head_ref="refs/heads/agentos/runs/run-20990101-000001-YARD-001"
   assert_eq "$(remote_oid "$remote" refs/heads/main)" "$baseline" "$crash_mode base unchanged"
   assert_eq "$(remote_oid "$remote" "$head_ref")" "$expected" "$crash_mode head OID"
   assert_eq "$(grep -c "PUSH_SUCCESS.*${expected}:${head_ref}" "$scenario/git.log" || true)" 1 "$crash_mode head mutation count"
@@ -535,7 +535,7 @@ PY
 )"
   (
     cd "$scenario/clone"
-    "$YARDLET_BIN" report >"$scenario/final-report.md"
+    "$AGENTOS_BIN" report >"$scenario/final-report.md"
   )
   if [[ "$queue_state" == partial && "$run_state" == partial \
     && "$telemetry_state" == Partial ]] \
@@ -567,7 +567,7 @@ run_failure_case() {
   expected="$(commit_owned "$ws" "$name")"
   write_integrated_run "$ws" "$baseline" "$expected"
   write_config "$ws" "$policy_remote"
-  run_yardlet "$scenario" "$gh_mode" true normal "$scenario/no-event" "$path_dir" \
+  run_agentos "$scenario" "$gh_mode" true normal "$scenario/no-event" "$path_dir" \
     "$system_path" >"$scenario/recover.log" 2>&1
   assert_eq "$(grep -c '^PUSH_SUCCESS' "$scenario/git.log" || true)" 0 "$name external Git mutation"
   assert_eq "$(grep -c 'PR_CREATE_SUCCESS' "$scenario/gh.log" || true)" 0 "$name external PR mutation"
@@ -583,11 +583,11 @@ run_pr_mismatch_case() {
   baseline="$(head_oid "$ws")"
   expected="$(commit_owned "$ws" "$mode")"
   write_integrated_run "$ws" "$baseline" "$expected"
-  head_ref="refs/heads/yardlet/runs/run-20990101-000001-YARD-001"
+  head_ref="refs/heads/agentos/runs/run-20990101-000001-YARD-001"
   "$REAL_GIT" -C "$ws" push -q "$remote" "$expected:$head_ref"
   printf 'open\n' >"$scenario/pr-state"
-  run_yardlet "$scenario" "$mode" true normal >"$scenario/recover.log" 2>&1
-  assert_eq "$(grep -c '^PUSH_SUCCESS' "$scenario/git.log" || true)" 0 "$mode Yardlet Git mutation"
+  run_agentos "$scenario" "$mode" true normal >"$scenario/recover.log" 2>&1
+  assert_eq "$(grep -c '^PUSH_SUCCESS' "$scenario/git.log" || true)" 0 "$mode AgentOS Git mutation"
   assert_eq "$(grep -c 'PR_CREATE_SUCCESS' "$scenario/gh.log" || true)" 0 "$mode PR mutation"
   assert_failure_projection "$scenario" pull_request_verification_mismatch
 }

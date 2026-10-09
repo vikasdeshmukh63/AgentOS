@@ -391,11 +391,11 @@ pub fn run(ws: &Workspace, options: WatchOptions) -> Result<(String, WatchResult
     let cancelled = Arc::new(AtomicBool::new(false));
     // Through the shared installer, not `ctrlc::set_handler` directly: only one
     // handler may exist per process, and `run` needs one too now that stopping
-    // Yardlet has to take its worker with it (issue #107). A second direct
+    // AgentOS has to take its worker with it (issue #107). A second direct
     // registration is an error, which is how this first showed up — as a test
     // failing because another test had already registered.
     if !crate::signals::install_stop_handler() {
-        eprintln!("yardlet: could not install a cancel handler; Ctrl-C will not stop this watch");
+        eprintln!("agentos: could not install a cancel handler; Ctrl-C will not stop this watch");
     }
     let mut observer = LocalObserver::new(
         &ws.root,

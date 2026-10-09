@@ -1,4 +1,4 @@
-//! `yardlet gc`: end-of-life for retained run worktrees.
+//! `agentos gc`: end-of-life for retained run worktrees.
 //!
 //! Per-run cleanup removes a worktree only on a verified, fully integrated
 //! finish. Every other ending — Partial preservation, `auto_commit` off, a
@@ -567,7 +567,7 @@ fn run_branch_refs(
     let mut out: Vec<String> = refs.iter().cloned().collect();
     for reference in &refs {
         if let Some(branch) = reference.strip_prefix("refs/heads/") {
-            out.push(format!("refs/heads/yardlet-txn/{branch}"));
+            out.push(format!("refs/heads/agentos-txn/{branch}"));
         }
     }
     out.sort();
@@ -995,7 +995,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let base = std::env::temp_dir().join(format!(
-            "yardlet-gc-unit-{name}-{}-{nonce}",
+            "agentos-gc-unit-{name}-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&base).unwrap();

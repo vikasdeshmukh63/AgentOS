@@ -48,10 +48,10 @@ fn the_idle_footer_leads_to_a_list_of_every_working_home_key() {
         .unwrap();
     assert!(
         init.status.success(),
-        "yardlet init failed: {}",
+        "agentos init failed: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let config_path = root.join(".agents/yardlet.yaml");
+    let config_path = root.join(".agents/agentos.yaml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("language: auto", "language: en");
@@ -64,7 +64,7 @@ fn the_idle_footer_leads_to_a_list_of_every_working_home_key() {
     let child = Command::new(&binary)
         .current_dir(&root)
         .env("TERM", "xterm-256color")
-        .env("YARDLET_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)

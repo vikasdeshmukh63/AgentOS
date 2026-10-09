@@ -13,9 +13,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: Yardlet version
-      description: Paste `yardlet --version` or the exact commit SHA.
-      placeholder: yardlet x.y.z
+      label: AgentOS version
+      description: Paste `agentos --version` or the exact commit SHA.
+      placeholder: agentos x.y.z
     validations:
       required: true
   - type: dropdown
@@ -23,8 +23,8 @@ body:
     attributes:
       label: Installation method
       options:
-        - cargo install yardlet
-        - cargo binstall yardlet
+        - cargo install agentos-build01
+        - cargo binstall agentos-build01
         - GitHub release binary
         - cargo install --path .
         - cargo run from source

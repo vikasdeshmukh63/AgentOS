@@ -1,6 +1,6 @@
 //! Project-memory init/refresh.
 //!
-//! Workers draft memory documents into an isolated run directory. Yardlet core
+//! Workers draft memory documents into an isolated run directory. AgentOS core
 //! is the sole writer of canonical `.agents/memory/*.md` files and the generated
 //! index through `Workspace::write_memory_documents`.
 
@@ -297,7 +297,7 @@ pub fn scout(ws: &Workspace) -> Result<ScoutCommandReport> {
             let env = env.clone();
             let worker_id = worker_id.clone();
             let live_report_dir = run_dir.join("scouts").join(topic);
-            let sandbox = std::env::temp_dir().join(format!("yardlet-{scout_run_id}-{topic}"));
+            let sandbox = std::env::temp_dir().join(format!("agentos-{scout_run_id}-{topic}"));
             let results = &results;
             scope.spawn(move || {
                 let result = (|| -> Result<(String, MemoryResult)> {
@@ -305,13 +305,13 @@ pub fn scout(ws: &Workspace) -> Result<ScoutCommandReport> {
                         std::fs::remove_dir_all(&sandbox)?;
                     }
                     copy_scout_workspace(&ws.root, &sandbox)?;
-                    let report_dir = sandbox.join(".yardlet-scout-output");
+                    let report_dir = sandbox.join(".agentos-scout-output");
                     std::fs::create_dir_all(&report_dir)?;
                     let packet = packet::compile_memory_scout(
                         topic,
                         brief,
                         &worker_id,
-                        ".yardlet-scout-output",
+                        ".agentos-scout-output",
                     );
                     let outcome = workers::spawn(
                         &profile,
@@ -419,7 +419,7 @@ pub fn apply_scout(ws: &Workspace, run_id: &str) -> Result<MemoryCommandReport> 
 }
 
 /// Copy a workspace into a disposable scout root, excluding VCS state, build
-/// artifacts, Yardlet runtime records, and symlinks. This is the production
+/// artifacts, AgentOS runtime records, and symlinks. This is the production
 /// scout-isolation copy; eval fixtures reuse it to prove the copy is inert.
 pub(crate) fn copy_scout_workspace(source: &Path, target: &Path) -> Result<()> {
     std::fs::create_dir_all(target)?;

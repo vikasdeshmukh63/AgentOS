@@ -151,7 +151,7 @@ fn ledger_line(member: &Member) -> String {
 fn manifest_has_only_the_approved_members_layers_and_pins() {
     let manifest = load_manifest();
     assert_eq!(manifest.schema_version, 1);
-    assert_eq!(manifest.library, "yardlet-managed-builtins");
+    assert_eq!(manifest.library, "agentos-managed-builtins");
     assert_eq!(manifest.members.len(), 11);
     assert_eq!(manifest.sources.len(), 2);
 

@@ -1,12 +1,12 @@
 # V010-002A missing-capability planning dogfood
 
 - 실행일: 2026-07-21 (Asia/Seoul)
-- 대상: `yardlet 0.10.0`, YARD-002/YARD-003 위의 YARD-005 isolation remediation
+- 대상: `agentos 0.10.0`, YARD-002/YARD-003 위의 YARD-005 isolation remediation
 - 원칙: provider-free, 외부 검색·설치·게시·deploy·push 없음
 
 ## 1. 실제 readiness와 요청
 
-현재 Yardlet workspace에서 `yardlet worker status`를 읽기 전용으로 실행한 결과
+현재 AgentOS workspace에서 `agentos worker status`를 읽기 전용으로 실행한 결과
 `codex` 0.144.1은 guard 기준 `invocable`, `claude-code`는 `disabled`였다. 현재
 `workers.yaml`에서 ready worker가 선언한 tool capability는 `image_generation`뿐이며,
 dogfood에 사용한 `nondeterministic_entropy_probe`는 어느 ready worker도 선언하지
@@ -20,7 +20,7 @@ dogfood에 사용한 `nondeterministic_entropy_probe`는 어느 ready worker도 
 ```text
 fixture-worker [invocable]
   [ok] binary
-  [ok] version yardlet-capability-fixture-worker 1.0
+  [ok] version agentos-capability-fixture-worker 1.0
   [ok] billing-env AI-billing env clean
   => safe to invoke under current policy (auth not verified offline)
 ```
@@ -28,14 +28,14 @@ fixture-worker [invocable]
 실제 express planning 요청은 다음과 같다.
 
 ```bash
-yardlet goal "dogfood nondeterministic capability" \
+agentos goal "dogfood nondeterministic capability" \
   --requires nondeterministic_entropy_probe \
   --plan-only
 ```
 
 ## 2. coverage, trigger, source, disposition
 
-2026-07-21 재현에서 `yardlet planning show --json`은 한 task에 다음 typed 결과를
+2026-07-21 재현에서 `agentos planning show --json`은 한 task에 다음 typed 결과를
 남겼다.
 
 ```json
@@ -82,7 +82,7 @@ lifecycle before confirm = open
 scout count before restart = 1
 ```
 
-별도 process인 `scripts/restart.sh`가 `yardlet planning show --json`을 다시 실행한
+별도 process인 `scripts/restart.sh`가 `agentos planning show --json`을 다시 실행한
 뒤에도 같은 session, head, coverage evidence, trigger, source, disposition을 읽었다.
 scout count는 1로 유지되어 duplicate scout가 없었다. confirm도 fresh CLI process로
 실행했다.
@@ -124,9 +124,9 @@ generic provider-free scout를 실행한다. 이 scout는 `.agents/intent-contra
 다음 형태의 disposable copy 경로로 바뀐다.
 
 ```text
-worker-cwd = /var/.../yardlet-planning-scout-20260721-071320-de9d33ab5c458b10-96887
-run-dir = /var/.../yardlet-planning-scout-20260721-071320-de9d33ab5c458b10-96887/.yardlet-scout-output
-worker executable = /var/.../yardlet-planning-scout-20260721-071320-de9d33ab5c458b10-96887/fixture-worker/worker.sh
+worker-cwd = /var/.../agentos-planning-scout-20260721-071320-de9d33ab5c458b10-96887
+run-dir = /var/.../agentos-planning-scout-20260721-071320-de9d33ab5c458b10-96887/.agentos-scout-output
+worker executable = /var/.../agentos-planning-scout-20260721-071320-de9d33ab5c458b10-96887/fixture-worker/worker.sh
 before = 1e64ab198880904da0aababc6d256090484c50ac
 after  = 1e64ab198880904da0aababc6d256090484c50ac
 ```
@@ -161,7 +161,7 @@ cargo test --test v010_002a_capability_discovery_process \
   restart_ -- --nocapture
 cargo test --test v010_002a_capability_discovery_process \
   missing_nondeterministic_capability_stops_at_one_visible_disposition -- --nocapture
-target/debug/yardlet eval fixtures --json \
+target/debug/agentos eval fixtures --json \
   --fixture capability-coverage-trigger-matrix \
   --fixture bounded-capability-scout-contract
 ```
@@ -203,7 +203,7 @@ cargo test
   `explicit_research_request`를 올리지 않는다(한국어 어간은 활용형이 어간을 그대로
   확장하므로 substring 유지). fixture 전용 마커(`weak-context:`, `unfamiliar-domain:`,
   `약한 매치:`, `낯선 도메인:`)는 production 기본 경로에서 비활성이며
-  `YARDLET_TEST_PLANNING_SIGNAL_MARKERS=1`로만 켜진다. process fixture는 opt-in 없이
+  `AGENTOS_TEST_PLANNING_SIGNAL_MARKERS=1`로만 켜진다. process fixture는 opt-in 없이
   마커가 무시되는 대조군(`soft-one-marker-off`)을 함께 검증한다. 고정 테스트:
   `planner::tests::capability_signals_ignore_embedded_terms_and_fixture_markers_by_default`.
 - **F3**: scout worker가 실제로 반환한 결과만 scout 캐시에 저장한다. 로컬

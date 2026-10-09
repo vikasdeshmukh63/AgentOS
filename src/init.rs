@@ -1,4 +1,4 @@
-//! `yardlet init`: scaffold canonical `.agents/` state into a workspace.
+//! `agentos init`: scaffold canonical `.agents/` state into a workspace.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -7,16 +7,15 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
-use crate::schemas::{GitFinishPolicy, YardConfig};
-use crate::state::{self, write_str, Workspace, STATE_DIR};
+use crate::schemas::{AgentConfig, GitFinishPolicy};
+use crate::state::{self, write_str, Workspace, CONFIG_FILE, STATE_DIR};
 use crate::templates;
 
 pub fn init(root: &Path, force: bool) -> Result<Vec<String>> {
     let ws = Workspace::at(root);
     if ws.is_initialized() && !force {
         bail!(
-            "this workspace already has {}/yardlet.yaml. Use --force to overwrite policy templates.",
-            STATE_DIR
+            "this workspace already has {STATE_DIR}/{CONFIG_FILE}. Use --force to overwrite policy templates."
         );
     }
 
@@ -28,9 +27,9 @@ pub fn init(root: &Path, force: bool) -> Result<Vec<String>> {
     std::fs::create_dir_all(ws.handoffs_dir())?;
 
     // Dynamic config.
-    let config = YardConfig {
+    let config = AgentConfig {
         schema_version: 1,
-        product: "yardlet".to_string(),
+        product: "agentos".to_string(),
         workspace_id: workspace_id(root),
         created_at: Utc::now().to_rfc3339(),
         state_dir: STATE_DIR.to_string(),
@@ -55,7 +54,7 @@ pub fn init(root: &Path, force: bool) -> Result<Vec<String>> {
     let config_path = ws.config_path();
     if should_write_scaffold(&config_path, force)? {
         state::save_yaml(&config_path, &config)?;
-        written.push("yardlet.yaml".to_string());
+        written.push(CONFIG_FILE.to_string());
     }
 
     // Static templates.
@@ -83,7 +82,7 @@ pub fn init(root: &Path, force: bool) -> Result<Vec<String>> {
     }
 
     // H3 hooks: create the (empty) hook dirs and a documented README so the
-    // feature is discoverable. Yardlet ships no enabled hooks — only the docs.
+    // feature is discoverable. AgentOS ships no enabled hooks — only the docs.
     std::fs::create_dir_all(agents.join("hooks/pre-run.d"))?;
     std::fs::create_dir_all(agents.join("hooks/post-run.d"))?;
     let hooks_readme = agents.join("hooks/README.md");
@@ -128,7 +127,7 @@ fn should_write_scaffold(path: &Path, force: bool) -> Result<bool> {
 /// Resolve a workspace, creating `.agents/` state on first use if none exists
 /// in this directory or any parent. Returns `(workspace, just_created)`.
 ///
-/// This is what makes `yardlet` work in a fresh directory without a separate
+/// This is what makes `agentos` work in a fresh directory without a separate
 /// setup step: like the worker CLIs, it initializes on demand.
 pub fn ensure_initialized(cwd: &Path) -> Result<(Workspace, bool)> {
     if let Some(ws) = Workspace::discover(cwd) {
@@ -171,7 +170,7 @@ mod tests {
         std::fs::create_dir_all(&external).unwrap();
 
         let links = [
-            ("yardlet.yaml", "yardlet.yaml"),
+            ("agentos.yaml", "agentos.yaml"),
             ("billing-policy.yaml", "billing-policy.yaml"),
             ("skills/planning-gate/SKILL.md", "planning-gate-SKILL.md"),
             ("hooks/README.md", "hooks-README.md"),
@@ -213,8 +212,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         init(&root, false).unwrap();
 
-        let text = std::fs::read_to_string(root.join(".agents/yardlet.yaml")).unwrap();
-        let cfg: YardConfig = crate::yaml::from_str(&text).unwrap();
+        let text = std::fs::read_to_string(root.join(".agents/agentos.yaml")).unwrap();
+        let cfg: AgentConfig = crate::yaml::from_str(&text).unwrap();
+        assert_eq!(cfg.product, "agentos");
         assert!(!cfg.git_finish.auto_push);
         assert!(text.contains("git_finish:"));
         assert!(text.contains("auto_push: false"));

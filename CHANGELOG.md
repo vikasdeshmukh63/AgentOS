@@ -748,8 +748,8 @@
   as an advisory check and the question remains visible in the run handoff and
   checkpoint instead of being silently lost.
 - **Preserve user-owned config files.** TUI settings saves and `agentos access`
-  now update only the targeted `agentos.yaml` / legacy `yard.yaml` /
-  `workers.yaml` keys, preserving comments, key order, and untouched values
+  now update only the targeted `agentos.yaml` / `workers.yaml` keys, preserving
+  comments, key order, and untouched values
   instead of round-tripping the whole file through YAML serialization.
 - **Recover abandoned runs.** `agentos recover` now salvages a task stranded by
   an abandoned run: a run left stuck `running` (no live worker, no result) whose
@@ -807,7 +807,7 @@
   postpone (e.g. work needing files you will provide later, or a capability no
   worker has) stops looking like a broken task and lets the intent wrap with the
   deferral on record. Revive it by re-queuing.
-- **Auto-commit (opt-in).** The `auto_commit: true` flag in `.agents/yard.yaml`
+- **Auto-commit (opt-in).** The `auto_commit: true` flag in `.agents/agentos.yaml`
   governs the serial path, which currently does NOT auto-commit: in the shared
   working tree a serial run's changes can't be told apart from a concurrent edit,
   so it reports that and leaves the commit to you (serial-in-worktree auto-commit
@@ -994,7 +994,7 @@
 - **Restored the macOS Intel (`x86_64-apple-darwin`) prebuilt binary.** The
   release workflow's Intel job ran on the `macos-13` runner, which stuck in
   `queued` and never produced a binary, so v0.5.4 shipped only Apple Silicon and
-  Linux binaries and `cargo binstall agentos` fell back to a source build on
+  Linux binaries and `cargo binstall agentos-build01` fell back to a source build on
   Intel Macs. Both darwin targets now cross-compile on the `macos-14` (Apple
   Silicon) runner.
 
@@ -1023,7 +1023,7 @@
 - **Prebuilt binaries + `cargo binstall` support.** A release workflow
   (`.github/workflows/release.yml`) builds macOS (Intel and Apple Silicon) and
   Linux x86_64 binaries on each version tag and attaches them to the GitHub
-  release, so users can grab a binary or run `cargo binstall agentos` instead
+  release, so users can grab a binary or run `cargo binstall agentos-build01` instead
   of compiling.
 
 ### Changed
@@ -1047,11 +1047,9 @@
 ### Changed
 
 - **Renamed the project to AgentOS.** The crate, binary, and command are now
-  `agentos` (the `yard` name was taken on crates.io by an unrelated parser).
-  The container-yard metaphor and identity are unchanged. Existing workspaces
-  keep working: the config file is now `.agents/agentos.yaml`, but a legacy
-  `.agents/yard.yaml` is still read (and written in place) so nothing breaks on
-  upgrade. Internal worktree branches stay `yard/<task-id>`.
+  `agentos`. The container-yard metaphor and identity are unchanged. The
+  canonical workspace configuration is `.agents/agentos.yaml`; workspaces must
+  use this config filename.
 
 ### Fixed
 

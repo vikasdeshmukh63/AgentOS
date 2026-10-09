@@ -11,7 +11,7 @@ app_script="${2:?local app script is required}"
 capture_script="${3:?browser capture script is required}"
 restart_script="$(dirname "$0")/restart_app.sh"
 packet="$(cat)"
-task_id="$(sed -n 's/^# Yardlet task packet: //p' <<<"$packet" | head -n 1)"
+task_id="$(sed -n 's/^# AgentOS task packet: //p' <<<"$packet" | head -n 1)"
 run_id="${run_dir##*/}"
 python_bin="$(command -v python3)"
 
@@ -167,8 +167,8 @@ with urlopen(sys.argv[2], timeout=1) as response:
     health_status = response.status
 assert page_status == 200
 assert health_status == 200
-assert "yardlet-local-app" in page
-assert health == {"status": "ok", "marker": "yardlet-local-app"}
+assert "agentos-local-app" in page
+assert health == {"status": "ok", "marker": "agentos-local-app"}
 print(json.dumps({"page_status": page_status, "health_status": health_status, "marker": health["marker"]}))
 PY
 
@@ -212,8 +212,8 @@ cat >"$run_dir/result.json" <<EOF
     {"proposal_id":"local-process","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open","attach","stop","restart","cleanup","reconcile"],"target":{"kind":"process","pid":$app_pid,"start_identity":"$app_identity","command":["$python_bin","$app_script","--port","$port"]}},
     {"proposal_id":"local-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open","reconcile"],"target":{"kind":"service","url":"$url","health_url":"$health_url"}},
     {"proposal_id":"local-unhealthy-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open","reconcile"],"target":{"kind":"service","url":"$url","health_url":"$unhealthy_url"}},
-    {"proposal_id":"local-restart-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"yardlet","capabilities":["open","restart","cleanup","reconcile"],"target":{"kind":"service","url":"$restart_healthy_url","health_url":"$restart_healthy_url","pid":$restart_healthy_pid,"start_identity":"$restart_healthy_identity","restart_command":["$restart_script","$python_bin","$app_script","$restart_healthy_port","${app_script}.restart-healthy"]}},
-    {"proposal_id":"local-unhealthy-restart-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"yardlet","capabilities":["open","restart","cleanup","reconcile"],"target":{"kind":"service","url":"http://127.0.0.1:${restart_unhealthy_port}/","health_url":"$restart_unhealthy_url","pid":$restart_unhealthy_pid,"start_identity":"$restart_unhealthy_identity","restart_command":["$restart_script","$python_bin","$app_script","$restart_unhealthy_port","${app_script}.restart-unhealthy"]}},
+    {"proposal_id":"local-restart-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"agentos","capabilities":["open","restart","cleanup","reconcile"],"target":{"kind":"service","url":"$restart_healthy_url","health_url":"$restart_healthy_url","pid":$restart_healthy_pid,"start_identity":"$restart_healthy_identity","restart_command":["$restart_script","$python_bin","$app_script","$restart_healthy_port","${app_script}.restart-healthy"]}},
+    {"proposal_id":"local-unhealthy-restart-service","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"agentos","capabilities":["open","restart","cleanup","reconcile"],"target":{"kind":"service","url":"http://127.0.0.1:${restart_unhealthy_port}/","health_url":"$restart_unhealthy_url","pid":$restart_unhealthy_pid,"start_identity":"$restart_unhealthy_identity","restart_command":["$restart_script","$python_bin","$app_script","$restart_unhealthy_port","${app_script}.restart-unhealthy"]}},
     {"proposal_id":"local-open-only-browser","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open"],"target":{"kind":"browser","url":"$url","session_id":"local-open-only-browser"}},
     {"proposal_id":"local-browser","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open","reconcile"],"target":{"kind":"browser","url":"$url","session_id":"local-browser-$browser_pid","pid":$browser_pid,"start_identity":"$browser_identity"}},
     {"proposal_id":"local-live-browser","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"local-app-fixture"},"causation_id":"$run_id","ownership":"worker","capabilities":["open","reconcile"],"target":{"kind":"browser","url":"$url","session_id":"local-active-browser-session","session_probe_url":"$browser_session_url","pid":$app_pid,"start_identity":"$app_identity"}},

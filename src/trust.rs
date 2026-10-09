@@ -537,7 +537,7 @@ impl AutonomyReport {
         rate(self.chores, self.human_touches())
     }
 
-    /// Machine-readable projection for `yardlet trust --json`. Nested so a reader
+    /// Machine-readable projection for `agentos trust --json`. Nested so a reader
     /// can map each number back to its source (transitions vs runs).
     pub fn to_json(&self) -> serde_json::Value {
         let per_intent: serde_json::Map<String, serde_json::Value> = self
@@ -798,7 +798,7 @@ pub fn autonomy_report(ws: &Workspace) -> AutonomyReport {
 }
 
 /// Render the v2 autonomy report as a compact, deterministic text block. Shown
-/// under the v1 worker table by `yardlet trust`, and in the TUI trust panel.
+/// under the v1 worker table by `agentos trust`, and in the TUI trust panel.
 pub fn render_autonomy(rep: &AutonomyReport) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -884,7 +884,7 @@ pub fn render_autonomy(rep: &AutonomyReport) -> String {
 }
 
 /// Full trust report text: the v1 worker/attempt table plus the v2 autonomy
-/// block. Used by `yardlet trust` (no --json) and the TUI trust panel so both
+/// block. Used by `agentos trust` (no --json) and the TUI trust panel so both
 /// surfaces show identical numbers.
 pub fn report_text(ws: &Workspace) -> Result<String> {
     let mut s = report(ws)?;

@@ -194,7 +194,7 @@ mod pty {
 ///
 /// `std::process::Child` does NOT kill on drop, so a failing assertion unwinds
 /// straight past a test's own cleanup and abandons a live process. Every red
-/// run during PTY work left one behind (issue #64: seven orphaned `yardlet`
+/// run during PTY work left one behind (issue #64: seven orphaned `agentos`
 /// processes after a day of it).
 ///
 /// The clean-quit path stays in the tests — it exercises the app's own shutdown
@@ -211,13 +211,13 @@ mod pty {
 /// removes the child from the test harness's group, so a developer's Ctrl-C no
 /// longer reaches it — and signal termination does not run `Drop`, so nothing
 /// else cleans up either. That trade only pays when the tree is actually
-/// reachable, and at every site here it is not: a Yardlet worker regroups itself
+/// reachable, and at every site here it is not: an AgentOS worker regroups itself
 /// on purpose (`src/workers/mod.rs` `process_group(0)`, issue #52) so it survives
 /// the terminal, so it escapes a group kill regardless. The remaining sites spawn
 /// leaves with no children at all.
 ///
-/// So a killed `yardlet run` orphans its worker no matter what this helper does.
-/// That gap is Yardlet's own teardown (issue #107), not a test helper's.
+/// So a killed `agentos run` orphans its worker no matter what this helper does.
+/// That gap is AgentOS's own teardown (issue #107), not a test helper's.
 pub struct ChildGuard {
     child: Option<Child>,
 }
@@ -368,7 +368,7 @@ pub fn wait_for_file_contents(
 /// So the pid is only a candidate. Before signalling, the guard reads the live
 /// process's command line and requires `expected` to appear in it. A recycled pid
 /// is not running the fixture script, so it does not match and is left alone.
-/// This is the same rule Yardlet applies to its own workers, which never signal a
+/// This is the same rule AgentOS applies to its own workers, which never signal a
 /// recorded pid without cross-checking its process identity first.
 #[cfg(unix)]
 pub struct PidFileGuard {

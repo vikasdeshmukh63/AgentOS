@@ -1,12 +1,12 @@
 //! A worker must outlive the terminal that started it (issue #52).
 //!
-//! Yardlet's contract is that quitting the orchestrator does not kill workers —
+//! AgentOS's contract is that quitting the orchestrator does not kill workers —
 //! the next start adopts a live one. That held for `q`, but not for the window
-//! closing: a plain spawn inherits Yardlet's process group, which is the
+//! closing: a plain spawn inherits AgentOS's process group, which is the
 //! controlling pty's foreground group, so pty teardown SIGHUPs the worker too.
 //! An operator quitting the host app mid-review lost the entire reasoning pass.
 //!
-//! This reproduces the shape without a terminal: the `yardlet` child is put in
+//! This reproduces the shape without a terminal: the `agentos` child is put in
 //! its own process group (as it is when it leads a pty's foreground group), its
 //! worker is allowed to start, and then SIGHUP is delivered to **that group**.
 //! The worker must still be alive afterwards.
@@ -44,7 +44,7 @@ fn must_succeed(cwd: &Path, program: &Path, args: &[&str]) {
 }
 
 /// A worker that records its own pid and process group, then stays alive long
-/// enough for the test to signal Yardlet's group and check on it.
+/// enough for the test to signal AgentOS's group and check on it.
 fn write_worker(path: &Path) {
     fs::write(
         path,
@@ -79,14 +79,14 @@ fn wait_for(path: &Path, within: Duration) -> bool {
 }
 
 #[test]
-fn a_worker_survives_a_hangup_delivered_to_yardlets_process_group() {
+fn a_worker_survives_a_hangup_delivered_to_agentoss_process_group() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "yardlet-worker-hangup-{}-{nonce}",
+        "agentos-worker-hangup-{}-{nonce}",
         std::process::id()
     ));
     fs::create_dir_all(&root).unwrap();
@@ -126,44 +126,44 @@ fn a_worker_survives_a_hangup_delivered_to_yardlets_process_group() {
     )
     .unwrap();
 
-    // Yardlet leads its own process group, exactly as it does as a terminal's
+    // AgentOS leads its own process group, exactly as it does as a terminal's
     // foreground process group leader. SIGHUP below then targets that group and
     // nothing else — including not this test harness.
-    let yardlet = Command::new(&binary)
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            std::fs::File::create(root.join("yardlet.err")).unwrap(),
+            std::fs::File::create(root.join("agentos.err")).unwrap(),
         ))
         .process_group(0)
         .spawn()
         .unwrap();
-    let yardlet_pid = yardlet.id() as i32;
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let agentos_pid = agentos.id() as i32;
+    let mut agentos = common::ChildGuard::new(agentos);
 
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
-        "the fixture worker never started; yardlet said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "the fixture worker never started; agentos said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
     let recorded = fs::read_to_string(&ids).unwrap();
     let mut parts = recorded.split_whitespace();
     let worker_pid: i32 = parts.next().unwrap().parse().unwrap();
     let worker_pgid: i32 = parts.next().unwrap().parse().unwrap();
 
-    let yardlet_pgid = pgid_of(yardlet_pid);
+    let agentos_pgid = pgid_of(agentos_pid);
 
     // The observable property first, so a regression reports what the operator
     // would live through rather than an implementation detail: hang up
-    // Yardlet's whole process group, exactly as pty teardown does.
+    // AgentOS's whole process group, exactly as pty teardown does.
     assert_eq!(
-        unsafe { libc::kill(-yardlet_pgid, libc::SIGHUP) },
+        unsafe { libc::kill(-agentos_pgid, libc::SIGHUP) },
         0,
-        "could not signal Yardlet's process group"
+        "could not signal AgentOS's process group"
     );
-    yardlet.shutdown(Duration::from_secs(5), || {});
+    agentos.shutdown(Duration::from_secs(5), || {});
     assert!(
         alive(worker_pid),
         "the worker died with the terminal that started it"
@@ -176,13 +176,13 @@ fn a_worker_survives_a_hangup_delivered_to_yardlets_process_group() {
         "the worker is not its own process group leader"
     );
     assert_ne!(
-        worker_pgid, yardlet_pgid,
-        "the worker shares Yardlet's process group, so pty teardown would take it down"
+        worker_pgid, agentos_pgid,
+        "the worker shares AgentOS's process group, so pty teardown would take it down"
     );
 
     unsafe {
         libc::kill(worker_pid, libc::SIGKILL);
     }
-    drop(yardlet);
+    drop(agentos);
     let _ = fs::remove_dir_all(&root);
 }

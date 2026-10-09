@@ -9,7 +9,7 @@ fi
 run_dir="$1"
 packet="$(cat)"
 workspace="$(pwd)"
-if grep -Eq 'Yardlet task packet|You are a hidden Yardlet worker' <<<"$packet"; then
+if grep -Eq 'AgentOS task packet|You are a hidden AgentOS worker' <<<"$packet"; then
   if grep -q 'confirmed auto runtime fixture' <<<"$packet"; then
     mkdir -p "$run_dir"
     touch "$run_dir/fixture-confirmed-auto-worker-entered"
@@ -51,7 +51,7 @@ EOF
 EOF
     exit 0
   fi
-  barrier="${YARDLET_TEST_MUTATION_BARRIER:?runtime fixture requires mutation barrier}"
+  barrier="${AGENTOS_TEST_MUTATION_BARRIER:?runtime fixture requires mutation barrier}"
   touch "$barrier/worker-entered"
   while [[ ! -f "$barrier/worker-release" ]]; do
     sleep 0.02
@@ -187,10 +187,10 @@ cat >"$run_dir/planning-result.json" <<EOF
   "questions_for_user": []
 }
 EOF
-if [[ -n "${YARDLET_TEST_PLANNER_RESULT_BARRIER:-}" ]]; then
-  mkdir -p "$YARDLET_TEST_PLANNER_RESULT_BARRIER"
-  touch "$YARDLET_TEST_PLANNER_RESULT_BARRIER/result-ready"
-  while [[ ! -f "$YARDLET_TEST_PLANNER_RESULT_BARRIER/release" ]]; do
+if [[ -n "${AGENTOS_TEST_PLANNER_RESULT_BARRIER:-}" ]]; then
+  mkdir -p "$AGENTOS_TEST_PLANNER_RESULT_BARRIER"
+  touch "$AGENTOS_TEST_PLANNER_RESULT_BARRIER/result-ready"
+  while [[ ! -f "$AGENTOS_TEST_PLANNER_RESULT_BARRIER/release" ]]; do
     sleep 0.02
   done
 fi

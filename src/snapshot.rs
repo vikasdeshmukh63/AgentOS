@@ -1,4 +1,4 @@
-//! A read-only snapshot of workspace state, shared by `yardlet status` and the TUI.
+//! A read-only snapshot of workspace state, shared by `agentos status` and the TUI.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -7,12 +7,12 @@ use crate::guard;
 use std::collections::BTreeMap;
 
 use crate::schemas::{
-    IntentContract, RunnableClass, Task, TaskState, TransitionRecord, WorkQueue, YardConfig,
+    AgentConfig, IntentContract, RunnableClass, Task, TaskState, TransitionRecord, WorkQueue,
 };
 use crate::state::Workspace;
 
 pub struct Snapshot {
-    pub config: YardConfig,
+    pub config: AgentConfig,
     pub intent: Option<IntentContract>,
     pub queue: WorkQueue,
     /// Read-only content gates for the idle Home footer. Computed with the
@@ -395,7 +395,7 @@ impl Snapshot {
                         canonical_state: "running".to_string(),
                         effective_state: "interrupted".to_string(),
                         reason: "canonical task is Running but has no recorded run".to_string(),
-                        action: "yardlet recover".to_string(),
+                        action: "agentos recover".to_string(),
                     });
                 };
                 crate::run::stale_running_reason(&run_dir, &task.id, &queue.intent_id).map(
@@ -405,7 +405,7 @@ impl Snapshot {
                         canonical_state: "running".to_string(),
                         effective_state: "interrupted".to_string(),
                         reason,
-                        action: "yardlet recover".to_string(),
+                        action: "agentos recover".to_string(),
                     },
                 )
             })
@@ -511,7 +511,7 @@ impl Snapshot {
         &self.queue.tasks
     }
 
-    /// JSON view for `yardlet status --json`.
+    /// JSON view for `agentos status --json`.
     pub fn to_json(&self) -> serde_json::Value {
         let health = self.health();
         let mut json = serde_json::json!({
@@ -574,7 +574,7 @@ pub(crate) fn reused_task_id_fixture(name: &str) -> (Workspace, Snapshot, String
     std::fs::write(
         ws.config_path(),
         r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: snapshot-test
 created_at: "2026-07-12T00:00:00Z"
 state_dir: .agents
@@ -634,7 +634,7 @@ pub(crate) fn corrupt_activated_state_fixture(name: &str) -> Workspace {
     std::fs::write(
         ws.config_path(),
         r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: corrupt-snapshot-test
 created_at: "2026-07-14T00:00:00Z"
 state_dir: .agents
@@ -718,8 +718,8 @@ mod tests {
         }
         let mut queue = WorkQueue::empty();
         queue.tasks = tasks;
-        let mut config: YardConfig = crate::yaml::from_str(
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: health\ncreated_at: \"2026-07-27T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: \"\"\n",
+        let mut config: AgentConfig = crate::yaml::from_str(
+            "schema_version: 1\nproduct: agentos\nworkspace_id: health\ncreated_at: \"2026-07-27T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: \"\"\n",
         )
         .unwrap();
         config.max_parallel = 4;
@@ -796,7 +796,7 @@ mod tests {
         std::fs::write(
             ws.config_path(),
             r#"schema_version: 1
-product: yardlet
+product: agentos
 workspace_id: snapshot-probe-seam
 created_at: "2026-07-24T00:00:00Z"
 state_dir: .agents
@@ -1027,7 +1027,7 @@ current_intent: ""
         assert_eq!(diagnostic["task_id"], "SHARED");
         assert_eq!(diagnostic["run_id"], run_id);
         assert_eq!(diagnostic["effective_state"], "interrupted");
-        assert_eq!(diagnostic["action"], "yardlet recover");
+        assert_eq!(diagnostic["action"], "agentos recover");
         assert_eq!(std::fs::read(ws.queue_path()).unwrap(), queue_before);
         assert_eq!(std::fs::read(run_dir.join("run.yaml")).unwrap(), run_before);
 

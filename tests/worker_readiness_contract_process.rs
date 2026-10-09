@@ -29,7 +29,7 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let stem = format!(
-            "yardlet-readiness-contract-{label}-{}-{nonce}",
+            "agentos-readiness-contract-{label}-{}-{nonce}",
             std::process::id()
         );
         let root = std::env::temp_dir().join(&stem);

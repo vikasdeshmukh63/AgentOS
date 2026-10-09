@@ -23,7 +23,7 @@ mod unix {
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "yardlet-v010-004-operations-{label}-{}-{nonce}",
+                "agentos-v010-004-operations-{label}-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();
@@ -38,7 +38,7 @@ mod unix {
             must_succeed(&root, Path::new("git"), &["add", "README.md"]);
             must_succeed(&root, Path::new("git"), &["commit", "-qm", "fixture"]);
             must_succeed(&root, &binary, &["init"]);
-            let config_path = root.join(".agents/yardlet.yaml");
+            let config_path = root.join(".agents/agentos.yaml");
             let config = fs::read_to_string(&config_path)
                 .unwrap()
                 .replace("auto_commit: false", "auto_commit: true");
@@ -123,19 +123,19 @@ mod unix {
             Command::new(&self.binary)
                 .args(args)
                 .current_dir(&self.root)
-                .env("YARDLET_TEST_RESOURCE_ACTION_FAULT", fault)
+                .env("AGENTOS_TEST_RESOURCE_ACTION_FAULT", fault)
                 .output()
-                .unwrap_or_else(|error| panic!("failed to run yardlet with {fault}: {error}"))
+                .unwrap_or_else(|error| panic!("failed to run agentos with {fault}: {error}"))
         }
 
         fn command_with_fault_trace(&self, args: &[&str], fault: &str, trace: &Path) -> Output {
             Command::new(&self.binary)
                 .args(args)
                 .current_dir(&self.root)
-                .env("YARDLET_TEST_RESOURCE_ACTION_FAULT", fault)
-                .env("YARDLET_TEST_RESOURCE_ACTION_TRACE", trace)
+                .env("AGENTOS_TEST_RESOURCE_ACTION_FAULT", fault)
+                .env("AGENTOS_TEST_RESOURCE_ACTION_TRACE", trace)
                 .output()
-                .unwrap_or_else(|error| panic!("failed to run yardlet with {fault}: {error}"))
+                .unwrap_or_else(|error| panic!("failed to run agentos with {fault}: {error}"))
         }
 
         fn discover(&self) -> Value {

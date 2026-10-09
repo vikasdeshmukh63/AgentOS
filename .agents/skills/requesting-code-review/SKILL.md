@@ -1,13 +1,13 @@
 ---
 name: requesting-code-review
-description: Use after meaningful implementation work to create an independent Yardlet review task
+description: Use after meaningful implementation work to create an independent AgentOS review task
 ---
 
 # Requesting Code Review
 
 ## Purpose
 
-Turn review into an explicit Yardlet queue item with bounded inputs and a
+Turn review into an explicit AgentOS queue item with bounded inputs and a
 structured verdict. Review is independent work, not an implicit hidden action.
 
 ## When to Request
@@ -30,7 +30,7 @@ judgment.
 
 ## Create the Review Task
 
-Create or propose a normal Yardlet queue task with `kind: review`. Keep its
+Create or propose a normal AgentOS queue task with `kind: review`. Keep its
 allowed scope read-only unless the contract explicitly creates a separate
 repair task. Use [code-reviewer.md](code-reviewer.md) as the review body.
 

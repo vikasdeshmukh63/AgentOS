@@ -90,7 +90,7 @@ blob `abf0390320aa14406af7a520b9b0739fdda9bf08`의 MIT 전문이다. `anthropics
 | SPW-02 | `skills/systematic-debugging`, 11 files | `SKILL.md` L96-105의 env, keychain, `codesign`; shell 1 | 예시 제거, fixture `test-*.md` 4개와 creation log 제외, shell 선택 | Pass |
 | SPW-03 | `skills/verification-before-completion`, 1 file | 로컬 validation만 | 단일 문서 포함 | Pass |
 | SPW-04 | `skills/writing-plans`, 2 files | L61, L162-170의 미채택 subagent skill 참조 | 참조 제거와 task 내부 계획 재범위화 전 설치 금지 | Pass |
-| SPW-06 | `skills/requesting-code-review`, 2 files | reviewer subagent dispatch | Yardlet review task로 번역 | Pass |
+| SPW-06 | `skills/requesting-code-review`, 2 files | reviewer subagent dispatch | AgentOS review task로 번역 | Pass |
 | SPW-07 | `skills/receiving-code-review`, 1 file | feedback 수신 task trigger, 추가 권한 없음 | `review-feedback` overlay에 단일 배정 | Pass |
 | SPW-08 | `skills/finishing-a-development-branch`, 1 file | L121-125 `git push`, PR, branch cleanup 선택 | NeedsUser 및 push gate 뒤로 이동 | Pass |
 | SPW-13 | `skills/writing-skills`, 7 files | 외부 spec URL, raw API/subagent 반복 비용, graphviz/render, push/PR, Claude API/MCP/package 표면 | self-contained `SKILL.md`와 `persuasion-principles.md`만 포함, 나머지 5 files 제외, 재작성 전 설치 금지 | Pass |
@@ -110,7 +110,7 @@ blob `abf0390320aa14406af7a520b9b0739fdda9bf08`의 MIT 전문이다. `anthropics
 | ANT-06 | Anthropic pin, Apache-2.0, 5 files | init script가 `npm install -g pnpm`, Vite 및 다수 package install 수행 | 과도한 설치 network와 용도 부적합, 제외 타당 |
 | ANT-07 | Anthropic pin, `SKILL.md` 1개, skill LICENSE 없음, repo license null | 문서 workflow이나 재배포 provenance가 license gate에서 막힘 | 불명 license, 제외 타당 |
 | ANT-08 | Anthropic pin, docx 61 files, blob `c55ab42...` | source-available 약관이 제3자 배포를 금지 | fresh install 재배포 제외 타당 |
-| SPW-11 | Superpowers pin, MIT, `SKILL.md` 1개 | parallel subagent dispatcher를 task trigger로 강제 | Yardlet queue 경계 충돌, 제외 타당 |
+| SPW-11 | Superpowers pin, MIT, `SKILL.md` 1개 | parallel subagent dispatcher를 task trigger로 강제 | AgentOS queue 경계 충돌, 제외 타당 |
 | SPW-12 | Superpowers pin, MIT, 6 files | subagent 세션과 bash script 3개 종속 | architecture와 tool 종속, 제외 타당 |
 | SPW-14 | Superpowers pin, MIT, 4 files | 1% 가능성에도 skill invocation을 강제하는 이중 dispatcher | packet catalog 충돌, 제외 타당 |
 | HDN-01 | `hoodini/...@f7a43d8...`, repo license null | 개인 AI-generated curation, provenance와 재배포 근거 부족 | 제외 타당 |

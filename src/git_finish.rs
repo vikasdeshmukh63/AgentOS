@@ -1,6 +1,6 @@
 //! Deterministic, user-owned Git finish policy.
 //!
-//! This module is the only Yardlet path that pushes. It accepts an OID that
+//! This module is the only AgentOS path that pushes. It accepts an OID that
 //! the completion engine has already attributed to the current run, checks the
 //! repository and user policy, pushes a non-force OID refspec, and verifies the
 //! remote ref independently. Records intentionally have no URL, output, or
@@ -180,7 +180,7 @@ impl GitFinishRecord {
                 && self
                     .head_ref
                     .as_deref()
-                    .is_some_and(|head| head.starts_with("refs/heads/yardlet/runs/"))
+                    .is_some_and(|head| head.starts_with("refs/heads/agentos/runs/"))
                 && self.pull_request_number.is_some_and(|number| number > 0)
                 && self.pull_request_state.as_deref() == Some("open")
                 && self.expected_oid.is_some()
@@ -630,7 +630,7 @@ fn deterministic_head_ref(run_id: &str) -> Option<String> {
     if run_id.trim().is_empty() || run_id.contains([' ', ':', '^', '~']) {
         return None;
     }
-    let head_ref = format!("refs/heads/yardlet/runs/{run_id}");
+    let head_ref = format!("refs/heads/agentos/runs/{run_id}");
     (!head_ref.ends_with('/') && git_ref_component_safe(run_id)).then_some(head_ref)
 }
 
@@ -764,8 +764,8 @@ pub(crate) fn preflight_target_before_spawn(
     persist(ws, run_dir, &record)?;
     anyhow::bail!(
         "branch_does_not_match_target_ref: configured Git finish target_ref '{}' \
-         does not match checkout ref '{}'; retarget with `yardlet target --to-checkout` \
-         (or `yardlet target <ref>`) before running",
+         does not match checkout ref '{}'; retarget with `agentos target --to-checkout` \
+         (or `agentos target <ref>`) before running",
         effective_target,
         observed
     )
@@ -1247,9 +1247,9 @@ fn finish_owned_run_with_mode_and_github(
         };
         let reused = !pull_requests.is_empty();
         if pull_requests.is_empty() {
-            let title = format!("Yardlet run {run_id}: {task_id}");
+            let title = format!("AgentOS run {run_id}: {task_id}");
             let body = format!(
-                "Yardlet run `{run_id}` delivered the core-verified commit for task `{task_id}`."
+                "AgentOS run `{run_id}` delivered the core-verified commit for task `{task_id}`."
             );
             if let Err(reason) = github.create_pull_request(
                 &discovered.host,
@@ -1309,7 +1309,7 @@ fn finish_owned_run_with_mode_and_github(
         return persist_result(record);
     }
 
-    // This durable write is a hard gate. If Yardlet cannot record that it is
+    // This durable write is a hard gate. If AgentOS cannot record that it is
     // about to mutate the remote, the error reaches the completion path and no
     // push subprocess is started.
     record.status = GitFinishStatus::Prepared;
@@ -1355,7 +1355,7 @@ fn finish_owned_run_with_mode_and_github(
 /// Move the local remote-tracking ref to the OID a verified push just put on
 /// the remote.
 ///
-/// Git updates tracking refs when you push to a named remote; Yardlet pushes to
+/// Git updates tracking refs when you push to a named remote; AgentOS pushes to
 /// the exact URL pinned before the run, so a remote cannot be retargeted
 /// mid-push. That deliberate choice has a cost: `git status` in the owning root
 /// keeps reporting the branch "ahead" after a successful push until someone
@@ -1507,7 +1507,7 @@ impl FinishLock {
         } else {
             root.join(common)
         };
-        let lock_root = common.join("yardlet-finish-locks");
+        let lock_root = common.join("agentos-finish-locks");
         fs::create_dir_all(&lock_root).map_err(|_| "finish_lock_unavailable")?;
         let mut hasher = DefaultHasher::new();
         remote.hash(&mut hasher);
@@ -1516,22 +1516,10 @@ impl FinishLock {
         let file = open_finish_lock_file(&path)?;
         let started = Instant::now();
         loop {
-            // SAFETY: `file` remains open for the full lock lifetime and flock
-            // only reads its valid descriptor. The kernel releases the lock if
-            // this process crashes, so no stale-owner deletion race is needed.
-            let result = unsafe {
-                libc::flock(
-                    std::os::fd::AsRawFd::as_raw_fd(&file),
-                    libc::LOCK_EX | libc::LOCK_NB,
-                )
-            };
-            if result == 0 {
-                return Ok(Self { file });
-            }
-            let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK)
-            {
-                return Err("finish_lock_unavailable");
+            match crate::file_lock::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if crate::file_lock::is_contention(&error) => {}
+                Err(_) => return Err("finish_lock_unavailable"),
             }
             if started.elapsed() >= timeout {
                 return Err("finish_lock_timeout");
@@ -1543,9 +1531,7 @@ impl FinishLock {
 
 impl Drop for FinishLock {
     fn drop(&mut self) {
-        // SAFETY: this descriptor belongs to `self.file` and remains valid
-        // until after Drop returns. Unlock failure is non-fatal on teardown.
-        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+        let _ = crate::file_lock::unlock(&self.file);
     }
 }
 
@@ -1561,7 +1547,7 @@ fn open_finish_lock_file(path: &Path) -> Result<fs::File, &'static str> {
     match open() {
         Ok(file) => Ok(file),
         Err(_) if path.is_dir() && stale_legacy_lock(path) => {
-            // Older Yardlet versions used a PID directory. Replacing a dead
+            // Older AgentOS versions used a PID directory. Replacing a dead
             // legacy directory with a file is race-safe: a concurrent migrator's
             // remove_dir_all cannot delete the newly created regular file.
             let _ = fs::remove_dir_all(path);
@@ -1590,6 +1576,7 @@ fn stale_legacy_lock(path: &Path) -> bool {
         .is_some_and(|age| age > Duration::from_secs(30))
 }
 
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -1597,6 +1584,35 @@ fn process_alive(pid: u32) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // Ambiguous failures fail safe: a legacy lock is reclaimed only when the
+    // PID is definitively absent.
+    // SAFETY: OpenProcess receives a valid access mask and process ID.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return unsafe { GetLastError() } != 87;
+    }
+    let mut exit_code = 0;
+    // SAFETY: process is an open handle and exit_code is a writable DWORD.
+    let alive = unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 || exit_code == 259;
+    // SAFETY: process was returned by OpenProcess and is closed exactly once.
+    unsafe {
+        CloseHandle(process);
+    }
+    alive
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 fn block(record: &mut GitFinishRecord, reason: &str) {
@@ -1759,6 +1775,7 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[cfg(unix)]
 fn shell_ok(root: &Path, command: &str) -> bool {
     Command::new("sh")
         .args(["-c", command])
@@ -1767,6 +1784,23 @@ fn shell_ok(root: &Path, command: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn shell_ok(root: &Path, command: &str) -> bool {
+    let interpreter = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    Command::new(interpreter)
+        .args(["/C", command])
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_ok(_root: &Path, _command: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -1813,7 +1847,7 @@ mod target_ref_tests {
 
     /// The tracking ref is refreshed only when Git itself already created one,
     /// and only to the OID the remote was just verified to hold. Inventing one
-    /// would assert remote state Yardlet did not observe.
+    /// would assert remote state AgentOS did not observe.
     #[test]
     fn tracking_ref_refresh_touches_only_an_existing_stale_ref() {
         let root = std::env::temp_dir().join(format!(
@@ -1920,8 +1954,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&root).unwrap();
             cmd(&root, &["init", "-q", "-b", "main"]);
-            cmd(&root, &["config", "user.name", "Yardlet Test"]);
-            cmd(&root, &["config", "user.email", "yardlet@example.test"]);
+            cmd(&root, &["config", "user.name", "AgentOS Test"]);
+            cmd(&root, &["config", "user.email", "agentos@example.test"]);
             std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
             cmd(&root, &["add", "seed.txt"]);
             cmd(&root, &["commit", "-q", "-m", "seed"]);
@@ -2088,10 +2122,32 @@ mod tests {
     }
 
     fn check(name: &str, command: &str) -> GitFinishCheck {
+        let command = if cfg!(windows) {
+            match command {
+                "true" => "exit /b 0",
+                "false" => "exit /b 1",
+                "printf first > .agents/first" => "echo first > .agents\\first",
+                "test -f .agents/first" => "if exist .agents\\first (exit /b 0) else (exit /b 1)",
+                "sleep 0.2" => "ping -n 2 127.0.0.1 > nul",
+                "git reset --hard HEAD^" => "git reset --hard HEAD~1",
+                "printf changed > owned.txt && git add owned.txt" => {
+                    "echo changed > owned.txt && git add owned.txt"
+                }
+                other => other,
+            }
+        } else {
+            command
+        };
         GitFinishCheck {
             name: name.to_string(),
             command: command.to_string(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pre_push_check_runs_with_the_windows_command_interpreter() {
+        assert!(shell_ok(&std::env::temp_dir(), "exit /b 0"));
     }
 
     struct FakeGithub {
@@ -2805,7 +2861,7 @@ mod tests {
         );
         drop(owner);
 
-        let lock_root = f.root.join(".git/yardlet-finish-locks");
+        let lock_root = f.root.join(".git/agentos-finish-locks");
         let lock_path = std::fs::read_dir(&lock_root)
             .unwrap()
             .next()
@@ -2968,6 +3024,7 @@ mod tests {
         assert!(!user_line.contains(secret));
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejected_push_is_git_failed_without_leaking_remote_details() {
         use std::os::unix::fs::PermissionsExt;
@@ -3064,7 +3121,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_ref_change_during_checks_blocks_yardlet_push() {
+    #[cfg(unix)]
+    fn remote_ref_change_during_checks_blocks_agentos_push() {
         let f = Fixture::new("remote-ref-change");
         f.configure(vec![check(
             "advance remote",

@@ -2,7 +2,7 @@
 //!
 //! A deterministic, human-readable wrap-up of the current intent + queue,
 //! synthesized from the intent contract, the task states, and each task's run
-//! result. Zero-key: Yardlet assembles it from artifacts, never calls a worker.
+//! result. Zero-key: AgentOS assembles it from artifacts, never calls a worker.
 
 use anyhow::Result;
 
@@ -95,7 +95,7 @@ pub fn archived_drain_snapshots(intent_dir: &std::path::Path) -> Vec<(String, st
     drains
 }
 
-/// Confirmation ids are minted path-safe by Yardlet, but they round-trip
+/// Confirmation ids are minted path-safe by AgentOS, but they round-trip
 /// through user-editable YAML — keep the derived directory name inside the
 /// intent's archive dir no matter what the file says.
 fn drain_dir_name(confirmation_id: &str) -> String {
@@ -175,7 +175,7 @@ pub fn promote_follow_up(ws: &Workspace, fu: &FollowUpTask) -> Result<String> {
     Ok(intent_id)
 }
 
-/// Yardlet's own run bookkeeping (under `.agents/`) — not a deliverable, so it is
+/// AgentOS's own run bookkeeping (under `.agents/`) — not a deliverable, so it is
 /// excluded from the report's file list.
 fn is_internal(path: &str) -> bool {
     path.starts_with(".agents/") || path.contains("/.agents/")
@@ -752,7 +752,7 @@ mod tests {
             push_succeeded: true,
             remote_oid: Some("abc".into()),
             remote_before_oid: Some("def".into()),
-            head_ref: Some("refs/heads/yardlet/runs/run-test".into()),
+            head_ref: Some("refs/heads/agentos/runs/run-test".into()),
             pull_request_number: Some(41),
             pull_request_state: Some("open".into()),
             reason: "pull_request_verified".into(),

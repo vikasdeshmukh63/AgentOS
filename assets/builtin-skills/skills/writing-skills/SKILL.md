@@ -1,13 +1,13 @@
 ---
 name: writing-skills
-description: Use when creating or improving a Yardlet-compatible skill through the existing skill authoring and review workflow
+description: Use when creating or improving a skill compatible with AgentOS through the existing skill authoring and review workflow
 ---
 
-# Writing Yardlet Skills
+# Writing AgentOS Skills
 
 ## Scope
 
-Create one focused, reusable procedure. Use Yardlet's configured skill author,
+Create one focused, reusable procedure. Use AgentOS's configured skill author,
 evaluator, and review tasks. Do not create a second dispatcher or bypass the
 canonical skill apply path.
 
@@ -31,8 +31,8 @@ skill directory.
 4. Put detailed reference material in relative companion files only when needed.
 5. List every bundled script or asset and its runtime requirements.
 6. Check the whole directory for network, credential, tool, and external-mutation instructions.
-7. Draft through `yardlet skill research` or `yardlet skill create` as appropriate.
-8. Install only through the deterministic `yardlet skill apply` path.
+7. Draft through `agentos skill research` or `agentos skill create` as appropriate.
+8. Install only through the deterministic `agentos skill apply` path.
 9. Evaluate the installed skill on representative tasks and request an independent review task.
 
 ## Writing for Compliance
@@ -46,7 +46,7 @@ resistant to shortcut rationalizations without adding tool dependencies.
 A skill may describe that a gated capability exists, but it cannot grant that
 capability. Any network, credential, browser, remote-write, deployment, or
 other external mutation remains subject to the task contract and existing
-Yardlet gates at use time.
+AgentOS gates at use time.
 
 ## Verification Checklist
 

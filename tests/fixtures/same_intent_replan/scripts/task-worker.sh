@@ -5,7 +5,7 @@ run_dir="${1:?task fixture requires run directory}"
 packet="$(cat)"
 mkdir -p "$run_dir"
 run_id="$(basename "$run_dir")"
-task_id="$(sed -n 's/^# Yardlet task packet: \(.*\)$/\1/p' <<<"$packet" | head -1)"
+task_id="$(sed -n 's/^# AgentOS task packet: \(.*\)$/\1/p' <<<"$packet" | head -1)"
 
 # A question-scenario task parks NeedsUser as a genuine worker-authored
 # conversation: status needs_user with an actionable question and passing

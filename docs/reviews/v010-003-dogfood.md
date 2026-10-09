@@ -7,7 +7,7 @@
 question/answer, redirect, replay 및 derived index 계약과 task packet의
 AC-001부터 AC-005, SEC-001, SEC-002다.
 
-현재 worktree에는 내부 문서인 `docs/yardlet-roadmap.md`와 run 시작 시점의
+현재 worktree에는 내부 문서인 `docs/agentos-roadmap.md`와 run 시작 시점의
 `evidence/repo-summary.md`가 없었다. 따라서 task packet에 보존된 exact failed
 check와 공개 계약 문서를 기준으로 구현 및 검증 범위를 고정했다. 활성 intent,
 queue 및 기존 run history는 수정하거나 fixture 입력으로 사용하지 않았다.
@@ -38,7 +38,7 @@ cargo test --test v010_003_task_channels_process -- --nocapture
 - `deleted_derived_index_rebuilds_from_canonical_facts_with_bounded_tail`: fixture가
   128개를 넘는 canonical event를 만들지 못했다.
 
-이 red는 compile 또는 파일 부재 오류가 아니라 fake worker를 통과한 실제 Yardlet
+이 red는 compile 또는 파일 부재 오류가 아니라 fake worker를 통과한 실제 AgentOS
 subprocess state가 acceptance story를 충족하지 못한 결과였다.
 
 ## Fix

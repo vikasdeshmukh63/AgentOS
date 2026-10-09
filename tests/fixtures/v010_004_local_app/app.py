@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 
 
-MARKER = "yardlet-local-app"
+MARKER = "agentos-local-app"
 BROWSER_SESSION_ID = "local-active-browser-session"
 
 
@@ -37,7 +37,7 @@ class Handler(BaseHTTPRequestHandler):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yardlet local resource fixture</title>
+  <title>AgentOS local resource fixture</title>
   <style>
     body {{ margin: 0; background: #101820; color: #f2f2f2; font-family: sans-serif; }}
     main {{ width: 720px; margin: 96px auto; padding: 48px; border: 2px solid #f2aa4c; }}

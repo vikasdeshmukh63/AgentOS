@@ -4,7 +4,7 @@
 //!
 //! - **Processes.** `std::process::Child` does not kill on drop, so a failing
 //!   assertion unwound past a test's own cleanup and abandoned a live process —
-//!   seven orphaned `yardlet` processes accumulated over a day of PTY work
+//!   seven orphaned `agentos` processes accumulated over a day of PTY work
 //!   (#64).
 //! - **Workspaces.** Every PTY test removed its temp root on the happy path
 //!   only, so the same unwind abandoned the workspace too. That half of #64 was

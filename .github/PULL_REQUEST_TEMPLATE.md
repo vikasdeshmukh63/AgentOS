@@ -31,5 +31,5 @@ boundary changes. Use "Not required" for an issue-optional small fix.
 - [ ] Behavior changes include tests.
 - [ ] Public commands, output, configuration, or contracts have updated docs.
 - [ ] I did not include secrets, personal paths, or generated run artifacts.
-- [ ] I did not hand-edit Yardlet-owned canonical `.agents/` state.
+- [ ] I did not hand-edit AgentOS-owned canonical `.agents/` state.
 - [ ] I have the right to submit this work under the repository's MIT License.

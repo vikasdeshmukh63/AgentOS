@@ -2,7 +2,7 @@
 //!
 //! The TUI chrome can render in English (default) or Korean. The language is
 //! resolved from the workspace `language` setting, falling back to the intent
-//! content and the OS locale when set to "auto". Yardlet's canonical state and
+//! content and the OS locale when set to "auto". AgentOS's canonical state and
 //! worker-facing packets are unaffected by this.
 
 use crate::schemas::{RunnableClass, TaskState};
@@ -91,7 +91,7 @@ pub fn runnable_class_label(l: &L, class: RunnableClass) -> &'static str {
 }
 
 /// Typed progress emitted by the run engine. Identifiers and diagnostic
-/// details are interpolated verbatim; only Yardlet-authored chrome changes.
+/// details are interpolated verbatim; only AgentOS-authored chrome changes.
 pub enum RunProgress<'a> {
     Ambiguity {
         turn: u32,
@@ -689,7 +689,7 @@ pub const EN: L = L {
     keys_title: " Home keys ",
     keys_intro: "Every key Home accepts. The footer only lists the ones with something to act on right now; all of these work.",
     footer_keys: "\u{2191}/\u{2193}/PgUp/PgDn scroll  Esc/q/? back",
-    key_doc_quit: "quit Yardlet",
+    key_doc_quit: "quit AgentOS",
     key_doc_restart: "restart into a newly installed binary (offered when one is ready)",
     key_doc_new: "describe new work",
     key_doc_replan: "replan this intent from a settled queue",
@@ -740,8 +740,8 @@ pub const EN: L = L {
     no_approval: "no task is waiting for approval \u{2014} press r to run, or A to auto-run the queue",
     approval_enter_hint: "needs approval before it can run \u{2014} press p to approve, then it runs",
     deferred_enter_hint: "deferred \u{2014} set aside by a decision, not scheduled to run",
-    initialized: "initialized Yardlet workspace (.agents/)",
-    startup_loading: "Starting Yardlet safely",
+    initialized: "initialized AgentOS workspace (.agents/)",
+    startup_loading: "Starting AgentOS safely",
     startup_recovery: "Validating activation and recovering interrupted work",
     startup_probe: "Checking worker readiness",
     startup_failed: "Startup failed:",
@@ -752,9 +752,9 @@ pub const EN: L = L {
     footer_startup_loading: "startup in progress  q quit",
     footer_startup_failed: "g retry  q quit",
     newwork_title: " New Work ",
-    newwork_prompt: "Describe the work in a few sentences. Yardlet plans, queues, and runs it.",
+    newwork_prompt: "Describe the work in a few sentences. AgentOS plans, queues, and runs it.",
     replan_title: " Replan This Intent ",
-    replan_prompt: "Describe the replacement direction. Yardlet keeps the same intent id and proposes a new plan for this failure-settled queue.",
+    replan_prompt: "Describe the replacement direction. AgentOS keeps the same intent id and proposes a new plan for this failure-settled queue.",
     request_title: " Request ",
     footer_newwork: "Enter newline   Ctrl+S submit   Ctrl+Enter submit (when supported)   Esc cancel",
     footer_replan: "Enter newline   Ctrl+S start same-intent replan   Ctrl+Enter submit (when supported)   Esc cancel",
@@ -966,7 +966,7 @@ pub const KO: L = L {
     keys_title: " 홈 키 목록 ",
     keys_intro: "홈에서 받는 모든 키입니다. 푸터에는 지금 대상이 있는 키만 나오지만, 아래는 전부 동작합니다.",
     footer_keys: "\u{2191}/\u{2193}/PgUp/PgDn 스크롤  Esc/q/? 뒤로",
-    key_doc_quit: "Yardlet 종료",
+    key_doc_quit: "AgentOS 종료",
     key_doc_restart: "새로 설치된 바이너리로 재시작 (준비됐을 때만 제공)",
     key_doc_new: "새 작업 입력",
     key_doc_replan: "종결된 큐를 같은 인텐트로 재계획",
@@ -1017,8 +1017,8 @@ pub const KO: L = L {
     no_approval: "승인 대기 중인 작업 없음 \u{2014} r 눌러 실행, 또는 A 눌러 큐 자동 실행",
     approval_enter_hint: "실행 전 승인 필요 \u{2014} p 눌러 승인하면 실행됩니다",
     deferred_enter_hint: "보류됨 \u{2014} 결정으로 미뤄둔 작업이라 실행 대상이 아님",
-    initialized: "Yardlet 워크스페이스 생성됨 (.agents/)",
-    startup_loading: "Yardlet 안전 시작 중",
+    initialized: "AgentOS 워크스페이스 생성됨 (.agents/)",
+    startup_loading: "AgentOS 안전 시작 중",
     startup_recovery: "활성화 검증 및 중단 작업 복구 중",
     startup_probe: "워커 준비 상태 확인 중",
     startup_failed: "시작 실패:",
@@ -1028,7 +1028,7 @@ pub const KO: L = L {
     footer_startup_loading: "시작 준비 중  q 종료",
     footer_startup_failed: "g 재시도  q 종료",
     newwork_title: " 새 작업 ",
-    newwork_prompt: "작업을 몇 문장으로 설명하세요. Yardlet 가 계획·큐·실행합니다.",
+    newwork_prompt: "작업을 몇 문장으로 설명하세요. AgentOS 가 계획·큐·실행합니다.",
     replan_title: " 같은 목표 재계획 ",
     replan_prompt: "대체 방향을 설명하세요. 같은 intent id를 유지하고 실패 종결 큐의 새 계획을 제안합니다.",
     request_title: " 요청 ",

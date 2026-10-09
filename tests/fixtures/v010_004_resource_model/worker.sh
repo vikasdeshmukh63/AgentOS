@@ -8,7 +8,7 @@ fi
 
 run_dir="${1:?run directory is required}"
 packet="$(cat)"
-task_id="$(sed -n 's/^# Yardlet task packet: //p' <<<"$packet" | head -n 1)"
+task_id="$(sed -n 's/^# AgentOS task packet: //p' <<<"$packet" | head -n 1)"
 run_id="${run_dir##*/}"
 
 fnv_digest() {
@@ -62,8 +62,8 @@ case "$task_id" in
   ],
   "resources":[
     {"proposal_id":"ops-stop","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"worker","target":{"kind":"process","pid":$stop_pid,"start_identity":"$stop_identity","command":["/bin/sleep","90"]}},
-    {"proposal_id":"ops-restart","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"yardlet","target":{"kind":"process","pid":$restart_pid,"start_identity":"$restart_identity","command":["/bin/sleep","90"]}},
-    {"proposal_id":"ops-cleanup","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"yardlet","target":{"kind":"process","pid":$cleanup_pid,"start_identity":"$cleanup_identity","command":["/bin/sleep","90"]}},
+    {"proposal_id":"ops-restart","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"agentos","target":{"kind":"process","pid":$restart_pid,"start_identity":"$restart_identity","command":["/bin/sleep","90"]}},
+    {"proposal_id":"ops-cleanup","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"agentos","target":{"kind":"process","pid":$cleanup_pid,"start_identity":"$cleanup_identity","command":["/bin/sleep","90"]}},
     {"proposal_id":"ops-detach","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"worker","target":{"kind":"terminal","terminal_id":"ops-terminal","pid":$detach_pid,"start_identity":"$detach_identity","attach_hint":"fixture attach"}},
     {"proposal_id":"ops-external","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"external","target":{"kind":"process","pid":$external_pid,"start_identity":"$external_identity","command":["/bin/sleep","90"]}},
     {"proposal_id":"ops-unknown","task_id":"$task_id","attempt_id":"$run_id","producer":{"worker_id":"fixture"},"causation_id":"$run_id","ownership":"unknown","target":{"kind":"process","pid":$external_pid,"start_identity":"$external_identity","command":["/bin/sleep","90"]}},

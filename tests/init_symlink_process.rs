@@ -19,7 +19,7 @@ mod unix {
                 .unwrap()
                 .as_nanos();
             let base = std::env::temp_dir().join(format!(
-                "yardlet-init-symlink-process-{}-{nonce}",
+                "agentos-init-symlink-process-{}-{nonce}",
                 std::process::id()
             ));
             let workspace = base.join("workspace");
@@ -44,7 +44,7 @@ mod unix {
     fn init_force_skips_symlink_scaffold_destinations_and_warns() {
         let fixture = Fixture::new();
         let links = [
-            ("yardlet.yaml", "yardlet.yaml"),
+            ("agentos.yaml", "agentos.yaml"),
             ("billing-policy.yaml", "billing-policy.yaml"),
             ("skills/planning-gate/SKILL.md", "planning-gate-SKILL.md"),
             ("hooks/README.md", "hooks-README.md"),
@@ -66,7 +66,7 @@ mod unix {
             .unwrap();
         assert!(
             output.status.success(),
-            "yardlet init --force failed\nstdout:\n{}\nstderr:\n{}",
+            "agentos init --force failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

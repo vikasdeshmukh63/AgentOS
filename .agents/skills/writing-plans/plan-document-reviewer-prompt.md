@@ -1,6 +1,6 @@
 # Plan Document Review Task Template
 
-Use this template when creating a Yardlet task with `kind: review` for an
+Use this template when creating an AgentOS task with `kind: review` for an
 implementation plan.
 
 ## Inputs

@@ -61,7 +61,7 @@ offline event.
 Report abusive, harassing, or otherwise unacceptable behavior privately using
 the contact method listed on the
 [@zzunkie GitHub profile](https://github.com/zzunkie). Use the subject
-`[yardlet conduct]`. Do not include sensitive incident details in a public
+`[agentos conduct]`. Do not include sensitive incident details in a public
 issue.
 
 All complaints will be reviewed and investigated promptly and fairly. Community

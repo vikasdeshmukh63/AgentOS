@@ -12,7 +12,7 @@
 2. `cargo test --test v010_001_shared_state_replay` 실행: 8/8 pass, exit 0. `cargo test` 전체 스위트 실행: 309 + 3 + 1 + 2 + 8 = 323 pass, 0 fail, exit 0 (증거: `.agents/runs/run-20260712-235209/validation.log`).
 3. 계약이 인용한 저장소 근거를 재차 원문 대조했다 (`src/state.rs:1-5`, `src/state.rs:198-210`, `src/state.rs:261-288`, `src/state.rs:296-311`, `src/state.rs:815-826`, `src/schemas.rs:150-201`, `src/schemas.rs:230-248`, `src/planner.rs:559-597`, `src/planner.rs:1322-1340`, `src/run.rs:115-135`, `src/run.rs:1356-1389`, `tests/state_architecture_guard.rs:20-31`). 전부 정확했다.
 4. `.agents/skills/contract-gate-parity-check/SKILL.md` 절차대로 §9.2 조건 목록과 runnable gate를 조건 단위 1:1 재대조하고, 각 좌변 필드가 predicate에서 실제로 읽히는지 grep으로 확정했다.
-5. 수정 범위 확인: 변경된 파일은 계약 문서, `canonical.json`, 테스트 파일 3건뿐이고 legacy fixture와 `src/**`, Yardlet 운영 상태는 건드리지 않았다 (out_of_scope 준수).
+5. 수정 범위 확인: 변경된 파일은 계약 문서, `canonical.json`, 테스트 파일 3건뿐이고 legacy fixture와 `src/**`, AgentOS 운영 상태는 건드리지 않았다 (out_of_scope 준수).
 
 ## 2. 1차 결함 해소 확인
 

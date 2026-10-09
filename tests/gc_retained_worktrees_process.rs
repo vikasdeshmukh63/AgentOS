@@ -1,4 +1,4 @@
-//! `yardlet gc` against a real repository with real retained run worktrees.
+//! `agentos gc` against a real repository with real retained run worktrees.
 //!
 //! Issue #139: retention has no end-of-life, so `.agents/worktrees/` grew to 39
 //! worktrees / 4.0GB. The judgment this command makes is about Git history and
@@ -43,7 +43,7 @@ fn commit(dir: &Path, message: &str) {
     sh_git(dir, &["commit", "-q", "-m", message]);
 }
 
-fn yardlet(root: &Path, args: &[&str]) -> (bool, String, String) {
+fn agentos(root: &Path, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_agentos"))
         .args(args)
         .current_dir(root)
@@ -59,10 +59,10 @@ fn yardlet(root: &Path, args: &[&str]) -> (bool, String, String) {
 fn gc(root: &Path, args: &[&str]) -> String {
     let mut argv = vec!["gc"];
     argv.extend_from_slice(args);
-    let (ok, stdout, stderr) = yardlet(root, &argv);
+    let (ok, stdout, stderr) = agentos(root, &argv);
     assert!(
         ok,
-        "yardlet {argv:?} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "agentos {argv:?} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
 }
@@ -116,7 +116,7 @@ fn fixture(name: &str) -> Fixture {
         .unwrap()
         .as_nanos();
     let guard = WorkspaceGuard::create(
-        std::env::temp_dir().join(format!("yardlet-gc-{name}-{}-{nonce}", std::process::id())),
+        std::env::temp_dir().join(format!("agentos-gc-{name}-{}-{nonce}", std::process::id())),
     );
     let root = guard.path().to_path_buf();
 
@@ -127,17 +127,17 @@ fn fixture(name: &str) -> Fixture {
     sh_git(&root, &["config", "user.name", "Local User"]);
     sh_git(&root, &["config", "user.email", "local@example.test"]);
     sh_git(&root, &["config", "commit.gpgsign", "false"]);
-    // Yardlet keeps its runtime state out of the repo it runs in (see
+    // AgentOS keeps its runtime state out of the repo it runs in (see
     // `parallel::ensure_worktrees_excluded`). Without it, a root commit here
     // would swallow the nested worktrees as gitlinks.
     write(&root.join(".git/info/exclude"), ".agents/\n");
     write(&root.join("README.md"), "base\n");
     commit(&root, "init");
 
-    let (ok, stdout, stderr) = yardlet(&root, &["init"]);
+    let (ok, stdout, stderr) = agentos(&root, &["init"]);
     assert!(
         ok,
-        "yardlet init failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "agentos init failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     let add = |run_id: &str, branch: &str| -> PathBuf {

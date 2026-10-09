@@ -11,7 +11,7 @@
 
 #[cfg(unix)]
 #[test]
-fn yardlet_serial_chain_and_crash_recovery_converge_without_manual_git_finish() {
+fn agentos_serial_chain_and_crash_recovery_converge_without_manual_git_finish() {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,7 @@ fn yardlet_serial_chain_and_crash_recovery_converge_without_manual_git_finish() 
         .expect("system clock before Unix epoch")
         .as_nanos();
     let evidence = std::env::temp_dir().join(format!(
-        "yardlet-v010-001a-process-{}-{nonce}",
+        "agentos-v010-001a-process-{}-{nonce}",
         std::process::id()
     ));
     std::fs::create_dir_all(&evidence).expect("create V010-001A evidence directory");
@@ -144,7 +144,7 @@ fn yardlet_serial_chain_and_crash_recovery_converge_without_manual_git_finish() 
             .env_remove("GIT_CONFIG_COUNT")
             .env_remove("GIT_CONFIG_PARAMETERS");
         if exit_trap_probe {
-            command.env("YARDLET_FIXTURE_EXIT_TRAP_PROBE", "1");
+            command.env("AGENTOS_FIXTURE_EXIT_TRAP_PROBE", "1");
         }
         command
     };

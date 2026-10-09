@@ -7,7 +7,7 @@
 //! ("a planning job just finished in THIS process"), so an accepted but
 //! unconfirmed draft became unreachable the moment the TUI restarted.
 //!
-//! This test therefore uses two separate `yardlet` processes over real
+//! This test therefore uses two separate `agentos` processes over real
 //! pseudo-terminals against the same workspace:
 //!
 //!   1. Process one plans and accepts a draft, then quits WITHOUT confirming.
@@ -121,7 +121,7 @@ fn spawn_tui(binary: &Path, root: &Path) -> (common::ChildGuard, File, Vec<u8>) 
     let child = Command::new(binary)
         .current_dir(root)
         .env("TERM", "xterm-256color")
-        .env("YARDLET_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
@@ -175,10 +175,10 @@ fn an_accepted_unconfirmed_plan_is_reachable_from_home_after_a_restart() {
         .unwrap();
     assert!(
         init.status.success(),
-        "yardlet init failed: {}",
+        "agentos init failed: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let config_path = root.join(".agents/yardlet.yaml");
+    let config_path = root.join(".agents/agentos.yaml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("language: auto", "language: ko");

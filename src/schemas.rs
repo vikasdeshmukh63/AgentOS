@@ -1,8 +1,8 @@
-//! Canonical Yardlet data model.
+//! Canonical AgentOS data model.
 //!
 //! These structs map to the `.agents/*.yaml` files and the per-run JSON
 //! artifacts. Logic-bearing fields are typed; loosely-structured policy detail
-//! that Yardlet only passes through to workers is kept as `yaml::Value` so the
+//! that AgentOS only passes through to workers is kept as `yaml::Value` so the
 //! model does not over-constrain user-edited files.
 
 use serde::{Deserialize, Serialize};
@@ -19,11 +19,11 @@ fn default_language() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// .agents/yard.yaml
+// .agents/agentos.yaml
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct YardConfig {
+pub struct AgentConfig {
     pub schema_version: u32,
     pub product: String,
     pub workspace_id: String,
@@ -33,7 +33,7 @@ pub struct YardConfig {
     pub canonical_queue: String,
     pub current_intent: String,
     /// User-facing output language for worker content: "auto" (detect from the
-    /// request), "ko", "en", etc. Yardlet's own CLI/TUI chrome stays English.
+    /// request), "ko", "en", etc. AgentOS's own CLI/TUI chrome stays English.
     #[serde(default = "default_language")]
     pub language: String,
     /// Default worker permission: "sandboxed" (local-only, network blocked) or
@@ -66,7 +66,7 @@ pub struct YardConfig {
     #[serde(default)]
     pub skill_library: String,
     /// Auto-equip core + detected-preset skills on plan/goal (I4: minimize
-    /// intervention). Off = `yardlet skill suggest` nudges instead. On by default.
+    /// intervention). Off = `agentos skill suggest` nudges instead. On by default.
     #[serde(default = "default_true")]
     pub auto_equip: bool,
     /// Auto-record worker-proposed skills (a run's harness_suggestions of kind
@@ -80,7 +80,7 @@ pub struct YardConfig {
     /// H1 inlines into every packet (harness.md H4). OFF by default: rules are
     /// always-on (not per-task) and not auto-pruned, so one wrong learned rule
     /// degrades every later packet. Promote rules by hand instead. Reversible
-    /// (git) and visible via `yardlet harness review`.
+    /// (git) and visible via `agentos harness review`.
     #[serde(default)]
     pub auto_rule: bool,
     /// Auto-prune learned skills whose eval score stays below the floor over
@@ -96,14 +96,14 @@ pub struct YardConfig {
     pub hooks: bool,
     /// Opt in to autonomous git commits of completed serial work. Serial workers
     /// always run in a run-owned worktree. When this is OFF, a changed worktree
-    /// is retained as Partial with no commit or merge. When ON, Yardlet commits
+    /// is retained as Partial with no commit or merge. When ON, AgentOS commits
     /// only that isolated diff (excluding `.agents/`) and merges it sequentially.
     /// The parallel path is unaffected: batch integration always commits its
     /// isolated worktrees. Remote push is a separate default-off policy below.
     /// OFF by default, since it writes to the user's git history.
     #[serde(default)]
     pub auto_commit: bool,
-    /// User-owned, default-off policy for finishing an owned Yardlet merge.
+    /// User-owned, default-off policy for finishing an owned AgentOS merge.
     /// Legacy configs omit this block and therefore deserialize to a disabled
     /// direct-delivery policy.
     #[serde(default)]
@@ -178,7 +178,7 @@ pub struct IntentContract {
     #[serde(default)]
     pub acceptance: Vec<yaml::Value>,
     /// Local image paths attached to this goal (passed to the worker natively:
-    /// codex `-i`, claude reads them), so Yardlet does not lose the CLIs' vision.
+    /// codex `-i`, claude reads them), so AgentOS does not lose the CLIs' vision.
     #[serde(default)]
     pub images: Vec<String>,
     /// The planner's own ambiguity self-report: low | medium | high.
@@ -1073,7 +1073,7 @@ pub enum TaskState {
     NeedsUser,
     /// Ran but did not fully complete — acceptance not met or a blocker found.
     Partial,
-    /// Consciously set aside by a human decision (`yardlet defer`): not pending,
+    /// Consciously set aside by a human decision (`agentos defer`): not pending,
     /// not done. Acknowledged work that will not run this cycle (e.g. a P0
     /// ceiling needing user-provided input or a capability no worker declares).
     /// Skipped by the scheduler like Blocked, but it reads as a decision, not a
@@ -1970,7 +1970,7 @@ impl WorkersFile {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SUPPORTED_WORKERS_SCHEMA_VERSION {
             return Err(format!(
-                "this yardlet supports workers.yaml schema_version {SUPPORTED_WORKERS_SCHEMA_VERSION}, found {}",
+                "this agentos supports workers.yaml schema_version {SUPPORTED_WORKERS_SCHEMA_VERSION}, found {}",
                 self.schema_version
             ));
         }
@@ -2136,10 +2136,10 @@ pub struct WorkerProfile {
 
 /// What a worker CLI reads from the workspace on its own.
 ///
-/// The packet is Yardlet's shared injection point, so workspace rules and the
+/// The packet is AgentOS's shared injection point, so workspace rules and the
 /// skill catalog ride in it. A source the worker already loads natively would
 /// then arrive twice, so it is projected out of *that* worker's packet — and a
-/// declared source Yardlet did not otherwise know about joins discovery, so the
+/// declared source AgentOS did not otherwise know about joins discovery, so the
 /// workers that do NOT read it still get it.
 ///
 /// Paths are workspace-relative (`AGENTS.md`, `.cursorrules`, `.claude/skills`).
@@ -2199,7 +2199,7 @@ pub struct OutputContractIncident {
     pub terminal_attempt_id: Option<String>,
 }
 
-/// Provenance for a result Yardlet had to recover from a worker's captured
+/// Provenance for a result AgentOS had to recover from a worker's captured
 /// stdout because the declared result FILE was absent. Recorded so a tolerant
 /// recovery can never read back as "the worker wrote result.json" (V010-006).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2267,7 +2267,7 @@ pub struct Invocation {
     pub prompt_transport: String,
     /// Arguments for the local, offline readiness probe. Missing keeps the
     /// legacy `--version` behavior. An explicitly empty list is invalid because
-    /// Yardlet must not guess whether a bare command is a safe offline probe.
+    /// AgentOS must not guess whether a bare command is a safe offline probe.
     #[serde(
         default = "default_version_args",
         skip_serializing_if = "is_default_version_args"
@@ -2290,7 +2290,7 @@ pub struct Invocation {
     pub effort_args: Vec<String>,
     /// Env vars passed through to THIS worker even when the billing policy
     /// scrubs them (e.g. ["OPENAI_API_KEY"] for an API-backed worker CLI).
-    /// Explicit per-worker opt-in; zero-key remains the default and Yardlet
+    /// Explicit per-worker opt-in; zero-key remains the default and AgentOS
     /// itself never reads or stores the values.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pass_env: Vec<String>,
@@ -2326,7 +2326,7 @@ pub struct IdentityProbe {
     pub expected_signature: String,
 }
 
-/// Offline, tolerant auth probe. Yardlet never makes a billed call to verify a
+/// Offline, tolerant auth probe. AgentOS never makes a billed call to verify a
 /// subscription login; this only reads what a local command already prints.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthProbe {
@@ -2344,7 +2344,7 @@ pub struct AuthProbe {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenericSessionInvocation {
     /// Exact fresh-child raw stream marker used to capture the provider's
-    /// opaque session reference. Yardlet never consults global session state.
+    /// opaque session reference. AgentOS never consults global session state.
     #[serde(default)]
     pub capture: GenericSessionCapture,
     /// Generic resume argv template. It uses the invocation's prompt transport
@@ -2387,7 +2387,7 @@ impl Invocation {
         self.prompt_transport.trim() == "stdin"
     }
 
-    /// Does this worker read the packet from a file Yardlet writes for it?
+    /// Does this worker read the packet from a file AgentOS writes for it?
     pub fn prompt_in_file(&self) -> bool {
         self.prompt_transport.trim() == "file"
     }
@@ -2397,7 +2397,7 @@ impl Invocation {
     /// Undeclared keeps today's behavior for every profile. A built-in adapter
     /// carries a CORE-OWNED vendor stream-json normalizer, so a declaration
     /// that disagrees with it is rejected rather than silently ignored: a
-    /// profile must never claim a stdout shape Yardlet will not honor.
+    /// profile must never claim a stdout shape AgentOS will not honor.
     pub fn validate_output_format(&self, worker_id: &str) -> Result<(), String> {
         let Some(declared) = self.output_format.as_deref().map(str::trim) else {
             return Ok(());
@@ -2719,20 +2719,20 @@ pub struct RunResult {
     #[serde(default)]
     pub compact_summary: String,
     /// Per-criterion verdict from a review/verify task — the structured
-    /// quality signal Yardlet records instead of trusting prose (docs/skills.md).
+    /// quality signal AgentOS records instead of trusting prose (docs/skills.md).
     /// Empty for build tasks; populated by reviewer-role runs.
     #[serde(default)]
     pub verdict: Vec<Verdict>,
-    /// Reusable lessons this run proposes (harness learning loop, H4). Yardlet
+    /// Reusable lessons this run proposes (harness learning loop, H4). AgentOS
     /// records them; the worker never writes canonical state itself.
     #[serde(default)]
     pub harness_suggestions: Vec<HarnessSuggestion>,
     /// Follow-up tasks this run PROPOSES for the queue (propose -> ingest). The
     /// worker authors intent here instead of editing `.agents/work-queue.yaml`;
-    /// Yardlet assigns ids/priority and is the sole writer of the queue.
+    /// AgentOS assigns ids/priority and is the sole writer of the queue.
     #[serde(default)]
     pub follow_up_tasks: Vec<FollowUpTask>,
-    /// Durable evidence proposals authored by the worker. Yardlet validates
+    /// Durable evidence proposals authored by the worker. AgentOS validates
     /// exact task/attempt/producer linkage and writes canonical declarations.
     #[serde(default)]
     pub artifacts: Vec<ArtifactProposal>,
@@ -2870,7 +2870,7 @@ pub struct Artifact {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceOwnership {
-    Yardlet,
+    AgentOS,
     Worker,
     User,
     External,
@@ -3321,7 +3321,7 @@ pub struct ResourceActionReceipt {
 }
 
 /// A follow-up task a worker PROPOSES in its result (propose -> ingest). A
-/// strict subset of the planner `PlanTask`: the worker authors intent; Yardlet
+/// strict subset of the planner `PlanTask`: the worker authors intent; AgentOS
 /// assigns `id`, `state`, and `priority` and stays the sole writer of the
 /// queue. `reason` is the audit trail (why this follow-up exists). Every field
 /// defaults so a malformed entry never crashes the whole result parse — empty
@@ -3355,8 +3355,8 @@ pub struct FollowUpTask {
     #[serde(default)]
     pub required_capabilities: Vec<String>,
     /// If set, this follow-up is a HUMAN DECISION (a choice/approval only the
-    /// user can make), not work a worker can do unattended. Yardlet ingests it
-    /// as `NeedsUser` with this text as the seeded question, and `yardlet answer`
+    /// user can make), not work a worker can do unattended. AgentOS ingests it
+    /// as `NeedsUser` with this text as the seeded question, and `agentos answer`
     /// resolves it — instead of the decision being mis-filed as a fake
     /// `required_capabilities` entry that would park the task `Blocked` with no
     /// clean resolver. Reserve `required_capabilities` for a worker's
@@ -3370,7 +3370,7 @@ pub struct FollowUpTask {
     /// append after them. For a HARD "run before X" guarantee use `runs_before`.
     #[serde(default)]
     pub insert: String,
-    /// Ids of existing queued tasks that must WAIT for this new one: Yardlet
+    /// Ids of existing queued tasks that must WAIT for this new one: AgentOS
     /// injects a dependency so each named task depends on this task (true
     /// "insert between"). Self-references, unknown ids, and entries that would
     /// form a dependency cycle are dropped.
@@ -3409,9 +3409,9 @@ pub enum TurnRole {
     User,
 }
 
-/// One turn in a task's `needs_user` conversation. Yardlet is the sole writer:
+/// One turn in a task's `needs_user` conversation. AgentOS is the sole writer:
 /// the worker authors its message via `question_for_user`, the user replies via
-/// `yardlet answer`, and the core records both here.
+/// `agentos answer`, and the core records both here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
     pub role: TurnRole,
@@ -4041,7 +4041,7 @@ pub struct ResolvedDependencyOutput {
     /// Normalized repository-relative destination used in every downstream
     /// worktree.
     pub path: String,
-    /// Digest calculated by Yardlet core from snapshot bytes.
+    /// Digest calculated by AgentOS core from snapshot bytes.
     pub content_digest: String,
     /// One normal filename under the source run's core-owned snapshot folder.
     pub snapshot_file: String,
@@ -4115,8 +4115,8 @@ delivery: auto
         let serialized = yaml::to_string(&automatic).unwrap();
         assert!(serialized.contains("delivery: auto"));
 
-        let template: YardConfig =
-            yaml::from_str(include_str!("../templates/agents/yardlet.yaml")).unwrap();
+        let template: AgentConfig =
+            yaml::from_str(include_str!("../templates/agents/agentos.yaml")).unwrap();
         assert!(!template.git_finish.auto_push);
         assert_eq!(template.git_finish.delivery, GitFinishDelivery::Direct);
     }
@@ -4165,7 +4165,7 @@ delivery: auto
     #[test]
     fn worker_harness_declaration_is_optional_and_never_written_when_absent() {
         // V010-006: a workspace written before declarations existed keeps
-        // parsing, and Yardlet does not start persisting an empty block.
+        // parsing, and AgentOS does not start persisting an empty block.
         let legacy: WorkersFile = crate::yaml::from_str(
             "schema_version: 1\nworkers:\n  - id: fixture\n    invocation: {command: fixture}\n",
         )
@@ -4321,7 +4321,7 @@ delivery: auto
                 .expect_err("an unsupported workers.yaml schema_version must fail closed");
             assert_eq!(
                 error,
-                format!("this yardlet supports workers.yaml schema_version 1, found {version}")
+                format!("this agentos supports workers.yaml schema_version 1, found {version}")
             );
         }
 

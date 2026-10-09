@@ -1,5 +1,5 @@
 //! V010-006: a generic worker declares the SHAPE of its stdout
-//! (`invocation.output_format`) and Yardlet normalizes against that
+//! (`invocation.output_format`) and AgentOS normalizes against that
 //! declaration instead of a hard-coded worker id.
 //!
 //! What only a real process can prove, and what this file is for:
@@ -34,7 +34,7 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "yardlet-output-format-{label}-{}-{nonce}",
+            "agentos-output-format-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -241,7 +241,7 @@ exit 64
     fs::set_permissions(path, permissions).unwrap();
 }
 
-/// (a) A declared `json` worker that never wrote result.json: Yardlet recovers
+/// (a) A declared `json` worker that never wrote result.json: AgentOS recovers
 /// the LAST result-shaped document from its captured stdout, keeps the worker's
 /// exact bytes, and stamps the recovery everywhere the run is read.
 #[test]

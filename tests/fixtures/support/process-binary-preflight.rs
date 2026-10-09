@@ -36,8 +36,8 @@ pub fn preflight_process_binary(binary: &Path, required: &[CliCapability]) -> Re
         "process binary capability preflight failed\n\
          target binary: {}\n\
          missing required CLI capability(s): {}\n\
-         The target Yardlet build artifact may be older than the process test source.\n\
-         Run cargo clean -p yardlet, rebuild with cargo build --bin yardlet, confirm with {} {}, then retry. Process fixture body was not started.",
+         The target AgentOS build artifact may be older than the process test source.\n\
+         Run cargo clean -p agentos, rebuild with cargo build --bin agentos, confirm with {} {}, then retry. Process fixture body was not started.",
         binary.display(),
         missing.join(", "),
         binary.display(),

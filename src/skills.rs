@@ -132,7 +132,7 @@ fn builtin_files_for(name: &str) -> Option<Vec<(String, String)>> {
         files.push(("LICENSE.txt".into(), SUPERPOWERS_LICENSE.into()));
     }
     files.push((
-        ".yardlet-managed.yaml".into(),
+        ".agentos-managed.yaml".into(),
         format!(
             "schema_version: 1\nlibrary: {}\nid: {}\nname: {}\nlayer: {}\nslot: {}\nactivation: {:?}\nsource: {}\ncommit: {}\nsource_path: {}\nlicense: {}\nlicense_blob: {}\n",
             manifest.library,
@@ -161,7 +161,7 @@ pub fn ensure_builtin_names(ws: &Workspace, names: &[String]) -> Result<Vec<Stri
             SUPERPOWERS_LICENSE.into(),
         ),
     ];
-    let _ = crate::state::place_skill_files_no_clobber(ws, ".yardlet-managed-bundle", &metadata)?;
+    let _ = crate::state::place_skill_files_no_clobber(ws, ".agentos-managed-bundle", &metadata)?;
     let mut added = Vec::new();
     let wanted: BTreeSet<_> = names.iter().cloned().collect();
     for name in wanted {
@@ -1102,7 +1102,7 @@ pub fn scores(ws: &Workspace) -> Vec<SkillScore> {
 /// durability it never established (issue #104).
 ///
 /// Fallible on purpose, with no infallible companion. The version that swallowed
-/// the failure into an empty vector is what let `yardlet skill commit` announce
+/// the failure into an empty vector is what let `agentos skill commit` announce
 /// "Every learned harness asset is already in git" having checked nothing, and a
 /// caller cannot make that mistake against a `Result` it has to handle.
 pub fn harness_asset_durability(ws: &Workspace) -> Result<Vec<String>, String> {
@@ -1174,7 +1174,7 @@ pub fn harness_asset_durability(ws: &Workspace) -> Result<Vec<String>, String> {
 ///
 /// Decided by the asset's own declaration, not by a sibling marker file. The
 /// marker proxy was wrong three ways (issue #103): a `source: created` skill
-/// carries no marker, `yardlet init` scaffolds `planning-gate` without one
+/// carries no marker, `agentos init` scaffolds `planning-gate` without one
 /// (`src/init.rs`), and a DELETED managed skill loses its marker along with the
 /// directory — so its removal would have been committed as "track learned".
 /// `write_skill` stamps `source:` on everything it writes, so the front matter
@@ -1454,7 +1454,7 @@ fn write_skill(
 
 /// Record a worker-proposed skill (H4 / docs/skills.md S3): a run's
 /// `harness_suggestions` entry of kind "skill" becomes a real
-/// `.agents/skills/<slug>/SKILL.md` — the worker proposed the *content*, Yardlet
+/// `.agents/skills/<slug>/SKILL.md` — the worker proposed the *content*, AgentOS
 /// (the deterministic core) does the writing. Marked `source: learned` so the
 /// score loop can later judge and prune it. Returns the slug if newly written.
 /// Skips if a skill of that name is already present (no clobber).
@@ -1462,7 +1462,7 @@ pub fn record_suggested_skill(ws: &Workspace, title: &str, content: &str) -> Opt
     write_skill(ws, title, title, content, "learned")
 }
 
-/// Outcome of explicitly authoring a skill (`yardlet skill create` / `apply`).
+/// Outcome of explicitly authoring a skill (`agentos skill create` / `apply`).
 pub enum AuthorOutcome {
     /// Newly written; carries the installed slug.
     Written(String),
@@ -1473,7 +1473,7 @@ pub enum AuthorOutcome {
 }
 
 /// Install an explicitly authored skill (docs/skills.md S2/S3 `create`/`apply`).
-/// The worker authored the content; Yardlet (the deterministic core) is the sole
+/// The worker authored the content; AgentOS (the deterministic core) is the sole
 /// writer. Tagged `source: created` — NOT `learned` — so it is user-chosen and
 /// never auto-pruned (it persists like a library equip until `unequip`).
 pub fn install_authored_skill(
@@ -1515,10 +1515,10 @@ pub fn record_run_suggestions(
 /// (harness.md H4, the rule half of the learning loop). A rule becomes
 /// `.agents/rules/learned-<slug>.md` — plain markdown H1 inlines into every
 /// packet (no frontmatter; the `learned-` prefix marks provenance). The worker
-/// proposed it; Yardlet (the deterministic core) writes it. No clobber. Returns
+/// proposed it; AgentOS (the deterministic core) writes it. No clobber. Returns
 /// the slugs written. Unlike learned skills these are not auto-pruned (an
 /// always-on rule has no per-task attribution to score), but they are
-/// reversible (git) and surfaced by `yardlet harness review`.
+/// reversible (git) and surfaced by `agentos harness review`.
 pub fn record_run_rules(
     ws: &Workspace,
     suggestions: &[crate::schemas::HarnessSuggestion],
@@ -1548,7 +1548,7 @@ pub fn record_run_rules(
 }
 
 /// Learned rule files (`.agents/rules/learned-*.md`) in this workspace, for
-/// `yardlet harness review`. Returns bare names (without the `.md`).
+/// `agentos harness review`. Returns bare names (without the `.md`).
 pub fn learned_rules(ws: &Workspace) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(ws.agents_dir().join("rules"))
         .into_iter()
@@ -1652,15 +1652,15 @@ mod harness_commit_tests {
             .unwrap();
             if managed {
                 std::fs::write(
-                    skills.join(slug).join(".yardlet-managed.yaml"),
+                    skills.join(slug).join(".agentos-managed.yaml"),
                     "source: library\n",
                 )
                 .unwrap();
             }
         }
-        std::fs::create_dir_all(skills.join(".yardlet-managed-bundle")).unwrap();
+        std::fs::create_dir_all(skills.join(".agentos-managed-bundle")).unwrap();
         std::fs::write(
-            skills.join(".yardlet-managed-bundle/manifest.yaml"),
+            skills.join(".agentos-managed-bundle/manifest.yaml"),
             "bundle: true\n",
         )
         .unwrap();
@@ -1682,7 +1682,7 @@ mod harness_commit_tests {
                 ".agents/rules/learned-thing.md".to_string(),
                 ".agents/skills/learned-one/SKILL.md".to_string(),
             ],
-            "only learned assets belong in a `yardlet skill commit`"
+            "only learned assets belong in a `agentos skill commit`"
         );
 
         let _ = std::fs::remove_dir_all(ws.root);
@@ -1744,7 +1744,7 @@ mod harness_commit_tests {
         )
         .unwrap();
 
-        // What `yardlet init` scaffolds: no marker AND no source field at all.
+        // What `agentos init` scaffolds: no marker AND no source field at all.
         std::fs::create_dir_all(skills.join("planning-gate")).unwrap();
         std::fs::write(
             skills.join("planning-gate/SKILL.md"),
@@ -1783,7 +1783,7 @@ mod harness_commit_tests {
         )
         .unwrap();
         std::fs::write(
-            skills.join("equipped/.yardlet-managed.yaml"),
+            skills.join("equipped/.agentos-managed.yaml"),
             "source: library\n",
         )
         .unwrap();
@@ -2223,13 +2223,13 @@ mod tests {
                 .agents_dir()
                 .join("skills")
                 .join(&core)
-                .join(".yardlet-managed.yaml")
+                .join(".agentos-managed.yaml")
                 .is_file());
         }
         assert!(!installed_set.contains("webapp-testing"));
         assert!(fresh_ws
             .agents_dir()
-            .join("skills/.yardlet-managed-bundle/manifest.yaml")
+            .join("skills/.agentos-managed-bundle/manifest.yaml")
             .is_file());
         assert!(ensure_builtin_core(&fresh_ws).unwrap().is_empty());
 
@@ -2244,7 +2244,7 @@ mod tests {
         assert!(!collision
             .parent()
             .unwrap()
-            .join(".yardlet-managed.yaml")
+            .join(".agentos-managed.yaml")
             .exists());
         crate::init::ensure_initialized(&existing_root).unwrap();
         assert_eq!(std::fs::read_to_string(&collision).unwrap(), "USER OWNED\n");
@@ -2710,7 +2710,7 @@ mod tests {
                 content: "do it".into(),
             },
         ];
-        // no yard.yaml loaded -> auto_skill defaults off via unwrap_or(false)
+        // Without a workspace config, auto_skill defaults off via unwrap_or(false).
         assert!(record_run_suggestions(&ws, &sugg).is_empty());
         let _ = std::fs::remove_dir_all(&ws_root);
     }

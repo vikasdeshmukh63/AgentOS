@@ -1,6 +1,6 @@
 //! End-to-end PTY integration for the TUI planning flow (YARD-014).
 //!
-//! A single isolated `yardlet` process, driven over a real pseudo-terminal,
+//! A single isolated `agentos` process, driven over a real pseudo-terminal,
 //! must reproduce the whole intended shape in one run:
 //!
 //!   1. A slow recovery + worker `--version` probe keeps the first frames on the
@@ -10,7 +10,7 @@
 //!   2. A planning request is submitted from the multi-line New Work input with
 //!      Ctrl+S; when the (fixture) planner finishes, the app transitions to the
 //!      planning review screen on its own.
-//!   3. With `language: ko` every Yardlet-owned label on that review screen is
+//!   3. With `language: ko` every AgentOS-owned label on that review screen is
 //!      Korean.
 //!   4. A multi-line revision is edited on the review screen with Enter=newline
 //!      and submitted with Ctrl+S; the verbatim two-line request (newline and
@@ -35,7 +35,7 @@ mod common;
 
 use common::{drain, open_pty, recent, seen, wait_for_marker};
 
-/// Slow-recovery injection (debug + `YARDLET_PROCESS_FIXTURE=1` only). Big enough
+/// Slow-recovery injection (debug + `AGENTOS_PROCESS_FIXTURE=1` only). Big enough
 /// that the loading screen is unmistakably shown before Home, small enough to
 /// keep the test quick.
 const RECOVERY_DELAY_MS: u64 = 800;
@@ -127,10 +127,10 @@ fn slow_startup_then_ko_review_then_multiline_revision_over_one_pty() {
         .unwrap();
     assert!(
         init.status.success(),
-        "yardlet init failed: {}",
+        "agentos init failed: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let config_path = root.join(".agents/yardlet.yaml");
+    let config_path = root.join(".agents/agentos.yaml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("language: auto", "language: ko");
@@ -181,9 +181,9 @@ fn slow_startup_then_ko_review_then_multiline_revision_over_one_pty() {
     let child = Command::new(&binary)
         .current_dir(&root)
         .env("TERM", "xterm-256color")
-        .env("YARDLET_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
         .env(
-            "YARDLET_FIXTURE_RECOVERY_DELAY_MS",
+            "AGENTOS_FIXTURE_RECOVERY_DELAY_MS",
             RECOVERY_DELAY_MS.to_string(),
         )
         .stdin(stdin)
@@ -201,7 +201,7 @@ fn slow_startup_then_ko_review_then_multiline_revision_over_one_pty() {
     wait_for_marker(
         &mut master,
         &mut sink,
-        "Yardlet 안전 시작 중",
+        "AgentOS 안전 시작 중",
         Duration::from_secs(3),
     );
 

@@ -33,7 +33,7 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "yardlet-transport-matrix-{label}-{}-{nonce}",
+            "agentos-transport-matrix-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -91,7 +91,7 @@ impl Fixture {
         .unwrap();
     }
 
-    fn yardlet(&self, args: &[&str]) -> Output {
+    fn agentos(&self, args: &[&str]) -> Output {
         command(&self.root, &self.binary, args)
     }
 
@@ -277,7 +277,7 @@ fn file_prompt_transport_matches_stdin_transport_across_task_result_and_continua
         file_first.join("seen-packet-body").is_file()
     );
 
-    // The packet lives in the run directory Yardlet already owns, so nothing
+    // The packet lives in the run directory AgentOS already owns, so nothing
     // else has to clean it up, and the worker read exactly that file.
     for (run, seen_path, seen_body, seen_stdin) in [
         (
@@ -353,7 +353,7 @@ fn stdin_transport_tolerates_a_worker_that_closes_stdin_unread() {
         "      supports_noninteractive: true\n      output_contract: files\n      version_args: [probe]\n      sandbox_args: ['--fixture-sandbox']\n      args: [ignored-stdin, '{run_dir}']\n",
     );
 
-    let output = fixture.yardlet(&["run", "--task", "YARD-001", "--execute"]);
+    let output = fixture.agentos(&["run", "--task", "YARD-001", "--execute"]);
     assert!(
         output.status.success(),
         "an unread stdin must not fail the run\nstdout:\n{}\nstderr:\n{}",
@@ -391,7 +391,7 @@ fn unparseable_result_is_recorded_as_a_typed_failure_with_raw_streams_preserved(
         "      supports_noninteractive: true\n      output_contract: files\n      version_args: [probe]\n      sandbox_args: ['--fixture-sandbox']\n      args: [broken-result, '{run_dir}']\n",
     );
 
-    let _ = fixture.yardlet(&["run", "--task", "YARD-001", "--execute"]);
+    let _ = fixture.agentos(&["run", "--task", "YARD-001", "--execute"]);
     let run = fixture.latest_run();
 
     assert_ne!(

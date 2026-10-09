@@ -1,6 +1,6 @@
 //! Worker packet compiler.
 //!
-//! Yardlet compiles one canonical task contract into a worker-specific packet.
+//! AgentOS compiles one canonical task contract into a worker-specific packet.
 //! Codex packets are execution-oriented; Claude Code packets lean toward
 //! planning/review. Both prefer anchors over pasted content to save tokens.
 
@@ -70,7 +70,7 @@ pub fn compile_scout(inputs: &ScoutPacketInputs<'_>) -> Result<String> {
         .collect::<Vec<_>>()
         .join(" -> ");
     let mut packet = String::new();
-    packet.push_str("# Yardlet queue-isolated capability scout\n\n");
+    packet.push_str("# AgentOS queue-isolated capability scout\n\n");
     packet.push_str(&format!("intent_id: {}\n", inputs.intent_id));
     packet.push_str(&format!("request_digest: {}\n", inputs.request_digest));
     packet.push_str(&format!(
@@ -303,7 +303,7 @@ fn role_guidance(role: &str) -> &'static str {
              `status` to `partial` and PROPOSE the fix in `follow_up_tasks`: one \
              implementation task scoped to the failing findings, with `acceptance` \
              listing exactly what must change (a builder, not you, will do it). \
-             Yardlet runs that fix, then re-runs THIS review to verify, with bounded \
+             AgentOS runs that fix, then re-runs THIS review to verify, with bounded \
              retries. If you cannot name a concrete fix, set `status` to `needs_user` \
              and ask instead.\n\
              - Do not rewrite the code yourself; only fix something if it is trivial \
@@ -361,7 +361,7 @@ pub fn load_role_notes(root: &std::path::Path, role: &str) -> String {
 // level 1, deeper files in the skill folder are level 2).
 //
 // A1 (docs/absorption.md): a repo that already has agent assets gets them
-// as harness the moment Yardlet runs. Discovery is read-only (nothing is
+// as harness the moment AgentOS runs. Discovery is read-only (nothing is
 // copied into .agents/), and projection is worker-aware: a worker that
 // natively consumes a source (claude-code reads CLAUDE.md and
 // .claude/skills; codex reads AGENTS.md) must not receive it twice.
@@ -386,7 +386,7 @@ pub struct HarnessSkill {
     /// Repo-relative SKILL.md path (".agents/skills/x/SKILL.md" or borrowed).
     pub path: String,
     pub native_to: Vec<String>,
-    /// `core` / `overlay` for Yardlet-managed built-ins. User-owned and
+    /// `core` / `overlay` for AgentOS-managed built-ins. User-owned and
     /// discovered skills are `None` and remain visible under legacy behavior.
     pub managed_layer: Option<String>,
 }
@@ -400,7 +400,7 @@ pub struct HarnessMemory {
     /// Repo-relative anchor (".agents/memory/x.md").
     pub path: String,
     /// Landmark paths this fact depends on (frontmatter `look_at:`). Used by
-    /// `yardlet memory` to flag a doc as possibly stale when a landmark changed
+    /// `agentos memory` to flag a doc as possibly stale when a landmark changed
     /// in git after the doc did. Empty = no staleness signal.
     pub look_at: Vec<String>,
 }
@@ -584,7 +584,7 @@ impl NativeHarnessSources {
         readers(&self.skill_dirs, path)
     }
 
-    /// Declared sources Yardlet does not already scan, sorted for determinism.
+    /// Declared sources AgentOS does not already scan, sorted for determinism.
     fn extra_rule_files<'a>(&'a self, known: &[&str]) -> Vec<&'a (String, Vec<String>)> {
         extras(&self.rule_files, known)
     }
@@ -651,7 +651,7 @@ pub fn native_harness_sources(ws: &crate::state::Workspace) -> NativeHarnessSour
         .unwrap_or_else(|_| NativeHarnessSources::builtin())
 }
 
-/// Discover the workspace harness. Yardlet-native `.agents/` sources always
+/// Discover the workspace harness. AgentOS-native `.agents/` sources always
 /// load; with `discovery` on (the default), assets the repo already has for
 /// other agent tooling join in, in precedence order — `.agents` first, and a
 /// canonical-path dedup so symlinked copies (e.g. CLAUDE.md -> AGENTS.md)
@@ -699,7 +699,7 @@ pub fn discover_harness(
         });
     };
 
-    // 1. Yardlet-native rules (always on).
+    // 1. AgentOS-native rules (always on).
     let rules_dir = root.join(crate::state::STATE_DIR).join("rules");
     let mut files: Vec<_> = std::fs::read_dir(&rules_dir)
         .into_iter()
@@ -716,9 +716,9 @@ pub fn discover_harness(
         push_rule(&mut h, &mut seen_rule_paths, f, origin, &readers);
     }
 
-    // 1b. Yardlet-native skills (always on). Scanned last-in-precedence order
+    // 1b. AgentOS-native skills (always on). Scanned last-in-precedence order
     // below; the source list is assembled first so a declared directory that
-    // duplicates one Yardlet already scans merges instead of scanning twice.
+    // duplicates one AgentOS already scans merges instead of scanning twice.
     let mut skill_sources: Vec<(std::path::PathBuf, String, Vec<String>)> = vec![(
         root.join(crate::state::STATE_DIR).join("skills"),
         ".agents/skills".to_string(),
@@ -866,7 +866,7 @@ fn collect_skills(h: &mut Harness, dir: &std::path::Path, prefix: &str, native_t
             description: frontmatter_field(&text, "description").unwrap_or_default(),
             path: format!("{prefix}/{dir_name}/SKILL.md"),
             native_to: native_to.iter().map(|s| s.to_string()).collect(),
-            managed_layer: std::fs::read_to_string(entry.path().join(".yardlet-managed.yaml"))
+            managed_layer: std::fs::read_to_string(entry.path().join(".agentos-managed.yaml"))
                 .ok()
                 .and_then(|marker| {
                     marker.lines().find_map(|line| {
@@ -996,9 +996,9 @@ pub fn compile(inputs: &PacketInputs) -> String {
     let role = role_for(&inputs.task.kind);
     let mut p = String::new();
 
-    p.push_str(&format!("# Yardlet task packet: {}\n\n", inputs.task.id));
+    p.push_str(&format!("# AgentOS task packet: {}\n\n", inputs.task.id));
     p.push_str(&format!(
-        "You are a hidden Yardlet worker ({}) acting as the {role}. Do the work below and \
+        "You are a hidden AgentOS worker ({}) acting as the {role}. Do the work below and \
          leave structured artifacts. Console prose is not enough.\n\n",
         inputs.worker_id
     ));
@@ -1205,7 +1205,7 @@ pub fn compile(inputs: &PacketInputs) -> String {
          also stop and report what you need instead of trying to bypass it.\n\n",
     );
     p.push_str(
-        "Yardlet itself captures change evidence around the worker run. Do not initialize a \
+        "AgentOS itself captures change evidence around the worker run. Do not initialize a \
          repository, create commits, or otherwise reshape version-control state just to satisfy \
          validation; make the requested file changes and write the required artifacts.\n\n",
     );
@@ -1239,10 +1239,10 @@ pub fn compile(inputs: &PacketInputs) -> String {
     p.push_str("## Proposing follow-up work\n\n");
     p.push_str(
         "If you find adjacent work worth doing later, do NOT edit \
-         `.agents/work-queue.yaml` \u{2014} Yardlet owns the queue. PROPOSE it in `result.json` \
+         `.agents/work-queue.yaml` \u{2014} AgentOS owns the queue. PROPOSE it in `result.json` \
          under `follow_up_tasks`: each entry needs a `title` and a `reason` (why it exists), \
          plus optional `kind`, `risk`, `allowed_scope`, `acceptance`, `skills`, `depends_on`, \
-         `preferred_worker`, `required_capabilities`, `decision_question`. Yardlet assigns the id \
+         `preferred_worker`, `required_capabilities`, `decision_question`. AgentOS assigns the id \
          and priority, validates, dedups, and enqueues it as a tracked candidate. Stay within \
          THIS task's scope; a follow-up is a candidate for later, not license to expand the \
          current task.\n\n",
@@ -1252,7 +1252,7 @@ pub fn compile(inputs: &PacketInputs) -> String {
          routing to a worker that declares them. A follow-up that is really a HUMAN DECISION \u{2014} \
          a choice or approval only the user can make (pick A vs B, sign off on a direction) \u{2014} \
          is NOT a capability: never invent one like `user-creative-direction-approval` for it. \
-         Instead set `decision_question` to what to ask; Yardlet ingests the follow-up as \
+         Instead set `decision_question` to what to ask; AgentOS ingests the follow-up as \
          `needs_user` with that question and resumes it once the user answers, instead of parking \
          it Blocked with no resolver. Use `required_capabilities` only for a genuine tool / asset \
          / license gap a worker lacks (there Blocked-until-a-worker-is-added is the right \
@@ -1262,7 +1262,7 @@ pub fn compile(inputs: &PacketInputs) -> String {
         "If a follow-up must run BEFORE work already queued (e.g. you hit a capability \
          ceiling and a worker with the right `required_capabilities`/`preferred_worker` should \
          take over first), set its `runs_before` to the ids of the existing tasks that depend on \
-         it \u{2014} Yardlet makes those tasks wait for it (a true \"insert between\"). For a softer \
+         it \u{2014} AgentOS makes those tasks wait for it (a true \"insert between\"). For a softer \
          \"just run this next\" nudge without hard dependencies, set `insert: \"next\"`.\n\n",
     );
 
@@ -1324,7 +1324,7 @@ pub fn compile(inputs: &PacketInputs) -> String {
 /// Compile a planning-gate packet: turn a raw natural-language request into a
 /// structured plan written to `planning-result.json` in the run directory.
 ///
-/// The worker authors only proposal content. Yardlet records an immutable
+/// The worker authors only proposal content. AgentOS records an immutable
 /// draft revision after explicit acceptance, and active intent/queue snapshots
 /// only after explicit confirmation. The worker therefore only needs write
 /// access to the run directory.
@@ -1335,8 +1335,8 @@ pub struct PlanningGitPolicy {
     pub push_target_configured: bool,
 }
 
-impl From<&crate::schemas::YardConfig> for PlanningGitPolicy {
-    fn from(config: &crate::schemas::YardConfig) -> Self {
+impl From<&crate::schemas::AgentConfig> for PlanningGitPolicy {
+    fn from(config: &crate::schemas::AgentConfig) -> Self {
         Self {
             auto_commit: config.auto_commit,
             auto_push: config.git_finish.auto_push,
@@ -1360,9 +1360,9 @@ pub fn compile_planning(
     git_policy: PlanningGitPolicy,
 ) -> String {
     let mut p = String::new();
-    p.push_str("# Yardlet planning gate\n\n");
+    p.push_str("# AgentOS planning gate\n\n");
     p.push_str(
-        "You are a hidden Yardlet planning worker. Turn the request below into a bounded, \
+        "You are a hidden AgentOS planning worker. Turn the request below into a bounded, \
          checkable replacement proposal. Do NOT implement anything in this run and do not \
          write active intent or queue state.\n\n",
     );
@@ -1456,7 +1456,7 @@ pub fn compile_planning(
         },
     ));
     p.push_str(
-        "- Git integration and configured exact-ref push are Yardlet core/author-session responsibilities, not worker actions. Yardlet has no PR-create or merge policy in this contract.\n\
+        "- Git integration and configured exact-ref push are AgentOS core/author-session responsibilities, not worker actions. AgentOS has no PR-create or merge policy in this contract.\n\
          - Do not make commit, push, PR creation, or merge a worker-verifiable intent or task acceptance criterion. Review criteria must be satisfiable from the workspace before author-session delivery.\n\
          - When delivery is explicitly requested, make the worker-verifiable criterion prepare a PR body or exact author-session commands in the handoff; keep the external delivery responsibility outside worker acceptance.\n\n",
     );
@@ -1504,7 +1504,7 @@ pub fn compile_planning(
          name in that task's `skills` so the worker reads it before starting.\n\
          - If any task is high-risk or the plan has 3+ tasks, END with a review-kind \
          task that verifies the intent's acceptance criteria against the workspace \
-         (per-criterion pass/fail). If you omit it, Yardlet appends one.\n\
+         (per-criterion pass/fail). If you omit it, AgentOS appends one.\n\
          - Default model and effort to \"auto\" (let the chosen worker decide). Set them \
          only when a task clearly needs a stronger or cheaper model, or more or less \
          reasoning. Effort levels: minimal|low|medium|high (or \"auto\").\n\
@@ -1545,7 +1545,7 @@ pub fn compile_planning(
 
 /// Compile a skill-authoring packet (docs/skills.md S2/S3). A researcher-role
 /// worker studies the subject against this repo and writes a candidate skill to
-/// `skill-result.json` in the run dir; Yardlet (not the worker) installs it. This
+/// `skill-result.json` in the run dir; AgentOS (not the worker) installs it. This
 /// run touches no canonical intent/queue state — the queue isolation S3 wanted.
 /// `mode` is `"research"` (propose name + rationale, install nothing) or
 /// `"create"` (author the named skill for installation).
@@ -1559,9 +1559,9 @@ pub fn compile_skill(
     worker_id: &str,
 ) -> String {
     let mut p = String::new();
-    p.push_str("# Yardlet skill authoring\n\n");
+    p.push_str("# AgentOS skill authoring\n\n");
     p.push_str(&format!(
-        "You are a hidden Yardlet worker ({worker_id}) acting as the researcher. Author ONE \
+        "You are a hidden AgentOS worker ({worker_id}) acting as the researcher. Author ONE \
          reusable skill \u{2014} a portable SKILL.md (frontmatter + a concise procedure) \u{2014} \
          for THIS repository. Do NOT implement repo changes in this run; your only deliverable \
          is the skill draft written to the result file.\n\n",
@@ -1631,7 +1631,7 @@ pub fn compile_skill(
 }
 
 /// Compile a one-off project-memory authoring packet. The worker writes only a
-/// draft JSON file in the isolated run directory; Yardlet core later writes the
+/// draft JSON file in the isolated run directory; AgentOS core later writes the
 /// canonical `.agents/memory` docs through `state.rs`.
 pub fn compile_memory(
     mode: &str,
@@ -1643,12 +1643,12 @@ pub fn compile_memory(
     targets: &[MemoryRefreshTarget],
 ) -> String {
     let mut p = String::new();
-    p.push_str("# Yardlet project-memory drafting\n\n");
+    p.push_str("# AgentOS project-memory drafting\n\n");
     p.push_str(&format!(
-        "You are a hidden Yardlet worker ({worker_id}) acting as the researcher. Draft \
+        "You are a hidden AgentOS worker ({worker_id}) acting as the researcher. Draft \
          project-memory documents for THIS repository. Do NOT edit `.agents/memory/`, \
          `index.yaml`, README files, or any canonical state. Your only deliverable is \
-         `{run_dir_rel}/memory-result.json`; Yardlet core writes canonical memory through \
+         `{run_dir_rel}/memory-result.json`; AgentOS core writes canonical memory through \
          `src/state.rs` after parsing your draft.\n\n"
     ));
 
@@ -1678,7 +1678,7 @@ pub fn compile_memory(
             p.push_str(
                 "Refresh ONLY the target slugs below. Read each target file and its `look_at` \
                  landmarks before drafting. Keep each returned document's `slug` exactly as \
-                 listed so Yardlet can update only the selected canonical file.\n\n",
+                 listed so AgentOS can update only the selected canonical file.\n\n",
             );
             for t in targets {
                 p.push_str(&format!(
@@ -1734,7 +1734,7 @@ pub fn compile_memory_scout(
     run_dir_rel: &str,
 ) -> String {
     format!(
-        "# Yardlet read-only memory scout\n\nYou are a hidden Yardlet worker ({worker_id}) acting as the `{topic}` scout. Inspect the isolated workspace copy for {brief}. The copy is disposable and cannot mutate the live project or canonical `.agents` state. Do not attempt to edit project files. Write exactly one independent report to `{run_dir_rel}/scout-result.json`.\n\nReturn the same JSON shape as project memory drafting:\n\n{MEMORY_SCHEMA_HINT}\nOnly include durable, non-obvious facts. `look_at` paths must be normalized repo-relative paths. An empty `documents` array is valid when no candidate has durable value.\n"
+        "# AgentOS read-only memory scout\n\nYou are a hidden AgentOS worker ({worker_id}) acting as the `{topic}` scout. Inspect the isolated workspace copy for {brief}. The copy is disposable and cannot mutate the live project or canonical `.agents` state. Do not attempt to edit project files. Write exactly one independent report to `{run_dir_rel}/scout-result.json`.\n\nReturn the same JSON shape as project memory drafting:\n\n{MEMORY_SCHEMA_HINT}\nOnly include durable, non-obvious facts. `look_at` paths must be normalized repo-relative paths. An empty `documents` array is valid when no candidate has durable value.\n"
     )
 }
 
@@ -1747,7 +1747,7 @@ const SKILL_SCHEMA_HINT: &str = r#"```json
 }
 ```
 
-Do NOT put YAML frontmatter inside `body` — Yardlet writes the `name`/`description`
+Do NOT put YAML frontmatter inside `body` — AgentOS writes the `name`/`description`
 frontmatter itself. `body` is just the Markdown procedure.
 "#;
 
@@ -1849,7 +1849,7 @@ const RESULT_SCHEMA_HINT: &str = r#"```json
       "kind": "implementation|review|...", "risk": "low|medium|high",
       "acceptance": ["..."], "allowed_scope": ["..."], "depends_on": [],
       "preferred_worker": "", "required_capabilities": [],
-      "decision_question": "<set ONLY if this is a human choice/approval; Yardlet asks the user, leave \"\" otherwise>",
+      "decision_question": "<set ONLY if this is a human choice/approval; AgentOS asks the user, leave \"\" otherwise>",
       "insert": "end|next", "runs_before": [] }
   ]
 }
@@ -1864,7 +1864,7 @@ only when you learned something reusable about THIS repo. A "skill" suggestion
 should be a self-contained procedure (how to do a recurring task in this repo)
 that a future worker could follow; a "rule" is a short always-apply constraint.
 Leave `follow_up_tasks` empty unless you found adjacent work worth queueing for
-later; never edit `.agents/work-queue.yaml` yourself — Yardlet ingests these.
+later; never edit `.agents/work-queue.yaml` yourself — AgentOS ingests these.
 Use `needs_user` only when the question blocks acceptance. If acceptance is met,
 finish with `done` and leave non-blocking leftovers as handoff/checkpoint notes
 or `follow_up_tasks`.
@@ -1874,8 +1874,25 @@ or `follow_up_tasks`.
 mod tests {
     use super::*;
 
+    #[test]
+    fn discovers_agentos_managed_skill_marker() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-legacy-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let skill = root.join("legacy-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# Legacy skill\n").unwrap();
+        std::fs::write(skill.join(".agentos-managed.yaml"), "layer: core\n").unwrap();
+
+        let mut harness = Harness::default();
+        collect_skills(&mut harness, &root, ".agents/skills", &[]);
+
+        assert_eq!(harness.skills[0].managed_layer.as_deref(), Some("core"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A workspace laid out the way the pre-declaration code discovered it:
-    /// Yardlet-native sources plus every foreign source discovery knows about.
+    /// AgentOS-native sources plus every foreign source discovery knows about.
     fn write_legacy_harness_fixture(root: &std::path::Path) {
         std::fs::create_dir_all(root.join(".agents/rules")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills/native-skill")).unwrap();
@@ -1993,7 +2010,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A declared skills directory Yardlet never scanned before joins discovery
+    /// A declared skills directory AgentOS never scanned before joins discovery
     /// (when it exists), native to its declarer only.
     #[test]
     fn declared_native_skill_dir_joins_discovery() {
@@ -2031,7 +2048,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Declaring a directory Yardlet already scans merges the reader into that
+    /// Declaring a directory AgentOS already scans merges the reader into that
     /// source instead of scanning it a second time.
     #[test]
     fn declared_dir_already_scanned_merges_instead_of_duplicating() {
@@ -2056,7 +2073,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The layout Yardlet's own repo uses: `.claude/skills` is a symlink to
+    /// The layout AgentOS's own repo uses: `.claude/skills` is a symlink to
     /// `.agents/skills`. Both are built-in sources, so name precedence still
     /// keeps the `.agents` entry and its (empty) native set — the declaration
     /// refactor must not quietly start merging them, which would change what
@@ -2938,9 +2955,9 @@ mod tests {
     }
 
     #[test]
-    fn packet_assigns_change_evidence_to_yardlet_not_git_setup() {
+    fn packet_assigns_change_evidence_to_agentos_not_git_setup() {
         let p = packet_for("implementation", "");
-        assert!(p.contains("Yardlet itself captures change evidence around the worker run."));
+        assert!(p.contains("AgentOS itself captures change evidence around the worker run."));
         assert!(p.contains("Do not initialize a repository, create commits"));
         assert!(!p.contains("git init"));
         assert!(!p.contains("git commit"));

@@ -14,7 +14,7 @@ V010-002의 계약, 구현, 자동화 테스트, 실제 process evidence를 buil
 
 ### F-001, minor: builder dogfood 문서의 process test 수가 한 곳에서 오래된 값이다
 
-- 증거: `docs/reviews/v010-002-yardlet-on-yardlet.md:8`은 35개라고 쓰지만 같은 문서
+- 증거: `docs/reviews/v010-002-agentos-on-agentos.md:8`은 35개라고 쓰지만 같은 문서
   `:611`과 fresh integration 실행은 37개를 보고한다.
 - 영향: 실제 테스트 누락은 없고 37/37이 통과했다. 다만 문서 첫 요약만 읽으면 현재
   matrix 크기를 잘못 이해할 수 있다.
@@ -34,9 +34,9 @@ V010-002의 계약, 구현, 자동화 테스트, 실제 process evidence를 buil
 
 ## 2. 계약 기준
 
-parent SOT의 V010-002는 `/Users/zzunkie/Desktop/workspace/yard/docs/yardlet-roadmap.md:456-494`에
+parent SOT의 V010-002는 `/Users/zzunkie/Desktop/workspace/yard/docs/agentos-roadmap.md:456-494`에
 있다. 이 파일은 worktree에 투영되지 않는 ignored 문서이므로 committed dogfood 문서가
-`docs/reviews/v010-002-yardlet-on-yardlet.md:33-81`에 같은 task anchor와 parent SHA-256을
+`docs/reviews/v010-002-agentos-on-agentos.md:33-81`에 같은 task anchor와 parent SHA-256을
 투영한다. reviewer가 parent 파일을 직접 hash한 결과도 위 SHA-256과 일치했다.
 
 공유 session state contract에서는 explicit confirmation과 projection 분리를
@@ -123,7 +123,7 @@ parent SOT의 V010-002는 `/Users/zzunkie/Desktop/workspace/yard/docs/yardlet-ro
   effect 뒤의 네 실제 crash가 각각 effect 1개, completed receipt 1개, valid activation으로
   수렴했음을 기록한다.
 
-### AC-005: running queue 격리와 `yardlet goal` express path
+### AC-005: running queue 격리와 `agentos goal` express path
 
 판정: **PASS**
 
@@ -142,7 +142,7 @@ parent SOT의 V010-002는 `/Users/zzunkie/Desktop/workspace/yard/docs/yardlet-ro
   `exact_active_parity: true`를 남겼다. fixture planner marker는 생성되지 않았고 두 queue는
   fresh `run --next`에서 prepared 상태로 진입했다.
 
-### AC-006: Yardlet-on-Yardlet multi-turn dogfood와 field parity
+### AC-006: AgentOS-on-AgentOS multi-turn dogfood와 field parity
 
 판정: **PASS**
 
@@ -172,7 +172,7 @@ parent SOT의 V010-002는 `/Users/zzunkie/Desktop/workspace/yard/docs/yardlet-ro
   V010-002 process 37, 총 448개 pass, failure 0.
 - targeted `cargo test --test v010_002_conversational_planning_process -- --nocapture`:
   37 passed, 0 failed, exit 0.
-- README mirror: 두 파일의 `##` section은 같은 순서와 개수 19개, `yardlet` command row는
+- README mirror: 두 파일의 `##` section은 같은 순서와 개수 19개, `agentos` command row는
   각각 34개, `.agents/` state tree는 20개 entry가 같은 순서다. em dash grep은 둘 다
   match가 없어 exit 1이었다. 새 planning command와 explicit confirm 설명은
   `README.md:90-114`, `:249-258`, `README.ko.md:88-111`, `:235-244`에서 1:1이다.

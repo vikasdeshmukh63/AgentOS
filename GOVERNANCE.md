@@ -1,6 +1,6 @@
-# Yardlet Governance
+# AgentOS Governance
 
-Yardlet is currently a maintainer-led open source project. This document says
+AgentOS is currently a maintainer-led open source project. This document says
 who makes decisions, which files are authoritative, and how contributions move
 from proposal to release.
 
@@ -23,7 +23,7 @@ The operational access baseline and recurring audit are documented in
 
 ## Contribution lanes
 
-Yardlet uses two contribution lanes:
+AgentOS uses two contribution lanes:
 
 1. **Direct pull request:** clear bug fixes, documentation, tests, typos, and
    small internal cleanups with no new public behavior.
@@ -48,7 +48,7 @@ public issue.
   GitHub Release, and crates.io.
 - Reusable agent harness: `.agents/rules/`, `.agents/skills/`, and
   `.agents/agents/`.
-- Generated workspace state: Yardlet's typed state mechanism, never a
+- Generated workspace state: AgentOS's typed state mechanism, never a
   hand-edited `.agents/` instance.
 
 Compatibility mirrors such as `CLAUDE.md` and `.claude/` are not independent
@@ -84,7 +84,7 @@ change when a second maintainer can provide independent approval.
 
 ## Releases
 
-Yardlet follows Semantic Versioning. Before 1.0, a minor release may include a
+AgentOS follows Semantic Versioning. Before 1.0, a minor release may include a
 breaking public-contract change when it is explicitly documented.
 
 A release updates the package version and lockfile, records user-visible

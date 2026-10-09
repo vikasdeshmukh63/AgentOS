@@ -1,16 +1,16 @@
 //! One place that knows the operator asked this process to stop.
 //!
-//! Yardlet starts workers in their own process group on purpose (issue #52), so
+//! AgentOS starts workers in their own process group on purpose (issue #52), so
 //! they survive the terminal that launched them. The cost is that nothing
-//! outside Yardlet can clean one up: not the shell, whose signal goes to its own
+//! outside AgentOS can clean one up: not the shell, whose signal goes to its own
 //! foreground group; not a test harness, which has no handle on a group it did
-//! not create. Yardlet is the only process that knows the worker's pid, so
-//! Yardlet has to be the one that takes it down.
+//! not create. AgentOS is the only process that knows the worker's pid, so
+//! AgentOS has to be the one that takes it down.
 //!
 //! Before this, it did not. `terminate_worker_tree` existed and was correct, and
 //! nothing called it when the orchestrator itself was asked to stop, so a
-//! Ctrl-C on `yardlet run` killed the parent and left the worker holding the run
-//! directory (issue #107 — the likely source of the four `yardlet` processes
+//! Ctrl-C on `agentos run` killed the parent and left the worker holding the run
+//! directory (issue #107 — the likely source of the four `agentos` processes
 //! found alive 26 hours later in #64).
 //!
 //! `ctrlc::set_handler` may only be installed once per process, so this owns the
@@ -27,7 +27,7 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 ///
 /// The emergency exit needs them: a second interrupt that leaves the process
 /// without taking its workers down produces the exact orphan #107 is about, only
-/// faster. Yardlet is still the only holder of these pids.
+/// faster. AgentOS is still the only holder of these pids.
 fn live_workers() -> &'static Mutex<Vec<u32>> {
     static LIVE: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(Vec::new()))
@@ -101,8 +101,8 @@ pub fn install_stop_handler() -> bool {
                 // produce the very orphan #107 is about, just faster.
                 kill_tracked_workers();
                 eprintln!(
-                    "\nyardlet: second interrupt — workers killed, exiting now. \
-                     Run `yardlet recover` to settle the interrupted run."
+                    "\nagentos: second interrupt — workers killed, exiting now. \
+                     Run `agentos recover` to settle the interrupted run."
                 );
                 std::process::exit(130); // 128 + SIGINT, what a shell reports
             }

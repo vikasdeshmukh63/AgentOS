@@ -7,5 +7,5 @@ if [[ "$*" == "eval fixtures --list --json" ]]; then
 fi
 
 : >"${STALE_FIXTURE_BODY_MARKER:?missing stale fixture body marker}"
-printf "yardlet: unknown fixture 'fixture-added-after-build'\n" >&2
+printf "agentos: unknown fixture 'fixture-added-after-build'\n" >&2
 exit 1

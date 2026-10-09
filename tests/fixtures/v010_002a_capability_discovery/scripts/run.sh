@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 3 ]]; then
-  printf 'usage: %s <yardlet-bin> <evidence-dir> <scenario>\n' "$0" >&2
+  printf 'usage: %s <agentos-bin> <evidence-dir> <scenario>\n' "$0" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCENARIO="$3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,7 +14,7 @@ FIXTURE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 mkdir -p "$EVIDENCE_DIR"
 
 source "$FIXTURE_ROOT/../support/fixture-binary-preflight.sh"
-preflight_fixture_binary "$YARDLET_BIN" \
+preflight_fixture_binary "$AGENTOS_BIN" \
   capability-coverage-trigger-matrix \
   bounded-capability-scout-contract
 
@@ -112,7 +112,7 @@ PY
 run_in() {
   local root="$1"
   shift
-  (cd "$root" && "$YARDLET_BIN" "$@")
+  (cd "$root" && "$AGENTOS_BIN" "$@")
 }
 
 setup_workspace() {
@@ -252,7 +252,7 @@ run_planning_case() {
 
 case "$SCENARIO" in
   trigger_matrix)
-    "$YARDLET_BIN" eval fixtures --json \
+    "$AGENTOS_BIN" eval fixtures --json \
       --fixture capability-coverage-trigger-matrix \
       >"$EVIDENCE_DIR/core-trigger-matrix.json"
     [[ "$(json_get "$EVIDENCE_DIR/core-trigger-matrix.json" passed)" == "true" ]] || \
@@ -275,12 +275,12 @@ case "$SCENARIO" in
     # Fixture-only markers are inert without this explicit opt-in.
     run_planning_case soft-one-marker-off \
       "fixture:soft_one weak-context:" no_scout "" 0
-    export YARDLET_TEST_PLANNING_SIGNAL_MARKERS=1
+    export AGENTOS_TEST_PLANNING_SIGNAL_MARKERS=1
     run_planning_case soft-one \
       "fixture:soft_one weak-context:" observe "" 1
     run_planning_case soft-two \
       "fixture:soft_two weak-context: unfamiliar-domain:" scout "" 2
-    unset YARDLET_TEST_PLANNING_SIGNAL_MARKERS
+    unset AGENTOS_TEST_PLANNING_SIGNAL_MARKERS
 
     # Production supply: an installed selected skill whose declared
     # requirements the sandboxed workspace cannot satisfy raises
@@ -388,7 +388,7 @@ EOF
       fail "second turn did not reuse all three unique bounded topics"
     [[ "$(record_count "$root" '*/proposals/*.yaml')" == "2" ]] || fail "proposal cardinality mismatch"
     [[ "$(active_digest "$root")" == "$before_active" ]] || fail "planning changed active state"
-    "$YARDLET_BIN" eval fixtures --json --fixture bounded-capability-scout-contract \
+    "$AGENTOS_BIN" eval fixtures --json --fixture bounded-capability-scout-contract \
       >"$EVIDENCE_DIR/core-scout-contract.json"
     [[ "$(json_get "$EVIDENCE_DIR/core-scout-contract.json" passed)" == "true" ]] || \
       fail "bounded scout mechanism fixture failed"
@@ -404,8 +404,8 @@ EOF
     audit_digest="$(json_digest "$EVIDENCE_DIR/restart-after-scout-before.json" capability_audits)"
     initial_scout_count="$(scout_count "$root")"
     proposal_count="$(record_count "$root" '*/proposals/*.yaml')"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-once.json"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-twice.json"
+    "$SCRIPT_DIR/restart.sh" "$AGENTOS_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-once.json"
+    "$SCRIPT_DIR/restart.sh" "$AGENTOS_BIN" "$root" "$EVIDENCE_DIR/restart-after-scout-twice.json"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-after-scout-once.json" capability_audits)" == "$audit_digest" ]] || \
       fail "restart changed capability evidence"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-after-scout-twice.json" capability_audits)" == "$audit_digest" ]] || \
@@ -432,8 +432,8 @@ EOF
     audit_digest="$(json_digest "$EVIDENCE_DIR/restart-before-confirm-before.json" capability_audits)"
     initial_scout_count="$(scout_count "$root")"
     proposal_count="$(record_count "$root" '*/proposals/*.yaml')"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-once.json"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-twice.json"
+    "$SCRIPT_DIR/restart.sh" "$AGENTOS_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-once.json"
+    "$SCRIPT_DIR/restart.sh" "$AGENTOS_BIN" "$root" "$EVIDENCE_DIR/restart-before-confirm-twice.json"
     [[ "$(json_get "$EVIDENCE_DIR/restart-before-confirm-twice.json" session.current_head)" == "$head" ]] || \
       fail "restart lost confirm-ready head"
     [[ "$(json_digest "$EVIDENCE_DIR/restart-before-confirm-twice.json" capability_audits)" == "$audit_digest" ]] || \
@@ -510,7 +510,7 @@ EOF
       fail "dogfood did not leave exactly one typed task disposition"
     [[ "$(active_digest "$root")" == "$active_before" ]] || fail "dogfood activated before confirm"
     [[ "$(scout_count "$root")" == "1" ]] || fail "dogfood scout count mismatch"
-    "$SCRIPT_DIR/restart.sh" "$YARDLET_BIN" "$root" "$EVIDENCE_DIR/dogfood-after-restart.json"
+    "$SCRIPT_DIR/restart.sh" "$AGENTOS_BIN" "$root" "$EVIDENCE_DIR/dogfood-after-restart.json"
     [[ "$(scout_count "$root")" == "1" ]] || fail "dogfood restart duplicated scout"
     head="$(json_get "$EVIDENCE_DIR/dogfood-after-restart.json" session.current_head)"
     pre_confirm="$(active_digest "$root")"

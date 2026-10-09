@@ -66,7 +66,7 @@ mod unix {
                 .expect("system clock before Unix epoch")
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "yardlet-v010-004-local-app-{}-{nonce}",
+                "agentos-v010-004-local-app-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).expect("create fixture workspace");
@@ -131,7 +131,7 @@ mod unix {
             permissions.set_mode(0o755);
             fs::set_permissions(&restart, permissions).unwrap();
 
-            let config_path = root.join(".agents/yardlet.yaml");
+            let config_path = root.join(".agents/agentos.yaml");
             let config = fs::read_to_string(&config_path)
                 .unwrap()
                 .replace("auto_commit: false", "auto_commit: true");
@@ -171,12 +171,12 @@ mod unix {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .unwrap_or_else(|error| panic!("failed to run yardlet {args:?}: {error}"));
+                .unwrap_or_else(|error| panic!("failed to run agentos {args:?}: {error}"));
             let pid = child.id();
-            let output = child.wait_with_output().expect("wait for yardlet process");
+            let output = child.wait_with_output().expect("wait for agentos process");
             assert!(
                 output.status.success(),
-                "yardlet {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+                "agentos {args:?} failed\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -187,7 +187,7 @@ mod unix {
             let (pid, output) = self.run_process(args);
             let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
-                    "invalid JSON from yardlet {args:?}: {error}\n{}",
+                    "invalid JSON from agentos {args:?}: {error}\n{}",
                     String::from_utf8_lossy(&output.stdout)
                 )
             });
@@ -198,15 +198,15 @@ mod unix {
             let child = Command::new(&self.binary)
                 .args(args)
                 .current_dir(&self.root)
-                .env("YARDLET_TEST_RESOURCE_ACTION_FAULT", fault)
+                .env("AGENTOS_TEST_RESOURCE_ACTION_FAULT", fault)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .unwrap_or_else(|error| panic!("failed to run yardlet with {fault}: {error}"));
+                .unwrap_or_else(|error| panic!("failed to run agentos with {fault}: {error}"));
             let pid = child.id();
             let output = child
                 .wait_with_output()
-                .expect("wait for faulted yardlet process");
+                .expect("wait for faulted agentos process");
             (pid, output)
         }
 
@@ -582,7 +582,7 @@ mod unix {
         fixture.remember_owned_process(&restart_service["resource"]);
         fixture.remember_owned_process(&unhealthy_restart_service["resource"]);
         let service_url = service["resource"]["target"]["url"].as_str().unwrap();
-        assert!(http_get(service_url).contains("yardlet-local-app"));
+        assert!(http_get(service_url).contains("agentos-local-app"));
 
         let live_process = reconcile(
             &fixture,
@@ -831,7 +831,7 @@ mod unix {
         let validation_json: Value = serde_json::from_slice(&validation_bytes).unwrap();
         assert_eq!(validation_json["page_status"], 200);
         assert_eq!(validation_json["health_status"], 200);
-        assert_eq!(validation_json["marker"], "yardlet-local-app");
+        assert_eq!(validation_json["marker"], "agentos-local-app");
         assert_eq!(
             validation["artifact"]["digest"],
             digest_bytes(&validation_bytes)

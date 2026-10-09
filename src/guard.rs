@@ -1,6 +1,6 @@
 //! Zero-key worker guard.
 //!
-//! Yardlet core never requires, requests, stores, or calls AI provider API keys.
+//! AgentOS core never requires, requests, stores, or calls AI provider API keys.
 //! This module enforces two things:
 //!
 //! 1. Worker readiness probing without invoking provider APIs.
@@ -23,7 +23,7 @@ pub enum Readiness {
     /// The worker is configured but explicitly disabled in workers.yaml.
     Disabled,
     /// Binary is present but its configured offline version probe failed, so the
-    /// resolved CLI or its runtime cannot be confirmed. Yardlet stops rather than
+    /// resolved CLI or its runtime cannot be confirmed. AgentOS stops rather than
     /// guess (it never risks a billed call to verify auth).
     Ambiguous,
     /// A binary answered the probe, but its declared identity signature does not
@@ -65,7 +65,7 @@ pub enum IdentityState {
 }
 
 /// Outcome of the optional offline auth gate. Deliberately three-valued:
-/// Yardlet never makes a billed call to verify a subscription login, so only a
+/// AgentOS never makes a billed call to verify a subscription login, so only a
 /// positively reported "not logged in" blocks; anything else stays invocable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthState {
@@ -134,7 +134,7 @@ pub fn auth_state_from_output(
 }
 
 /// Tolerant version comparison: compare the first `major.minor.patch` triple
-/// found on each side and treat anything unparseable as undetermined. Yardlet
+/// found on each side and treat anything unparseable as undetermined. AgentOS
 /// cannot know a worker CLI's private versioning scheme, so an uncomparable
 /// version is reported as unknown and never blocks a run.
 pub fn version_verdict(found: &str, min_version: &str) -> VersionVerdict {
@@ -269,7 +269,7 @@ pub fn readiness_cache_key(
 /// Validate that a generic profile's `sandbox_args` actually declare a
 /// bounded-write sandbox contract: non-empty, distinct from the full-access
 /// arguments, free of elevation markers and unknown placeholders, and carrying
-/// at least one literal flag. Yardlet cannot infer a missing flag or guess the
+/// at least one literal flag. AgentOS cannot infer a missing flag or guess the
 /// meaning of an unknown placeholder, so callers fail closed on Err.
 pub fn generic_sandbox_declaration(profile: &WorkerProfile) -> Result<(), String> {
     let sandbox = &profile.invocation.sandbox_args;
@@ -345,10 +345,10 @@ pub fn access_contract(profile: &WorkerProfile, requested_access: &str) -> Resul
     }
     generic_sandbox_declaration(profile).map_err(|reason| {
         format!(
-            "worker '{}' cannot honor sandboxed access: {reason}. Yardlet cannot verify a \
+            "worker '{}' cannot honor sandboxed access: {reason}. AgentOS cannot verify a \
              sandbox it does not own, so this profile is not invocable while the workspace \
              asks for sandboxed access; declare a real sandbox in invocation.sandbox_args \
-             or grant full access explicitly (yardlet access full)",
+             or grant full access explicitly (agentos access full)",
             profile.id
         )
     })
@@ -365,7 +365,7 @@ pub enum StageMark {
     Scrubbed,
     /// Hard stop: strict (`block`) policy refuses to run while billing env is set.
     Blocked,
-    /// Cannot be checked offline. Not a failure: Yardlet never makes a billed
+    /// Cannot be checked offline. Not a failure: AgentOS never makes a billed
     /// call to verify auth, so it relies on the worker's own subscription login.
     Offline,
     /// Gate does not apply (e.g. version when no binary was found).
@@ -406,7 +406,7 @@ pub fn billing_blocked(policy: &str, billing_env_present: usize) -> bool {
     policy == "block" && billing_env_present > 0
 }
 
-/// Static gates that must hold before Yardlet starts either the worker or its
+/// Static gates that must hold before AgentOS starts either the worker or its
 /// offline version probe. Built-in adapters keep their core-owned command
 /// shapes, while generic workers must also have a structurally valid template.
 pub fn invocation_contract(profile: &WorkerProfile) -> Result<(), String> {
@@ -440,9 +440,9 @@ pub fn invocation_contract(profile: &WorkerProfile) -> Result<(), String> {
 }
 
 impl WorkerStatus {
-    /// The readiness gates as a staged checklist for `yardlet worker status`.
+    /// The readiness gates as a staged checklist for `agentos worker status`.
     ///
-    /// Auth is deliberately reported as unverifiable offline: Yardlet never
+    /// Auth is deliberately reported as unverifiable offline: AgentOS never
     /// makes a billed call to confirm a subscription login, so it never claims
     /// the login was verified. It only reports what it can prove locally.
     pub fn stages(&self, billing: &BillingPolicy) -> Vec<StatusStage> {
@@ -586,7 +586,7 @@ impl WorkerStatus {
             AuthState::NotProbed => StatusStage {
                 label: "auth",
                 mark: StageMark::Offline,
-                note: "not verified offline; Yardlet never makes a billed call to check, it relies on the worker's own subscription login".to_string(),
+                note: "not verified offline; AgentOS never makes a billed call to check, it relies on the worker's own subscription login".to_string(),
             },
             AuthState::Authenticated => StatusStage {
                 label: "auth",
@@ -720,7 +720,7 @@ fn fallback_paths(worker_id: &str) -> Vec<PathBuf> {
 /// on the selected binary. A failed gate stops the later ones, so the reported
 /// state always names the FIRST thing that is wrong. The static invocation and
 /// access contracts still run before all of them, because they decide whether
-/// Yardlet may spawn anything at all.
+/// AgentOS may spawn anything at all.
 ///
 /// Resolution prefers the first candidate that passes those gates: the
 /// PATH-resolved binary first, then well-known fallback paths. This keeps a
@@ -862,7 +862,7 @@ pub fn probe(
                     Readiness::Unauthenticated,
                     format!(
                         "binary resolved to {} and its version is ok, but the profile's offline auth probe reports the CLI is NOT logged in. \
-                         Log in with the worker CLI's own subscription account, then retry. Yardlet did not call an AI API and did not ask for an API key.",
+                         Log in with the worker CLI's own subscription account, then retry. AgentOS did not call an AI API and did not ask for an API key.",
                         path.display()
                     ),
                 )
@@ -891,11 +891,11 @@ pub fn probe(
                 }
                 // An operator reading "sandboxed" must be able to tell an enforced
                 // boundary from a declared one (issue #123): the generic sandbox
-                // passed the declaration check above, but Yardlet does not own it.
+                // passed the declaration check above, but AgentOS does not own it.
                 if requested_access == "sandboxed"
                     && !matches!(profile.id.as_str(), "codex" | "claude-code")
                 {
-                    detail.push_str("; sandbox is profile-declared, not verified by Yardlet");
+                    detail.push_str("; sandbox is profile-declared, not verified by AgentOS");
                 }
                 (
                     Some(path),
@@ -917,7 +917,7 @@ pub fn probe(
                 format!(
                     "binary resolved to {} but its identity probe reported {seen:?}, which does not carry the declared signature {expected:?}: \
                      a different product is installed under the command name '{command}'. Set an explicit `command:` path in \
-                     .agents/workers.yaml, then retry. Yardlet did not call an AI API and did not ask for an API key.",
+                     .agents/workers.yaml, then retry. AgentOS did not call an AI API and did not ask for an API key.",
                     path.display()
                 ),
             ),
@@ -929,7 +929,7 @@ pub fn probe(
                 Readiness::UnsupportedVersion,
                 format!(
                     "binary resolved to {} reports version {found:?}, below the profile's declared min_version {minimum}: \
-                     upgrade to >= {minimum}, then retry. Yardlet did not call an AI API and did not ask for an API key.",
+                     upgrade to >= {minimum}, then retry. AgentOS did not call an AI API and did not ask for an API key.",
                     path.display()
                 ),
             ),
@@ -942,7 +942,7 @@ pub fn probe(
                 format!(
                     "binary resolved to {} but the configured offline identity probe failed; the resolved CLI or its runtime \
                      is unverified. Set an explicit `command:` path in .agents/workers.yaml or fix \
-                     the local CLI runtime, then retry. Yardlet did not call an AI API and did not ask for an API key.",
+                     the local CLI runtime, then retry. AgentOS did not call an AI API and did not ask for an API key.",
                     path.display()
                 ),
             ),
@@ -955,7 +955,7 @@ pub fn probe(
                 format!(
                     "binary resolved to {} but the configured offline version probe failed; the resolved CLI or its runtime \
                      is unverified. Set an explicit `command:` path in .agents/workers.yaml or fix \
-                     the local CLI runtime, then retry. Yardlet did not call an AI API and did not ask for an API key.",
+                     the local CLI runtime, then retry. AgentOS did not call an AI API and did not ask for an API key.",
                     path.display()
                 ),
             ),
@@ -968,7 +968,7 @@ pub fn probe(
                 Readiness::NotReady,
                 format!(
                     "worker CLI '{command}' not found on PATH or known install paths. Install it \
-                     and log in with a subscription-backed account, then retry. Yardlet did not call \
+                     and log in with a subscription-backed account, then retry. AgentOS did not call \
                      an AI API and did not ask for an API key."
                 ),
             ),
@@ -1061,14 +1061,14 @@ struct ProbeOutput {
 }
 
 /// Spawn one offline probe in the sanitized worker environment. Returns None
-/// when Yardlet must not or could not run it, which every caller treats as
+/// when AgentOS must not or could not run it, which every caller treats as
 /// "unknown", never as a positive result.
 fn run_probe(
     path: &std::path::Path,
     args: &[String],
     billing: &BillingPolicy,
 ) -> Option<ProbeOutput> {
-    // Never spawn a bare command: Yardlet cannot know whether it would be an
+    // Never spawn a bare command: AgentOS cannot know whether it would be an
     // interactive session rather than an offline probe.
     if args.is_empty() || args.iter().all(|arg| arg.trim().is_empty()) {
         return None;
@@ -1120,7 +1120,7 @@ fn read_version(
 /// A worker profile may opt back in to specific variables
 /// (`invocation.pass_env`). Zero-key stays the DEFAULT: nothing passes
 /// through unless the user names it on that worker in workers.yaml, and
-/// Yardlet itself never reads, stores, or requires the value.
+/// AgentOS itself never reads, stores, or requires the value.
 pub fn sanitized_worker_env_for(
     billing: &BillingPolicy,
     pass_env: &[String],
@@ -1334,7 +1334,7 @@ invocation:
     #[test]
     fn capability_readiness_projection_keeps_ready_not_ready_and_disabled_distinct() {
         let workers: crate::schemas::WorkersFile = crate::yaml::from_str(
-            "schema_version: 1\nworkers:\n  - id: ready\n    capabilities: [Shell Tool]\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n  - id: absent\n    capabilities: [browser]\n    invocation: { command: yardlet-definitely-missing-command, supports_noninteractive: true, output_contract: files }\n  - id: disabled\n    enabled: false\n    capabilities: [image-generation]\n    invocation: { command: bash }\n",
+            "schema_version: 1\nworkers:\n  - id: ready\n    capabilities: [Shell Tool]\n    invocation: { command: bash, supports_noninteractive: true, output_contract: files }\n  - id: absent\n    capabilities: [browser]\n    invocation: { command: agentos-definitely-missing-command, supports_noninteractive: true, output_contract: files }\n  - id: disabled\n    enabled: false\n    capabilities: [image-generation]\n    invocation: { command: bash }\n",
         )
         .unwrap();
         let projection =

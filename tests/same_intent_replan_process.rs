@@ -11,7 +11,7 @@ mod unix {
             .expect("system clock before Unix epoch")
             .as_nanos();
         let evidence = std::env::temp_dir().join(format!(
-            "yardlet-replan-{scenario}-{}-{nonce}",
+            "agentos-replan-{scenario}-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&evidence).expect("create same-intent replan evidence directory");

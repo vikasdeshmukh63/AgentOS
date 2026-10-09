@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 3 ]]; then
-  printf 'usage: %s <yardlet-bin> <evidence-dir> <scenario>\n' "$0" >&2
+  printf 'usage: %s <agentos-bin> <evidence-dir> <scenario>\n' "$0" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCENARIO="$3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -106,7 +106,7 @@ PY
 run_in() {
   local root="$1"
   shift
-  (cd "$root" && "$YARDLET_BIN" "$@")
+  (cd "$root" && "$AGENTOS_BIN" "$@")
 }
 
 show_json() {
@@ -372,7 +372,7 @@ case "$SCENARIO" in
     fi
 
     # Leg 2: a worker-authored question is a genuine conversation — the hold is
-    # typed worker_question and replan must refuse with the yardlet answer path.
+    # typed worker_question and replan must refuse with the agentos answer path.
     qroot="$(mktemp -d "$EVIDENCE_DIR/question.XXXXXX")"
     setup_workspace "$qroot"
 
@@ -397,12 +397,12 @@ case "$SCENARIO" in
       >"$EVIDENCE_DIR/question-replan.out" 2>&1; then
       fail "replan superseded a worker-question hold"
     fi
-    grep -q 'yardlet answer' "$EVIDENCE_DIR/question-replan.out" || \
-      fail "worker-question replan rejection did not point at yardlet answer"
+    grep -q 'agentos answer' "$EVIDENCE_DIR/question-replan.out" || \
+      fail "worker-question replan rejection did not point at agentos answer"
     grep -q 'YARD-001' "$EVIDENCE_DIR/question-replan.out" || \
       fail "worker-question replan rejection did not name the waiting task"
 
-    write_summary "실제 바이너리로 feedback cap 소진이 needs_user_origin: goal_feedback_exhausted를 기록하고 planning replan이 그 종결 큐를 같은 intent id로 수용했으며, worker 질문 NeedsUser 큐에서는 replan이 yardlet answer 안내와 대기 태스크 id를 남기며 거부됨"
+    write_summary "실제 바이너리로 feedback cap 소진이 needs_user_origin: goal_feedback_exhausted를 기록하고 planning replan이 그 종결 큐를 같은 intent id로 수용했으며, worker 질문 NeedsUser 큐에서는 replan이 agentos answer 안내와 대기 태스크 id를 남기며 거부됨"
     ;;
 
   mixed_worker_question_replan)
@@ -435,12 +435,12 @@ case "$SCENARIO" in
       >"$EVIDENCE_DIR/mixed-replan.out" 2>&1; then
       fail "replan superseded a worker question in a mixed settled queue"
     fi
-    grep -q 'yardlet answer' "$EVIDENCE_DIR/mixed-replan.out" || \
-      fail "mixed queue replan rejection did not point at yardlet answer"
+    grep -q 'agentos answer' "$EVIDENCE_DIR/mixed-replan.out" || \
+      fail "mixed queue replan rejection did not point at agentos answer"
     grep -q 'YARD-001' "$EVIDENCE_DIR/mixed-replan.out" || \
       fail "mixed queue replan rejection did not name the waiting task"
 
-    write_summary "실제 바이너리로 worker_question NeedsUser와 Partial이 공존하는 settled queue를 만든 뒤 planning replan이 yardlet answer 안내와 대기 태스크 id를 남기며 거부됨"
+    write_summary "실제 바이너리로 worker_question NeedsUser와 Partial이 공존하는 settled queue를 만든 뒤 planning replan이 agentos answer 안내와 대기 태스크 id를 남기며 거부됨"
     ;;
 
   *)

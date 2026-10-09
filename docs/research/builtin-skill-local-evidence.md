@@ -6,7 +6,7 @@ alias mapping(1.1절) 추가, 전체 인용 경로 존재 재확인, LE-020·LE-
 
 ## 1. 목적과 판정 규칙
 
-이 문서는 Yardlet fresh install의 built-in skill library를 결정하기 위한 **로컬 수요 근거**만 정리한다. 외부 후보의 적격성, upstream commit, license와 provenance 검증은 별도 후보 원장의 책임이다. 여기서 `local-reference-catalog`는 기존 분류 체계와 실제 사용 흔적을 확인하는 비교 자료일 뿐, 복제하거나 정답 원장으로 채택하지 않는다.
+이 문서는 AgentOS fresh install의 built-in skill library를 결정하기 위한 **로컬 수요 근거**만 정리한다. 외부 후보의 적격성, upstream commit, license와 provenance 검증은 별도 후보 원장의 책임이다. 여기서 `local-reference-catalog`는 기존 분류 체계와 실제 사용 흔적을 확인하는 비교 자료일 뿐, 복제하거나 정답 원장으로 채택하지 않는다.
 
 조사 규칙은 다음과 같다.
 
@@ -27,7 +27,7 @@ alias mapping(1.1절) 추가, 전체 인용 경로 존재 재확인, LE-020·LE-
 `<workspace>`는 조사 대상 repo들의 공통 부모다. 각 alias는 아래 fingerprint를 모두 가진 유일한
 directory로 해석한다. 2026-07-12 로컬 검증에서 모든 fingerprint가 정확히 한 대상을 찾았고, alias
 인용 경로 전부가 존재 확인을 통과했다. 실제 directory 이름과 절대 경로는 tracked 문서가 아니라
-Yardlet run validation에만 보관한다.
+AgentOS run validation에만 보관한다.
 
 | Alias | 결정적 fingerprint |
 |---|---|
@@ -64,7 +64,7 @@ primary checkout for each repository.
 
 | Evidence ID | Repo / path | 관찰 사실 | Inferred need | 강도와 제한 |
 |---|---|---|---|---|
-| LE-001 | `yard/Cargo.toml`, `yard/src/`, `yard/tests/`, `yard/templates/agents/`, `yard/.github/workflows/ci.yml` | `yardlet`은 Rust 2021 CLI/TUI이고, Rust source와 integration tests, agent-state templates, CI를 함께 가진다. | CLI/runtime preset, deterministic test workflow, harness-state-aware repo orientation 수요 | 강함. 현재 task의 기준 repo이기도 하다. |
+| LE-001 | `yard/Cargo.toml`, `yard/src/`, `yard/tests/`, `yard/templates/agents/`, `yard/.github/workflows/ci.yml` | `agentos`은 Rust 2021 CLI/TUI이고, Rust source와 integration tests, agent-state templates, CI를 함께 가진다. | CLI/runtime preset, deterministic test workflow, harness-state-aware repo orientation 수요 | 강함. 현재 task의 기준 repo이기도 하다. |
 | LE-002 | `workspace-erp-monorepo/package.json`, `workspace-erp-monorepo/pnpm-workspace.yaml`, `workspace-erp-monorepo/AGENTS.md`, `workspace-erp-monorepo/docs/erp-rebuild/` | pnpm workspace 아래 TypeScript frontend, NestJS backend, Go backend, Electron, 여러 D2C 앱이 공존한다. 공용 package 선행 build와 package별 test 명령이 문서화돼 있다. | web/fullstack monorepo preset, package-boundary validation, UI parity overlay 수요 | 강함. 한 repo가 여러 preset과 overlay를 동시에 요구한다. |
 | LE-003 | `workspace-secondary-monorepo/package.json`, `workspace-secondary-monorepo/pnpm-workspace.yaml`, `workspace-secondary-monorepo/packages/server/test/app.e2e-spec.ts`, `workspace-secondary-monorepo/packages/erp/src/tests/App.test.tsx` | `workspace-secondary-monorepo`도 pnpm monorepo이며 frontend와 backend test가 함께 tracked되어 있다. | LE-002의 monorepo, cross-package test 수요를 독립적으로 보강 | 중간. README 제목과 package name이 LE-002 repo의 실명과 동일한 별개 repo여서(1.1절 mapping) 현재 제품 정체성은 확정하지 않는다. |
 | LE-004 | `workspace-agent-runtime/pyproject.toml`, `workspace-agent-runtime/AGENTS.md`, `workspace-agent-runtime/app/`, `workspace-agent-runtime/tests/`, `workspace-agent-runtime/docs/map/` | Python/FastAPI 기반 agent runtime이며 Slack, web, trigger, CLI surface와 pytest map, security guardrail, repo map을 가진다. | agent/backend preset, repo-map orientation, tool/security review overlay 수요 | 강함. runtime log나 conversation 기록은 이 조사에 사용하지 않았다. |
@@ -173,7 +173,7 @@ Overlay는 task 수명 동안만 활성화해야 한다. repo에 `Dockerfile`이
 | OC-002 | `<workspace>/local-reference-catalog/presets/*.skills` | preset identifier는 `ai-ml`, `all`, `backend-api`, `cli-tool`, `cms`, `commerce`, `content-studio`, `core`, `data-engineering`, `data-science`, `desktop`, `game`, `infra`, `library-package`, `media-studio`, `mobile`, `ops`, `qa`, `research`, `security`, `video`, `web-ui`의 22개다. member 수는 1개부터 39개까지이며 `core`는 7개다. | identifier와 규모만 비교. member 정의는 기록하거나 채택하지 않음. |
 | OC-003 | `workspace-quant-system/.agents/skills/*`, `workspace-content-pipeline/.agents/skills/*`, `workspace-mobile-companion/.agents/skills/*` symlink metadata | 세 repo의 tracked harness 설명은 workspace 공용 asset 사용을 명시하고, 실제 local symlink 일부가 `../../../local-reference-catalog/skills/<identifier>`를 가리킨다. | workspace에서 이 catalog가 사용된 흔적만 증명. 사용 효과나 품질을 증명하지는 않음. |
 | OC-004 | `<workspace>/local-reference-catalog/` root metadata | 이 directory 자체에서 Git `HEAD`를 확인할 수 없었고, root와 2-depth metadata scan에서 LICENSE, README, source commit, provenance 또는 version 문서를 찾지 못했다. 파일 수정 시각은 provenance가 아니다. | source commit과 license를 고정할 수 없으므로 fresh install 재배포 원장이나 upstream 적격 후보로 사용 금지. |
-| OC-005 | `yard/docs/skills.md` | Yardlet 문서는 기존 90-skill catalog와 preset library를 연구 입력으로 언급하지만, 동시에 library를 read-only discovery 대상으로 두고 worker authoring과 deterministic recording을 분리한다. | 기존 메커니즘 비교에는 사용하되, 이번 fresh library의 후보 선정은 별도 upstream 검증을 거쳐야 함. |
+| OC-005 | `yard/docs/skills.md` | AgentOS 문서는 기존 90-skill catalog와 preset library를 연구 입력으로 언급하지만, 동시에 library를 read-only discovery 대상으로 두고 worker authoring과 deterministic recording을 분리한다. | 기존 메커니즘 비교에는 사용하되, 이번 fresh library의 후보 선정은 별도 upstream 검증을 거쳐야 함. |
 
 ### 비복제 판정
 
@@ -204,7 +204,7 @@ Overlay는 task 수명 동안만 활성화해야 한다. repo에 `Dockerfile`이
 - 실제 빈도는 telemetry나 run history를 보지 않았으므로 측정하지 않았다. 여기서 반복은 안정적 tracked evidence의 repo 간 반복을 뜻한다.
 - local `local-reference-catalog`의 provenance가 없으므로 어떤 identifier도 upstream 후보 ID로 승격하지 않았다.
 - package manifest는 capability 존재를 보여주지만 성공한 workflow를 증명하지 않는다. tests, runbook, template과 함께 있는 경우에만 근거 강도를 높였다.
-- 후속 후보 원장은 CORE-D1부터 CORE-D7, PRESET-D1부터 PRESET-D8, OVERLAY-D1부터 OVERLAY-D10을 upstream candidate ID에 연결하고, immutable commit, license, bundled scripts/assets, network, secret, tool 요구와 Yardlet adaptation을 독립적으로 검증해야 한다.
+- 후속 후보 원장은 CORE-D1부터 CORE-D7, PRESET-D1부터 PRESET-D8, OVERLAY-D1부터 OVERLAY-D10을 upstream candidate ID에 연결하고, immutable commit, license, bundled scripts/assets, network, secret, tool 요구와 AgentOS adaptation을 독립적으로 검증해야 한다.
 
 ## 8. Acceptance 자체 점검
 

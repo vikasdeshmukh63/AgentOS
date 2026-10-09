@@ -11,7 +11,7 @@ mod unix {
             .expect("system clock before Unix epoch")
             .as_nanos();
         let evidence = std::env::temp_dir().join(format!(
-            "yardlet-v010-002a-{scenario}-{}-{nonce}",
+            "agentos-v010-002a-{scenario}-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&evidence).expect("create V010-002A capability evidence directory");

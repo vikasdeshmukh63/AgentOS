@@ -12,7 +12,7 @@ workers:
     # best_for / not_for are the planner's rubric: task characteristics, not
     # model names, so they survive model changes. Keep them contrastive between
     # workers (one worker's not_for is roughly the other's best_for) so the
-    # planner can tell them apart. Refine by hand or via `yardlet routing review`.
+    # planner can tell them apart. Refine by hand or via `agentos routing review`.
     best_for: >-
       terminal-first execution with deterministic feedback; repository-grounded
       implementation planning and decomposition; issue-to-patch implementation;
@@ -31,7 +31,7 @@ workers:
     model: ""
     effort: ""
     # Optional, case-insensitive LITERAL signatures from this worker/provider.
-    # Yardlet checks only a resultless attempt's own worker-output.log span.
+    # AgentOS checks only a resultless attempt's own worker-output.log span.
     # Keep this narrow (max 16 entries, 256 bytes each). A match permits one
     # same-worker, result-first output-contract recovery, never task rewording.
     # Example: ["provider declined response"]
@@ -122,13 +122,13 @@ workers:
   #     output_contract: files
   #     # Shape of this CLI's stdout: text (default when omitted; one message
   #     # per line), json (one document per attempt), or stream-json (one
-  #     # object per line). json/stream-json also let Yardlet tolerantly
+  #     # object per line). json/stream-json also let AgentOS tolerantly
   #     # recover a missing result from stdout, marked as recovered in the run
   #     # record so it never reads as a written result file.
   #     output_format: stream-json
   #     version_args: ["version", "--offline"]
   #     prompt_transport: argument
-  #     # {prompt} is exactly one argv item. Yardlet never builds a shell string.
+  #     # {prompt} is exactly one argv item. AgentOS never builds a shell string.
   #     args: ["run", "--out", "{run_dir}", "--prompt", "{prompt}"]
   #     session:
   #       # The non-empty suffix after this exact fresh-child raw line prefix
@@ -136,9 +136,9 @@ workers:
   #       capture: { stream: stdout, prefix: "SESSION_REF=" }
   #       # Exactly one {session}; {prompt} follows prompt_transport above.
   #       resume_args: ["resume", "--session", "{session}", "--prompt", "{prompt}"]
-  #     # Required under sandboxed access: Yardlet cannot verify a sandbox it
+  #     # Required under sandboxed access: AgentOS cannot verify a sandbox it
   #     # does not own, so a generic profile must declare one (or the workspace
-  #     # must grant full access explicitly with `yardlet access full`).
+  #     # must grant full access explicitly with `agentos access full`).
   #     sandbox_args: ["--sandbox"]
   #     full_access_args: ["--full-access"]
   #     model_args: ["--model", "{model}"]

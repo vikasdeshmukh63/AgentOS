@@ -1,7 +1,7 @@
 //! Run orchestration: select one bounded task, prepare it, and (optionally)
 //! execute it through a hidden worker, then evaluate and compact.
 //!
-//! Yardlet stays deterministic until a worker is invoked. By default `run_next`
+//! AgentOS stays deterministic until a worker is invoked. By default `run_next`
 //! prepares everything (run dir, evidence, packet, sanitized env) and stops
 //! *before* spawning, because spawning a subscription-backed worker consumes
 //! real usage. Pass `execute: true` to actually invoke the worker.
@@ -345,7 +345,7 @@ pub(crate) fn committed_paths_since_baseline(
     })
 }
 
-/// Actual serial-worktree changes with only Yardlet's unchanged canonical seed
+/// Actual serial-worktree changes with only AgentOS's unchanged canonical seed
 /// copies removed. The main run owns an exact pre-worker snapshot, so a worker
 /// create, edit, delete, or symlink replacement stays in the evidence and is
 /// rejected by the evaluator's forbidden-path gate. Status alone is not enough:
@@ -368,7 +368,7 @@ fn serial_worktree_evidence(
     if !seed_dir.is_dir() {
         // Compatibility for runs created before exact seed snapshots existed:
         // retain their previous recovery behavior instead of attributing every
-        // Yardlet-seeded untracked canonical copy to the worker.
+        // AgentOS-seeded untracked canonical copy to the worker.
         paths.retain(|path| !evaluator::is_canonical_state_path(path));
         paths.extend(committed.paths);
         paths.sort();
@@ -1150,7 +1150,7 @@ fn adoption_policy_for(ws: &Workspace) -> Option<AdoptionPolicy> {
             "accepted output is adopted into the owning ref by serial integration".to_string()
         } else {
             "automatic adoption is disabled; the run-owned worktree is retained and the \
-             operator integrates it, then `yardlet resolve` settles the task"
+             operator integrates it, then `agentos resolve` settles the task"
                 .to_string()
         },
     })
@@ -1916,7 +1916,7 @@ fn recover_declared_result_from_stdout(
     record.result_recovered_from_stdout = Some(marker.clone());
     state::save_yaml_atomic(&record_path, &record)?;
     // The worker's exact bytes, never a re-serialization: a recovered result
-    // stays worker-authored content that Yardlet only relocated.
+    // stays worker-authored content that AgentOS only relocated.
     state::write_str_atomic(&result_path, &recovered.json)?;
     Ok(Some(marker))
 }
@@ -2433,7 +2433,7 @@ pub(crate) fn prepare_answer_action_with_deviations(
 }
 
 pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
-    // Installed at the entry point, not at each caller: `yardlet goal` reaches
+    // Installed at the entry point, not at each caller: `agentos goal` reaches
     // `run_auto` without going through `cmd_run`, and an independent review found
     // exactly that path still orphaning its worker. Every route that can start a
     // worker passes through here or `run_next` (issue #107).
@@ -2461,7 +2461,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
             if crate::planner::intent_gated(i, config.ambiguity_gate) {
                 return Err(anyhow!(
                     "the plan is still guessing (ambiguity: high, {} open question(s), \
-                     interview turn {}/{}). Answer with `a` in the TUI or `yardlet answer`, \
+                     interview turn {}/{}). Answer with `a` in the TUI or `agentos answer`, \
                      or override with --accept-ambiguity.",
                     i.open_questions.len(),
                     i.interview_turns,
@@ -2513,7 +2513,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
                         prepared: false,
                         executed: false,
                         lines: vec![format!(
-                            "{}: migrated stale capability gate to NeedsUser; answer it with `yardlet answer --task {}`",
+                            "{}: migrated stale capability gate to NeedsUser; answer it with `agentos answer --task {}`",
                             task.id, task.id
                         )],
                         result_state: Some(TaskState::NeedsUser),
@@ -2618,7 +2618,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
     if prepared_answer_attempt
         .as_ref()
         .is_some_and(|attempt| attempt.continuation == ContinuationMode::Redirect)
-        && std::env::var("YARDLET_TEST_CRASH_AFTER_REDIRECT_RECEIPT").as_deref() == Ok("1")
+        && std::env::var("AGENTOS_TEST_CRASH_AFTER_REDIRECT_RECEIPT").as_deref() == Ok("1")
     {
         bail!("injected crash after redirect receipt and before continuation spawn");
     }
@@ -2884,8 +2884,8 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
             lines.push(format!("approval consumed for {}", task.id));
         } else {
             return Err(anyhow!(
-                "task {} requires approval. Run `yardlet approve {}` first, then \
-                 `yardlet run --task {} --execute`.",
+                "task {} requires approval. Run `agentos approve {}` first, then \
+                 `agentos run --task {} --execute`.",
                 task.id,
                 task.id,
                 task.id
@@ -3011,7 +3011,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
     // Snapshot the workspace before the worker runs so the evaluator can diff
     // against ACTUAL on-disk changes, not the worker's self-report. Git
     // workspaces use `git status`; non-git workspaces use a bounded folder scan.
-    // The current run dir is excluded so Yardlet's own result/handoff artifacts
+    // The current run dir is excluded so AgentOS's own result/handoff artifacts
     // are not attributed as worker deliverables.
     let run_excludes = vec![run_dir.clone()];
     let baseline_fp = evaluator::run_fingerprints(&ws.root, &run_excludes);
@@ -3233,9 +3233,9 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
 
     // A stop cancels recovery too: this spawns a fresh attempt on a typed
     // refusal, which is right when the worker is unwell and wrong when the
-    // operator has asked Yardlet to stop (issue #107).
+    // operator has asked AgentOS to stop (issue #107).
     //
-    // Keyed on the OUTCOME, not on the `cancelled` marker. `yardlet redirect`
+    // Keyed on the OUTCOME, not on the `cancelled` marker. `agentos redirect`
     // writes that same marker to stop a run, so reading it here made a redirect
     // look like a process stop and changed the path it takes — the full suite
     // caught it as `redirect_ignores_decoy_pid_and_signals_verified_worker`
@@ -3246,7 +3246,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
         output_contract_incident = None;
     }
     if let Some(mut incident) = output_contract_incident.take() {
-        // Consume the one-shot budget durably BEFORE spawning. If Yardlet dies
+        // Consume the one-shot budget durably BEFORE spawning. If AgentOS dies
         // in this crash window, orphan recovery reads this receipt and parks
         // NeedsUser instead of starting another worker.
         incident.recovery_consumed = true;
@@ -3639,7 +3639,7 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
     })
 }
 
-/// Did the worker touch any path OUTSIDE Yardlet's own `.agents/` state? Drives
+/// Did the worker touch any path OUTSIDE AgentOS's own `.agents/` state? Drives
 /// the serial auto-commit guidance: only worth telling an opted-in user their
 /// changes were left to commit when the run actually produced deliverable
 /// (non-`.agents/`) edits. `None` evidence (no git signal) counts as no change.
@@ -3653,8 +3653,8 @@ pub fn run_next(ws: &Workspace, opts: &RunOptions) -> Result<RunReport> {
 fn wall_clock_timeout(max_wall_minutes: u32) -> Duration {
     #[cfg(debug_assertions)]
     {
-        if std::env::var("YARDLET_PROCESS_FIXTURE").as_deref() == Ok("1") {
-            if let Some(ms) = std::env::var("YARDLET_FIXTURE_WALL_MS")
+        if std::env::var("AGENTOS_PROCESS_FIXTURE").as_deref() == Ok("1") {
+            if let Some(ms) = std::env::var("AGENTOS_FIXTURE_WALL_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|ms| *ms > 0)
@@ -3684,12 +3684,12 @@ struct DeclaredPathRoots<'a> {
     workspace: &'a std::path::Path,
 }
 
-/// What a worker-declared path is, once Yardlet tries to place it.
+/// What a worker-declared path is, once AgentOS tries to place it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeclaredPath {
     /// Placed in the repository. Judged by the normal integration rules.
     Repository(String),
-    /// Outside every root Yardlet owns — an absolute path elsewhere, or a
+    /// Outside every root AgentOS owns — an absolute path elsewhere, or a
     /// relative one that climbs out. Not a repository deliverable, so it
     /// cannot contradict an honest no-change outcome, but it is still
     /// reported: silently forgetting a declared output is the failure this
@@ -3817,10 +3817,10 @@ fn resolve_repository_relative(relative: &str) -> Resolved {
     Resolved::Inside(parts.join("/"))
 }
 
-/// Declared outputs Yardlet could not place in the repository.
+/// Declared outputs AgentOS could not place in the repository.
 ///
 /// These never contradict a no-change outcome: a path outside every root
-/// Yardlet owns — absolute, or relative and climbing out — is not a repository
+/// AgentOS owns — absolute, or relative and climbing out — is not a repository
 /// deliverable, and flipping a correct run to Partial over a worker's scratch
 /// file would recreate the very false positive this guard was corrected for.
 /// They are surfaced instead.
@@ -3867,7 +3867,7 @@ fn unplaceable_declared_outputs(
 /// against the right root matters, since every non-implementation task is
 /// REQUIRED to write `report.md` there and forbidden to touch code.
 ///
-/// A path Yardlet cannot place is NOT here — see [`unplaceable_declared_outputs`],
+/// A path AgentOS cannot place is NOT here — see [`unplaceable_declared_outputs`],
 /// which reports it without letting it flip a correct run.
 fn declared_integratable_outputs(
     result: Option<&RunResult>,
@@ -3922,7 +3922,7 @@ fn declared_integratable_outputs(
 /// - the run's own change evidence still lists an integratable worker change,
 ///   which staging would have committed; or
 /// - result.json declares integratable outputs, which the worktree therefore
-///   never held — the deliverable was written somewhere Yardlet does not
+///   never held — the deliverable was written somewhere AgentOS does not
 ///   integrate (typically the owning root) and would be reported Done while
 ///   sitting uncommitted.
 ///
@@ -4192,7 +4192,7 @@ fn partial_integration_note(paths: &[String], wt: &std::path::Path) -> String {
          deliverable stayed out of Git — the same harm as issue #55, narrowed to the case where \
          SOME of the work landed. The run is Partial and the worktree is kept at `{}`. Check \
          whether the output was written outside the run-owned worktree, then integrate it and \
-         `yardlet resolve` the task.\n",
+         `agentos resolve` the task.\n",
         paths
             .iter()
             .map(|path| format!("- `{path}`"))
@@ -4227,10 +4227,10 @@ fn no_change_contradiction_note(reason: &str, paths: &[String], wt: &std::path::
 /// Surface-neutral auto-drain guidance.
 ///
 /// `run_auto` streams these lines to whatever surface drives it — the TUI live
-/// view or the CLI — so they must NOT embed `yardlet ...` command literals. Each
+/// view or the CLI — so they must NOT embed `agentos ...` command literals. Each
 /// surface names its own affordance: the TUI shows key hints (`a` to answer, `p`
 /// to approve) via `ui/i18n.rs`, and cli.rs command handlers print the imperative
-/// `yardlet ...` form. A stop message that hardcoded one surface's command would
+/// `agentos ...` form. A stop message that hardcoded one surface's command would
 /// read wrong on the other, so the engine stays neutral and just says WHAT to do.
 pub(crate) mod gate_msg {
     use crate::ui::i18n::{self, Lang, RunProgress};
@@ -4279,7 +4279,7 @@ pub fn run_auto<F: FnMut(&str)>(
     accept_ambiguity: bool,
     mut on_event: F,
 ) -> Result<Vec<String>> {
-    // Installed at the entry point, not at each caller: `yardlet goal` reaches
+    // Installed at the entry point, not at each caller: `agentos goal` reaches
     // `run_auto` without going through `cmd_run`, and an independent review found
     // exactly that path still orphaning its worker. Every route that can start a
     // worker passes through here or `run_next` (issue #107).
@@ -4334,7 +4334,7 @@ pub fn run_auto<F: FnMut(&str)>(
         // An interrupt ends the drain, it does not just end the current task.
         // Without this the loop reads the stopped task as Failed, calls that
         // transient, and starts the next worker — after the operator asked
-        // Yardlet to stop (issue #107).
+        // AgentOS to stop (issue #107).
         if crate::signals::stop_requested() {
             emit("stopped at your request; the queue is unchanged".to_string());
             break;
@@ -4729,7 +4729,7 @@ fn migrate_stale_gate_to_decision(
             _ => detail.clone(),
         });
         let question = format!(
-            "This task needs your decision before Yardlet can run it: {}. Reply with the decision or instructions to proceed.",
+            "This task needs your decision before AgentOS can run it: {}. Reply with the decision or instructions to proceed.",
             t.title
         );
         let task_id = t.id.clone();
@@ -4850,7 +4850,7 @@ fn is_transient_failure(outcome: &workers::WorkerOutcome, run_dir: &std::path::P
 }
 
 /// Validation commands configured on a task: `validation: { commands: [..] }`
-/// or a bare sequence. Yardlet runs these itself (a worker's self-reported
+/// or a bare sequence. AgentOS runs these itself (a worker's self-reported
 /// validation is advisory, not the gate).
 fn validation_commands(task: &crate::schemas::Task) -> Vec<String> {
     if !task.has_validation() {
@@ -4894,9 +4894,9 @@ fn validation_applies(task: &crate::schemas::Task) -> bool {
 }
 
 /// Run `cmds` in `cwd` via `sh -c`, write the deterministic outcome to
-/// `run_dir/validation.json`, and return `(any_ran, all_passed)`. Yardlet (not
+/// `run_dir/validation.json`, and return `(any_ran, all_passed)`. AgentOS (not
 /// the worker) decides whether validation passed.
-/// How long a single validation command may run before Yardlet kills it. A
+/// How long a single validation command may run before AgentOS kills it. A
 /// stuck command must not hang the orchestrator after the worker has finished.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -4916,7 +4916,7 @@ fn kill_validation_child(child: &mut std::process::Child) {
 }
 
 /// Run the task's validation commands as a deterministic gate. These commands
-/// are planner-authored, so Yardlet runs them itself (not the worker) with a
+/// are planner-authored, so AgentOS runs them itself (not the worker) with a
 /// billing-scrubbed core environment (no provider keys, no worker `pass_env`),
 /// captures each command's output to the run dir, and kills any command that
 /// exceeds VALIDATION_TIMEOUT. Returns (ran_any, all_passed); a timeout counts
@@ -4985,7 +4985,7 @@ fn run_validation_commands(
     let report = serde_json::json!({
         "ran": !cmds.is_empty(),
         "all_passed": all_passed,
-        "note": "planner-authored commands, run by Yardlet with a billing-scrubbed env; \
+        "note": "planner-authored commands, run by AgentOS with a billing-scrubbed env; \
                  not sandboxed like a worker",
         "commands": results,
     });
@@ -5018,7 +5018,7 @@ fn run_worker(run_dir: &std::path::Path) -> Option<String> {
 
 /// The pid of a run's worker, if that process is still alive. The pid file is
 /// written at spawn and removed when the worker exits cleanly under a live
-/// Yardlet; an orphaned worker (Yardlet quit mid-run) keeps running with the file
+/// AgentOS; an orphaned worker (AgentOS quit mid-run) keeps running with the file
 /// in place.
 pub(crate) fn live_worker_pid(run_dir: &std::path::Path) -> Option<u32> {
     // Planning runs predate task-run provenance and have no run.yaml. Preserve
@@ -5188,7 +5188,7 @@ pub(crate) fn verified_worker_pid_for_redirect(
     Ok(provenance.pid)
 }
 
-/// A run Yardlet never finalized: its `worker.pid` is still on disk (a finalized
+/// A run AgentOS never finalized: its `worker.pid` is still on disk (a finalized
 /// run removes it the moment it sees the worker exit), the process is now gone,
 /// and it left a `result.json`. Such a run was orphaned by a dying orchestrator
 /// *after* the worker finished but *before* evaluation — its completed work is
@@ -5204,7 +5204,7 @@ fn is_orphaned_unfinalized(run_dir: &std::path::Path) -> bool {
 /// its run.yaml still reads `prepared`/`running` (never sealed), no worker
 /// process is alive, and it left NO result.json. Distinct from
 /// `is_orphaned_unfinalized`, which HAS a result to salvage. Such a run strands
-/// its task when the task's own state (e.g. `NeedsUser` after a `yardlet answer`
+/// its task when the task's own state (e.g. `NeedsUser` after a `agentos answer`
 /// run died before finalize) does not itself flag the task for recovery.
 fn is_abandoned_run(run_dir: &std::path::Path) -> bool {
     let Ok(rec) = state::load_yaml::<RunRecord>(&run_dir.join("run.yaml")) else {
@@ -5480,7 +5480,7 @@ fn registered_recovery_worktree_matches(
     // validated canonical owned path rather than its lexical spelling.
     let expected_path = actual.display().to_string();
     let expected_ref = format!("refs/heads/{branch}");
-    let expected_transaction_ref = format!("refs/heads/yardlet-txn/{branch}");
+    let expected_transaction_ref = format!("refs/heads/agentos-txn/{branch}");
     listed.split("\n\n").any(|entry| {
         let mut path_matches = false;
         let mut branch_matches = false;
@@ -5901,7 +5901,7 @@ fn reconcile_integrated_cleanups(ws: &Workspace, msgs: &mut Vec<String>) {
 
 /// Recover tasks left "running" by an interrupted/quit session: if the task's
 /// latest run produced a result, evaluate it (keep the finished work); if its
-/// worker is still alive (quitting Yardlet does not kill workers), ADOPT it —
+/// worker is still alive (quitting AgentOS does not kill workers), ADOPT it —
 /// keep the task Running and let a later pass evaluate the result, instead of
 /// starting a duplicate worker on the same task. Only a dead worker with no
 /// result is requeued. A parallel worktree run that finished Done is also
@@ -6032,11 +6032,11 @@ pub(crate) fn recover_orphans(ws: &Workspace) -> Vec<String> {
                         .as_ref()
                         .map(|evidence| evidence.paths.clone()),
                     // No worktree: the workspace git status is the evidence,
-                    // but it also carries Yardlet's OWN canonical-state
+                    // but it also carries AgentOS's OWN canonical-state
                     // writes (it wrote the queue when it marked this task
                     // Running). With no pre-run baseline those cannot be
                     // attributed to the worker, so drop them rather than
-                    // false-fail the canonical-state gate on Yardlet's own
+                    // false-fail the canonical-state gate on AgentOS's own
                     // writes.
                     None => evaluator::changed_paths(&ws.root).map(|paths| {
                         paths
@@ -6468,7 +6468,7 @@ fn requeue_review_locked(
 /// worker-proposed follow-up tasks, and save once. Re-reading first means a
 /// change made since the run started is not clobbered by a stale start-of-run
 /// copy; folding the state update and follow-up ingestion into one write keeps
-/// Yardlet the sole queue writer (propose -> ingest). Returns the ids of the
+/// AgentOS the sole queue writer (propose -> ingest). Returns the ids of the
 /// follow-up tasks ingested.
 // The single canonical "settle a task on the latest queue" path: it needs the
 // full run context (identity, scope, follow-ups, worker vocab) plus the typed
@@ -7018,7 +7018,7 @@ pub(crate) fn feedback_next_state(feedback: &FeedbackRecord) -> TaskState {
 
 /// Typed origin for a task settling NeedsUser out of run finalization. A
 /// worker-authored question is a genuine conversation (`WorkerQuestion`,
-/// `yardlet answer`-only). A System question synthesized by the terminal
+/// `agentos answer`-only). A System question synthesized by the terminal
 /// goal-feedback loop marks the approach itself as failed
 /// (`GoalFeedbackExhausted`, same-intent replan eligible). Any other System
 /// pause (provider refusal, fallback question) stays untyped.
@@ -7430,7 +7430,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
         }
     }
 
-    // Deterministic validation: Yardlet core runs the task's configured
+    // Deterministic validation: AgentOS core runs the task's configured
     // validation commands itself. Any failure (or a `required` task with
     // nothing to run) is fatal and blocks Done. Scoped to code tasks: a
     // doc/non-code task is not failed by an unrelated whole-app command
@@ -7719,7 +7719,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
     )?;
 
     // Harness learning loop (S3): record skills/rules the worker proposed. The
-    // worker authored the content; Yardlet (the core) does the writing.
+    // worker authored the content; AgentOS (the core) does the writing.
     if flags.learned {
         if let Some(r) = &result {
             let learned = crate::skills::record_run_suggestions(ws, &r.harness_suggestions);
@@ -7738,13 +7738,13 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
             if !untracked.is_empty() {
                 lines.push(format!(
                     "learned harness assets are NOT in git yet: {}. Commit them with \
-                     `yardlet skill commit`",
+                     `agentos skill commit`",
                     untracked.join(", ")
                 ));
                 let note = format!(
                     "\n## Untracked harness assets\n\nThis run learned harness assets that are \
                      on disk but not in git:\n\n{}\n\nThey are not durable until committed:\n\n\
-                     ```\nyardlet skill commit\n```\n",
+                     ```\nagentos skill commit\n```\n",
                     untracked
                         .iter()
                         .map(|path| format!("- `{path}`"))
@@ -7782,7 +7782,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
             worktree: m.wt_path,
             workspace: &ws.root,
         };
-        // Declared outputs Yardlet cannot place are not repository deliverables
+        // Declared outputs AgentOS cannot place are not repository deliverables
         // and must not flip a correct run, but they must not vanish either. The
         // run lines are transient — a background or parallel drain may never put
         // them in front of anyone — so the record goes in the handoff too.
@@ -7790,13 +7790,13 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
         if !unplaceable.is_empty() {
             for path in &unplaceable {
                 lines.push(format!(
-                    "{}: declared output {path} is outside this workspace; Yardlet did not integrate it",
+                    "{}: declared output {path} is outside this workspace; AgentOS did not integrate it",
                     task.id
                 ));
             }
             let note = format!(
                 "\n## Declared outputs outside the workspace\n\nThe worker declared these paths, \
-                 which are not inside this repository:\n\n{}\n\nYardlet did not integrate them and \
+                 which are not inside this repository:\n\n{}\n\nAgentOS did not integrate them and \
                  cannot say anything about them. They are recorded here so they are not lost \
                  silently; nothing about this run's state depends on them.\n",
                 unplaceable
@@ -7831,7 +7831,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
                 next_state = TaskState::Partial;
                 let _ = state::write_str(&run_dir.join("partial-reason"), "auto_commit_disabled");
                 let note = format!(
-                    "\n## Git integration paused\n\n`auto_commit` is disabled, so Yardlet did not \
+                    "\n## Git integration paused\n\n`auto_commit` is disabled, so AgentOS did not \
                      commit or merge this run. The isolated worktree is retained at `{}`.\n",
                     m.wt_path.display()
                 );
@@ -8151,7 +8151,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
                     next_state = TaskState::Partial;
                     let _ = state::write_str(&run_dir.join("partial-reason"), "integration_error");
                     let note = format!(
-                        "\n## Integration error\n\nYardlet could not integrate `{}`: {}\n\
+                        "\n## Integration error\n\nAgentOS could not integrate `{}`: {}\n\
                          This is not a merge conflict: there is nothing to resolve by hand. \
                          The worktree is kept at `{}`.\n",
                         m.branch,
@@ -8300,7 +8300,7 @@ pub(crate) fn finalize_run(input: FinalizeInput) -> Result<FinalizeReport> {
     let telemetry_state = next_state;
 
     // Update the queue: set state AND ingest any follow-up tasks the worker
-    // proposed (propose -> ingest). Yardlet stays the sole queue writer — both
+    // proposed (propose -> ingest). AgentOS stays the sole queue writer — both
     // land in one re-read-then-save.
     // Recovery (follow_ups off) only finalizes the stranded run's state — it must
     // not ingest new follow-ups or re-queue a review, which would rewrite the
@@ -10044,7 +10044,7 @@ mod tests {
 
     #[test]
     fn gate_messages_are_surface_neutral_no_command_literals() {
-        // AC-004: engine-streamed guidance names WHAT to do, never a `yardlet ...`
+        // AC-004: engine-streamed guidance names WHAT to do, never a `agentos ...`
         // command literal (each surface renders its own affordance).
         let msgs = [
             gate_msg::needs_user(Lang::En, "YARD-007"),
@@ -10054,7 +10054,7 @@ mod tests {
         ];
         for m in &msgs {
             assert!(
-                !m.contains("yardlet"),
+                !m.contains("agentos"),
                 "gate message leaked a command literal: {m:?}"
             );
         }
@@ -10327,8 +10327,8 @@ mod tests {
             .output();
         write_str(&root.join("fixture.txt"), "fixture\n").unwrap();
         for args in [
-            &["config", "user.name", "Yardlet Test"][..],
-            &["config", "user.email", "yardlet@example.test"][..],
+            &["config", "user.name", "AgentOS Test"][..],
+            &["config", "user.email", "agentos@example.test"][..],
             &["add", "fixture.txt"][..],
             &["commit", "-q", "-m", "fixture baseline"][..],
         ] {
@@ -10346,7 +10346,7 @@ mod tests {
         }
         write_str(
             &ws.config_path(),
-            "schema_version: 1\nproduct: yardlet\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\n# unit fixtures opt into full access explicitly: they exercise run/parallel\n# mechanics with bash fixture workers that declare no sandbox contract\ndefault_access: full\n",
+            "schema_version: 1\nproduct: agentos\nworkspace_id: test\ncreated_at: \"2026-07-03T00:00:00Z\"\nstate_dir: .agents\ndefault_interface: tui\ncanonical_queue: work-queue.yaml\ncurrent_intent: intent-contract.yaml\n# unit fixtures opt into full access explicitly: they exercise run/parallel\n# mechanics with bash fixture workers that declare no sandbox contract\ndefault_access: full\n",
         )
         .unwrap();
         write_str(&ws.billing_path(), "schema_version: 1\n").unwrap();
@@ -12032,7 +12032,7 @@ printf '# handoff\n' > "$run_dir/handoff.md"
             &[
                 "show-ref",
                 "--verify",
-                &format!("refs/heads/yardlet-txn/{}", record.worktree_branch),
+                &format!("refs/heads/agentos-txn/{}", record.worktree_branch),
             ],
         );
         assert!(target.is_ok() || transaction.is_ok());
@@ -12052,7 +12052,7 @@ printf '# handoff\n' > "$run_dir/handoff.md"
     fn no_ready_worker_removes_owned_serial_worktree_and_branch() {
         let ws = init_test_workspace(
             "serial-no-ready-cleanup",
-            "schema_version: 1\nrouting: {default_worker: missing}\nworkers:\n  - id: missing\n    invocation: {command: yardlet-definitely-missing-worker-command}\n",
+            "schema_version: 1\nrouting: {default_worker: missing}\nworkers:\n  - id: missing\n    invocation: {command: agentos-definitely-missing-worker-command}\n",
         );
         ws.save_queue(&queue(vec![task(
             "YARD-NO-READY",
@@ -12195,8 +12195,8 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
                 String::from_utf8_lossy(&output.stderr)
             );
         };
-        git(&["config", "user.name", "Yardlet Test"]);
-        git(&["config", "user.email", "yardlet@example.test"]);
+        git(&["config", "user.name", "AgentOS Test"]);
+        git(&["config", "user.email", "agentos@example.test"]);
         git(&["add", "owned.txt"]);
         git(&["commit", "-q", "-m", "baseline"]);
         let mut q = queue(vec![task("YARD-ISO", TaskState::Queued, 10, false)]);
@@ -12292,7 +12292,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
         assert!(std::path::Path::new(&retained_default_off).exists());
 
         // An overlapping concurrent main edit is never staged or overwritten.
-        // Git refuses the merge, Yardlet records Partial, and keeps the owned
+        // Git refuses the merge, AgentOS records Partial, and keeps the owned
         // worktree for inspection.
         write_str(&payload, "third worker change\n").unwrap();
         write_str(&ws.root.join("owned.txt"), "user overlapping edit\n").unwrap();
@@ -12613,7 +12613,7 @@ run_dir="$1"
 spawn_marker="$2"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 status=done
 created='[]'
 case "$task_id" in
@@ -12853,7 +12853,7 @@ run_dir="$1"
 owning_root="$2"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 printf "declared deliverable\n" > "$owning_root/declared-deliverable.txt"
 cat > "$run_dir/result.json" <<EOF
 {
@@ -12991,7 +12991,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
     }
 
     /// The wiring, not just the helper: a worker that names a deliverable from
-    /// its OWN cwd (the worktree) while actually writing it somewhere Yardlet
+    /// its OWN cwd (the worktree) while actually writing it somewhere AgentOS
     /// does not integrate must still be caught. Resolving that path against the
     /// owning root instead lands it under `.agents/worktrees/**`, which the
     /// allowlist rejects — so the guard goes silent and issue #55 ships again.
@@ -13017,7 +13017,7 @@ run_dir="$1"
 owning_root="$2"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 mkdir -p "$owning_root/tests"
 printf "// deliverable\n" > "$owning_root/tests/new.rs"
 cat > "$run_dir/result.json" <<EOF
@@ -13111,7 +13111,7 @@ printf "# worker handoff\n" > "$run_dir/handoff.md"
 run_dir="$1"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 printf "# findings
 " > "$run_dir/report.md"
 cat > "$run_dir/result.json" <<EOF
@@ -13299,7 +13299,7 @@ printf "# worker handoff
         // in a parallel batch condemning a sibling that finished correctly.
         assert!(ws.run_interruption_cause("run-b").is_none());
 
-        // The cause is carried, not just the fact, so a `yardlet redirect` stop
+        // The cause is carried, not just the fact, so a `agentos redirect` stop
         // can never be read as an operator interrupt.
         ws.record_run_interrupted("run-c", "redirect").unwrap();
         assert_eq!(
@@ -13360,7 +13360,7 @@ printf "# worker handoff
             // Written through init so the fixture matches the real schema
             // rather than a hand-rolled subset that silently fails to parse.
             crate::init::ensure_initialized(&root).expect("init the fixture workspace");
-            let config_path = ws.agents_dir().join("yardlet.yaml");
+            let config_path = ws.agents_dir().join("agentos.yaml");
             let config = std::fs::read_to_string(&config_path).unwrap();
             let config = config
                 .lines()
@@ -13674,7 +13674,7 @@ printf "# worker handoff
         };
 
         // Change evidence outranks the self-report: staging would have committed
-        // this path, so a no-change outcome contradicts Yardlet's own diff.
+        // this path, so a no-change outcome contradicts AgentOS's own diff.
         let evidenced = result(&[], &[], &[]);
         assert_eq!(
             contradiction(&evidenced, &["src/lib.rs".to_string()]),
@@ -13763,7 +13763,7 @@ printf "# worker handoff
             "a review run's own artifacts must not read as lost repository output"
         );
 
-        // A path Yardlet cannot place is not a repository deliverable, so it
+        // A path AgentOS cannot place is not a repository deliverable, so it
         // must NOT flip a correct run — that would recreate the false positive
         // this guard was corrected for. It is reported instead, and the two
         // spellings of "outside" must agree.
@@ -13984,7 +13984,7 @@ run_dir="$1"
 spawn_marker="$2"
 run_id=$(basename "$run_dir")
 packet=$(cat)
-task_id=$(printf "%s" "$packet" | sed -n 's/^# Yardlet task packet: //p' | head -n 1)
+task_id=$(printf "%s" "$packet" | sed -n 's/^# AgentOS task packet: //p' | head -n 1)
 status=done
 case "$task_id" in
   YARD-UPSTREAM)
@@ -15236,7 +15236,7 @@ exit 1
 "#,
         );
         let worker_yaml = format!(
-            "schema_version: 1\nrouting:\n  default_worker: dead\n  fallback_order: [dead, missing]\nworkers:\n  - id: dead\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n  - id: missing\n    invocation:\n      command: yardlet-definitely-missing-worker-command\n      supports_noninteractive: true\n      output_contract: files\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
+            "schema_version: 1\nrouting:\n  default_worker: dead\n  fallback_order: [dead, missing]\nworkers:\n  - id: dead\n    invocation:\n      command: bash\n      supports_noninteractive: true\n      output_contract: files\n      args: [{}, \"{{run_dir}}\", {}]\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n  - id: missing\n    invocation:\n      command: agentos-definitely-missing-worker-command\n      supports_noninteractive: true\n      output_contract: files\n    limits:\n      max_wall_minutes: 1\n      max_retries: 0\n",
             shell_literal(&dead),
             shell_literal(&attempts)
         );
@@ -15727,7 +15727,7 @@ exit 1
             &ws.root,
             &[
                 "update-ref",
-                &format!("refs/heads/yardlet-txn/{branch}"),
+                &format!("refs/heads/agentos-txn/{branch}"),
                 &worker_oid,
                 "",
             ],
@@ -15821,7 +15821,7 @@ exit 1
             .is_empty());
         write_str(&rule, "# User dirty edit\n").unwrap();
 
-        // Exact crash window: Git removed the worktree, but Yardlet had not yet
+        // Exact crash window: Git removed the worktree, but AgentOS had not yet
         // deleted the owned target/transaction refs or marked cleanup complete.
         git_stdout(
             &ws.root,
@@ -15849,7 +15849,7 @@ exit 1
             &[
                 "show-ref",
                 "--verify",
-                &format!("refs/heads/yardlet-txn/{branch}")
+                &format!("refs/heads/agentos-txn/{branch}")
             ]
         )
         .is_err());
@@ -16320,7 +16320,7 @@ exit 1
 
     #[test]
     fn recovery_merges_a_finished_orphaned_worktree_run() {
-        // A parallel worktree run finished (result.json written) but Yardlet died
+        // A parallel worktree run finished (result.json written) but AgentOS died
         // before integrating. Recovery must merge the work back, not just mark
         // the task Done with its changes stranded in the worktree.
         let root = std::env::temp_dir().join(format!("yard-orphan-wt-{}", std::process::id()));
@@ -16934,7 +16934,7 @@ exit 1
         assert_eq!(
             ws.load_queue().unwrap().tasks[0].state,
             TaskState::Done,
-            "Yardlet-seeded canonical copies are not worker changes: {messages:?}"
+            "AgentOS-seeded canonical copies are not worker changes: {messages:?}"
         );
         assert!(
             !run_dir.join("feedback.json").exists(),
@@ -18896,8 +18896,8 @@ exit 1
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.name", "Yardlet Test"]);
-        git(&["config", "user.email", "yardlet@example.test"]);
+        git(&["config", "user.name", "AgentOS Test"]);
+        git(&["config", "user.email", "agentos@example.test"]);
         std::fs::write(root.join("owned.txt"), "seed\n").unwrap();
         git(&["add", "owned.txt"]);
         git(&["commit", "-q", "-m", "seed"]);

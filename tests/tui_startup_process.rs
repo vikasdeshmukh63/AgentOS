@@ -59,10 +59,10 @@ fn slow_probe_and_recovery_do_not_block_first_safe_tui_frame() {
         .unwrap();
     assert!(
         init.status.success(),
-        "yardlet init failed: {}",
+        "agentos init failed: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let config_path = root.join(".agents/yardlet.yaml");
+    let config_path = root.join(".agents/agentos.yaml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("language: auto", "language: en");
@@ -88,8 +88,8 @@ fn slow_probe_and_recovery_do_not_block_first_safe_tui_frame() {
         .current_dir(&root)
         .env("PATH", path)
         .env("TERM", "xterm-256color")
-        .env("YARDLET_PROCESS_FIXTURE", "1")
-        .env("YARDLET_FIXTURE_RECOVERY_DELAY_MS", "11000")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_FIXTURE_RECOVERY_DELAY_MS", "11000")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
@@ -99,7 +99,7 @@ fn slow_probe_and_recovery_do_not_block_first_safe_tui_frame() {
     // (issue #64).
     let mut child = common::ChildGuard::new(child);
 
-    let marker = b"Starting Yardlet safely";
+    let marker = b"Starting AgentOS safely";
     let deadline = started + Duration::from_secs(3);
     let mut output = Vec::new();
     let first_frame = loop {

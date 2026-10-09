@@ -1,4 +1,4 @@
-//! Stopping `yardlet run` must take its worker with it (issue #107).
+//! Stopping `agentos run` must take its worker with it (issue #107).
 //!
 //! The counterpart to #52, not a reversal of it. A worker leads its own process
 //! group so it survives the TERMINAL closing — an operator quitting the host app
@@ -7,13 +7,13 @@
 //! goes to its own foreground group, and not a test harness's, which has no
 //! handle on a group it did not create.
 //!
-//! Yardlet holds the only handle. Before this, it never used it on the stop
+//! AgentOS holds the only handle. Before this, it never used it on the stop
 //! path: `terminate_worker_tree` existed and nothing called it when the
 //! orchestrator was asked to stop, so interrupting a run killed the parent and
 //! left the worker holding the run directory. That is the most likely source of
-//! the four `yardlet` processes found alive 26 hours later in #64.
+//! the four `agentos` processes found alive 26 hours later in #64.
 //!
-//! Here Yardlet is signalled DIRECTLY — not its group — so nothing but Yardlet's
+//! Here AgentOS is signalled DIRECTLY — not its group — so nothing but AgentOS's
 //! own teardown can explain the worker's death.
 
 #![cfg(unix)]
@@ -92,7 +92,7 @@ fn pid_file_is_ready_only_with_numeric_contents() {
         .unwrap()
         .as_nanos();
     let workspace = common::WorkspaceGuard::create(std::env::temp_dir().join(format!(
-        "yardlet-run-stop-pid-ready-{}-{nonce}",
+        "agentos-run-stop-pid-ready-{}-{nonce}",
         std::process::id()
     )));
     let pid_file = workspace.path().join("worker-pid");
@@ -119,14 +119,14 @@ fn wait_until_gone(pid: i32, within: Duration) -> bool {
 }
 
 #[test]
-fn stopping_yardlet_takes_the_worker_it_started_with_it() {
+fn stopping_agentos_takes_the_worker_it_started_with_it() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_agentos"));
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let workspace = common::WorkspaceGuard::create(
-        std::env::temp_dir().join(format!("yardlet-run-stop-{}-{nonce}", std::process::id())),
+        std::env::temp_dir().join(format!("agentos-run-stop-{}-{nonce}", std::process::id())),
     );
     let root = workspace.path().to_path_buf();
     must_succeed(&root, Path::new("git"), &["init", "-q"]);
@@ -152,7 +152,7 @@ fn stopping_yardlet_takes_the_worker_it_started_with_it() {
     .unwrap();
     fs::write(
         root.join(".agents/work-queue.yaml"),
-        "schema_version: 1\nqueue_id: queue-stop\nintent_id: intent-stop\ntasks:\n  - id: YARD-001\n    title: run stop fixture\n    state: queued\n    priority: 10\n    risk: low\n    kind: implementation\n    preferred_worker: fixture\n    acceptance: [stopping yardlet stops the worker]\n",
+        "schema_version: 1\nqueue_id: queue-stop\nintent_id: intent-stop\ntasks:\n  - id: YARD-001\n    title: run stop fixture\n    state: queued\n    priority: 10\n    risk: low\n    kind: implementation\n    preferred_worker: fixture\n    acceptance: [stopping agentos stops the worker]\n",
     )
     .unwrap();
     fs::write(
@@ -165,27 +165,27 @@ fn stopping_yardlet_takes_the_worker_it_started_with_it() {
     )
     .unwrap();
 
-    // Its own group, so the signal below can target Yardlet alone and cannot
+    // Its own group, so the signal below can target AgentOS alone and cannot
     // reach the worker by accident — the worker's death has to come from
-    // Yardlet's teardown or not at all.
-    let yardlet = Command::new(&binary)
+    // AgentOS's teardown or not at all.
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            fs::File::create(root.join("yardlet.err")).unwrap(),
+            fs::File::create(root.join("agentos.err")).unwrap(),
         ))
         .process_group(0)
         .spawn()
         .unwrap();
-    let yardlet_pid = yardlet.id() as i32;
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let agentos_pid = agentos.id() as i32;
+    let mut agentos = common::ChildGuard::new(agentos);
 
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
-        "the fixture worker never started; yardlet said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "the fixture worker never started; agentos said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
     let worker_pid: i32 = fs::read_to_string(&ids)
         .unwrap()
@@ -194,20 +194,20 @@ fn stopping_yardlet_takes_the_worker_it_started_with_it() {
         .expect("numeric worker pid");
     assert!(alive(worker_pid), "the fixture worker never started");
 
-    // Exactly what Ctrl-C delivers, to Yardlet only.
+    // Exactly what Ctrl-C delivers, to AgentOS only.
     assert_eq!(
-        unsafe { libc::kill(yardlet_pid, libc::SIGINT) },
+        unsafe { libc::kill(agentos_pid, libc::SIGINT) },
         0,
-        "could not signal Yardlet"
+        "could not signal AgentOS"
     );
 
     assert!(
         wait_until_gone(worker_pid, Duration::from_secs(30)),
-        "the worker outlived the Yardlet that started it: nothing else can reach \
+        "the worker outlived the AgentOS that started it: nothing else can reach \
          it, because it leads its own process group by design (#52), so it would \
          have run to its own completion holding the run directory"
     );
-    yardlet.shutdown(Duration::from_secs(15), || {});
+    agentos.shutdown(Duration::from_secs(15), || {});
 
     // The stop must not be recorded as the task finishing — and "not done" is too
     // weak on its own, because a stopped run that fell through to failover lands
@@ -235,10 +235,10 @@ fn stopping_yardlet_takes_the_worker_it_started_with_it() {
     );
 }
 
-/// The stop path has to reach the whole tree, not just the process Yardlet
+/// The stop path has to reach the whole tree, not just the process AgentOS
 /// spawned. A launcher that handles SIGTERM exits while the agent CLI it started
 /// ignores it and keeps the inherited pipes open: the grandchild survives, and
-/// Yardlet blocks forever waiting for an EOF that cannot come. Same shape as #52,
+/// AgentOS blocks forever waiting for an EOF that cannot come. Same shape as #52,
 /// reached through the stop path.
 #[test]
 fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
@@ -248,7 +248,7 @@ fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
         .unwrap()
         .as_nanos();
     let workspace = common::WorkspaceGuard::create(std::env::temp_dir().join(format!(
-        "yardlet-run-stop-tree-{}-{nonce}",
+        "agentos-run-stop-tree-{}-{nonce}",
         std::process::id()
     )));
     let root = workspace.path().to_path_buf();
@@ -306,24 +306,24 @@ fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
     )
     .unwrap();
 
-    let yardlet = Command::new(&binary)
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            fs::File::create(root.join("yardlet.err")).unwrap(),
+            fs::File::create(root.join("agentos.err")).unwrap(),
         ))
         .process_group(0)
         .spawn()
         .unwrap();
-    let yardlet_pid = yardlet.id() as i32;
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let agentos_pid = agentos.id() as i32;
+    let mut agentos = common::ChildGuard::new(agentos);
 
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
-        "the grandchild never started; yardlet said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "the grandchild never started; agentos said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
     let grandchild: i32 = fs::read_to_string(&ids)
         .unwrap()
@@ -332,17 +332,17 @@ fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
         .expect("numeric grandchild pid");
 
     assert_eq!(
-        unsafe { libc::kill(yardlet_pid, libc::SIGINT) },
+        unsafe { libc::kill(agentos_pid, libc::SIGINT) },
         0,
-        "could not signal Yardlet"
+        "could not signal AgentOS"
     );
 
     assert!(
         wait_until_gone(grandchild, Duration::from_secs(30)),
         "the grandchild ignored SIGTERM and was never escalated to, so it still \
-         holds Yardlet's pipes"
+         holds AgentOS's pipes"
     );
-    // `kill(pid, 0)` is NOT the check: Yardlet is this test's child, so once it
+    // `kill(pid, 0)` is NOT the check: AgentOS is this test's child, so once it
     // exits it stays a reapable zombie and a liveness probe keeps succeeding.
     // `try_wait` distinguishes "still running" from "exited". (Third time this
     // trap was walked into on this branch — it is why the guard tests assert on
@@ -350,7 +350,7 @@ fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut exited = false;
     while Instant::now() < deadline {
-        if matches!(yardlet.as_mut().try_wait(), Ok(Some(_))) {
+        if matches!(agentos.as_mut().try_wait(), Ok(Some(_))) {
             exited = true;
             break;
         }
@@ -358,8 +358,8 @@ fn stopping_reaches_a_grandchild_whose_launcher_exits_first() {
     }
     assert!(
         exited,
-        "Yardlet is still waiting on a stream its grandchild never closed; it said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "AgentOS is still waiting on a stream its grandchild never closed; it said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
 }
 
@@ -375,7 +375,7 @@ fn a_result_written_before_the_interrupt_does_not_finish_the_task() {
         .unwrap()
         .as_nanos();
     let workspace = common::WorkspaceGuard::create(std::env::temp_dir().join(format!(
-        "yardlet-run-stop-result-{}-{nonce}",
+        "agentos-run-stop-result-{}-{nonce}",
         std::process::id()
     )));
     let root = workspace.path().to_path_buf();
@@ -436,24 +436,24 @@ fn a_result_written_before_the_interrupt_does_not_finish_the_task() {
     )
     .unwrap();
 
-    let yardlet = Command::new(&binary)
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
-            fs::File::create(root.join("yardlet.err")).unwrap(),
+            fs::File::create(root.join("agentos.err")).unwrap(),
         ))
         .process_group(0)
         .spawn()
         .unwrap();
-    let yardlet_pid = yardlet.id() as i32;
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let agentos_pid = agentos.id() as i32;
+    let mut agentos = common::ChildGuard::new(agentos);
 
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
-        "the fixture worker never started; yardlet said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "the fixture worker never started; agentos said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
     assert!(
         root.join(".agents/runs").exists(),
@@ -461,15 +461,15 @@ fn a_result_written_before_the_interrupt_does_not_finish_the_task() {
     );
 
     assert_eq!(
-        unsafe { libc::kill(yardlet_pid, libc::SIGINT) },
+        unsafe { libc::kill(agentos_pid, libc::SIGINT) },
         0,
-        "could not signal Yardlet"
+        "could not signal AgentOS"
     );
 
     let deadline = Instant::now() + Duration::from_secs(40);
     let mut exited = false;
     while Instant::now() < deadline {
-        if matches!(yardlet.as_mut().try_wait(), Ok(Some(_))) {
+        if matches!(agentos.as_mut().try_wait(), Ok(Some(_))) {
             exited = true;
             break;
         }
@@ -477,8 +477,8 @@ fn a_result_written_before_the_interrupt_does_not_finish_the_task() {
     }
     assert!(
         exited,
-        "Yardlet never finished after the interrupt; it said:\n{}",
-        fs::read_to_string(root.join("yardlet.err")).unwrap_or_default()
+        "AgentOS never finished after the interrupt; it said:\n{}",
+        fs::read_to_string(root.join("agentos.err")).unwrap_or_default()
     );
 
     let queue = fs::read_to_string(root.join(".agents/work-queue.yaml")).unwrap_or_default();
@@ -492,7 +492,7 @@ fn a_result_written_before_the_interrupt_does_not_finish_the_task() {
 /// Issue #110: a stopped run that reaches finalization in a LATER process must
 /// not be recorded finished. Review reproduced the shape — interrupt after Done
 /// evidence exists, let the queue save fail, restore the durable `running`
-/// queue, and a fresh `yardlet recover` reported `YARD-001 -> done` with no
+/// queue, and a fresh `agentos recover` reported `YARD-001 -> done` with no
 /// marker anywhere, because the decision lived only in the process that made it.
 #[test]
 fn recover_in_a_fresh_process_honours_the_interruption() {
@@ -502,7 +502,7 @@ fn recover_in_a_fresh_process_honours_the_interruption() {
         .unwrap()
         .as_nanos();
     let workspace = common::WorkspaceGuard::create(std::env::temp_dir().join(format!(
-        "yardlet-stop-recover-{}-{nonce}",
+        "agentos-stop-recover-{}-{nonce}",
         std::process::id()
     )));
     let root = workspace.path().to_path_buf();
@@ -563,7 +563,7 @@ fn recover_in_a_fresh_process_honours_the_interruption() {
     )
     .unwrap();
 
-    let yardlet = Command::new(&binary)
+    let agentos = Command::new(&binary)
         .args(["run", "--task", "YARD-001", "--execute"])
         .current_dir(&root)
         .stdin(Stdio::null())
@@ -572,14 +572,14 @@ fn recover_in_a_fresh_process_honours_the_interruption() {
         .process_group(0)
         .spawn()
         .unwrap();
-    let yardlet_pid = yardlet.id() as i32;
-    let mut yardlet = common::ChildGuard::new(yardlet);
+    let agentos_pid = agentos.id() as i32;
+    let mut agentos = common::ChildGuard::new(agentos);
     assert!(
         wait_for(&ids, Duration::from_secs(60)),
         "worker never started"
     );
-    assert_eq!(unsafe { libc::kill(yardlet_pid, libc::SIGINT) }, 0);
-    yardlet.shutdown(Duration::from_secs(30), || {});
+    assert_eq!(unsafe { libc::kill(agentos_pid, libc::SIGINT) }, 0);
+    agentos.shutdown(Duration::from_secs(30), || {});
 
     // The interrupted process recorded its verdict in core-owned state, outside
     // the run directory a worker can write.

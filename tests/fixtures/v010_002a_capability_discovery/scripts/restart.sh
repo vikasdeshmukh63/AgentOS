@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "$#" -ne 3 ]]; then
-  printf 'usage: %s <yardlet-bin> <workspace> <output-json>\n' "$0" >&2
+  printf 'usage: %s <agentos-bin> <workspace> <output-json>\n' "$0" >&2
   exit 64
 fi
 

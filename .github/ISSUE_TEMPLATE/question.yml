@@ -1,5 +1,5 @@
 name: Question
-description: Ask for help with Yardlet setup or usage
+description: Ask for help with AgentOS setup or usage
 title: "[Question]: "
 labels:
   - question
@@ -14,8 +14,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: Yardlet version
-      placeholder: yardlet x.y.z
+      label: AgentOS version
+      placeholder: agentos x.y.z
     validations:
       required: true
   - type: input

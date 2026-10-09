@@ -22,7 +22,7 @@ fn protected_branch_delivery_and_crash_recovery_are_process_safe() {
         .expect("system clock before Unix epoch")
         .as_nanos();
     let evidence = std::env::temp_dir().join(format!(
-        "yardlet-protected-branch-pr-{}-{nonce}",
+        "agentos-protected-branch-pr-{}-{nonce}",
         std::process::id()
     ));
     std::fs::create_dir_all(&evidence).expect("create fixture evidence directory");

@@ -1,8 +1,8 @@
 schema_version: 1
 mode: zero_key_subscription_workers
 
-# Yard core itself must never touch AI provider API billing.
-yard_core:
+# AgentOS core itself must never touch AI provider API billing.
+agentos_core:
   require_ai_api_key: false
   ask_for_ai_api_key: false
   store_ai_api_key: false
@@ -20,7 +20,7 @@ worker_invocation:
   never_print_secret_values: true
 
 # Environment variables that must not leak into a worker subprocess.
-# Yard scrubs these from the worker env so a subscription-backed CLI does
+# AgentOS scrubs these from the worker env so a subscription-backed CLI does
 # not accidentally bill against an API key.
 blocked_worker_env_names:
   - OPENAI_API_KEY

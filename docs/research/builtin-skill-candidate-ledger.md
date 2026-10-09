@@ -1,6 +1,6 @@
 # Built-in Skill Candidate Ledger (YARD-002)
 
-> Yardlet fresh install에 번들할 built-in skill 후보의 외부 원출처 원장.
+> AgentOS fresh install에 번들할 built-in skill 후보의 외부 원출처 원장.
 > 최소 세트 확정(YARD-003)과 독립 검증(YARD-004)의 입력 문서이며, 이 문서 자체는
 > 어떤 skill 파일도 생성/복사/설치하지 않는다.
 > 정정: 2026-07-12 (YARD-005) — YARD-004 review F-002·F-003 반영. KDS-01·HDN-01 commit 고정,
@@ -14,7 +14,7 @@
 | 항목 | 값 |
 |---|---|
 | 조사 기준일 | 2026-07-12 (Asia/Seoul) |
-| 조사 주체 | Yardlet run `run-20260712-151807-yard-002` (task YARD-002, researcher) |
+| 조사 주체 | AgentOS run `run-20260712-151807-yard-002` (task YARD-002, researcher) |
 | 조사 방법 | GitHub REST API(`gh api`)로 repo metadata, git tree, blob을 commit 고정 상태로 조회. 파일 본문은 `raw.githubusercontent.com/<org>/<repo>/<commit>/<path>` 정적 열람 |
 | 실행 안전성 | 후보 저장소 clone 없음, bundled script 실행 0회, 로그인/쓰기 작업 0회, secret 제공 0회. 모든 network 접근은 읽기 전용 GET |
 | license 판별 | repo-level license API + skill별 LICENSE 파일 blob SHA 비교(동일 SHA = 동일 전문) 후 blob 본문 확인 |
@@ -70,7 +70,7 @@ discovery source로만 분리 관리한다(5.1절 DS-01).
 | 크기 권고 | SKILL.md 500줄 미만 유지, 상세 자료는 `references/` 분리, 참조는 skill root 기준 상대 경로 1단계 |
 | 선택 디렉토리 | `scripts/`(실행 코드), `references/`(문서), `assets/`(정적 자원) |
 
-Yardlet 함의: `allowed-tools`는 experimental이므로 built-in 후보의 권한 판정은
+AgentOS 함의: `allowed-tools`는 experimental이므로 built-in 후보의 권한 판정은
 frontmatter가 아니라 bundled 파일의 정적 inspection(4절)으로 한다.
 
 ## 3. Repository 유지/공식성 판정 매트릭스
@@ -183,7 +183,7 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
 - source path: `skills/verification-before-completion/`
 - bundled: `SKILL.md` 단일
 - 요구: 없음
-- activation 범위: core 후보. 완료 주장/commit 직전 trigger. Yardlet evaluator 및
+- activation 범위: core 후보. 완료 주장/commit 직전 trigger. AgentOS evaluator 및
   verdict 계약(docs/skills.md의 structured review verdicts)과 정합
 - overlap: 로컬 yard `git-finish`, `git-finish-4`(git 종결 특화, 보완), `local-reference-catalog` `delivery-cycle`(식별자 수준)
 - adaptation: 낮음
@@ -197,17 +197,17 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
   (둘 다 이 원장에서 제외/조건부 상태). 또한 빈번한 git commit을 계획 단계에 포함하도록 지시한다(로컬)
 - 요구: 로컬 git 작업 외 없음. 단 위 참조 문구를 제거하지 않으면 번들이 존재하지 않는 skill을
   요구하는 죽은 지시가 된다
-- activation 범위: core 후보이나 조건부. Yardlet은 planner가 intent/queue를 이미 생성하므로
+- activation 범위: core 후보이나 조건부. AgentOS은 planner가 intent/queue를 이미 생성하므로
   이 skill은 "task 내부 구현 계획" 용도로 재범위화해야 함
-- overlap: **높음**. Yardlet planner(`src/planner.rs`), 로컬 yard `planning-gate`,
+- overlap: **높음**. AgentOS planner(`src/planner.rs`), 로컬 yard `planning-gate`,
   `local-reference-catalog` `planning-gate`(식별자 수준)
 - adaptation: 높음(범위 재정의 + 미채택 skill 참조 문구 제거. 둘 다 없이는 설치 불가)
 - verification: static-verified @ `d884ae0` (본문 표면 재검증 2026-07-12)
 
 #### SPW-05 executing-plans [C]
 - source path: `skills/executing-plans/`, bundled: `SKILL.md` 단일, 요구 없음
-- activation 범위: 조건부. "별도 세션에서 계획 실행" 모델은 Yardlet queue 실행과 중복
-- overlap: Yardlet work-queue 실행 모델 자체
+- activation 범위: 조건부. "별도 세션에서 계획 실행" 모델은 AgentOS queue 실행과 중복
+- overlap: AgentOS work-queue 실행 모델 자체
 - adaptation: 높음. SPW-04와 묶어 판단 권장
 - verification: static-verified @ `d884ae0`
 
@@ -215,9 +215,9 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
 - source path: `skills/requesting-code-review/`
 - bundled: `SKILL.md`, `code-reviewer.md`(reviewer prompt)
 - 요구: 없음(지시상 subagent dispatch 가정)
-- activation 범위: core 후보. Yardlet에서는 subagent가 아니라 review task(kind: review) 생성으로 번역 필요
-- overlap: Yardlet reviewer role + verdict 계약, `local-reference-catalog` `review-pr`(식별자 수준)
-- adaptation: 중간(subagent 표현을 Yardlet queue 용어로)
+- activation 범위: core 후보. AgentOS에서는 subagent가 아니라 review task(kind: review) 생성으로 번역 필요
+- overlap: AgentOS reviewer role + verdict 계약, `local-reference-catalog` `review-pr`(식별자 수준)
+- adaptation: 중간(subagent 표현을 AgentOS queue 용어로)
 - verification: static-verified @ `d884ae0`
 
 #### SPW-07 receiving-code-review [E]
@@ -239,14 +239,14 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
 - activation 범위: overlay 후보. branch 종결/통합 결정 task에서 trigger(YARD-004 F-004 반영,
   초판의 "core 또는 overlay" 이중 표기를 overlay로 확정)
 - overlap: **높음**. 로컬 yard `git-finish`, `git-finish-4`, `process-git-finish`(이미 학습된 자산이 더 구체적)
-- adaptation: 중간. merge/PR 선택지 제시를 Yardlet NeedsUser 결정 흐름에 연결하고, push는
+- adaptation: 중간. merge/PR 선택지 제시를 AgentOS NeedsUser 결정 흐름에 연결하고, push는
   기존 승인 gate 뒤에 두며 자동 push는 금지
 - verification: static-verified @ `d884ae0` (본문 표면 재검증 2026-07-12)
 
 #### SPW-09 using-git-worktrees [C]
 - source path: `skills/using-git-worktrees/`, bundled: `SKILL.md` 단일, 요구: git 로컬 작업만
-- activation 범위: 조건부. Yardlet이 worktree 생성/정리를 이미 기계적으로 수행
-- overlap: Yardlet worktree 메커니즘, `.agents/rules/worktree-tooling.md`, multi-session-safety rule
+- activation 범위: 조건부. AgentOS이 worktree 생성/정리를 이미 기계적으로 수행
+- overlap: AgentOS worktree 메커니즘, `.agents/rules/worktree-tooling.md`, multi-session-safety rule
 - adaptation: 높음(수동 절차 부분 삭제 필요), 규칙과 중복이면 미채택이 타당
 - verification: static-verified @ `d884ae0`
 
@@ -258,8 +258,8 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
 - 외부 endpoint(정적 발견): `server.cjs:106`이 로고 이미지
   `https://primeradiant.com/brand/superpowers-visual-brainstorming-logo.png` 참조(장식용).
   실행 시 로컬 포트 listen 필요. secret 불요
-- activation 범위: overlay 후보. 설계 전 대화형 탐색. Yardlet discuss-mode 부재로 현재는 제한적
-- overlap: Yardlet planner interview 단계와 부분 중복
+- activation 범위: overlay 후보. 설계 전 대화형 탐색. AgentOS discuss-mode 부재로 현재는 제한적
+- overlap: AgentOS planner interview 단계와 부분 중복
 - adaptation: 높음. visual-companion script 일체 제거(문서만 채택)를 전제로 C
 - verification: static-verified @ `d884ae0`
 
@@ -273,11 +273,11 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
   | 표면 | pinned 근거 | 원문에서 발생하는 요구 |
   |---|---|---|
   | external URL | `SKILL.md` L96, L638의 `https://agentskills.io/specification` | 링크를 따라가면 task-time network |
-  | subagent·worker | L14, L34, L162, L236-253, L558-587의 pressure scenario·dispatch·RED/GREEN 반복 | fresh-context worker/subagent 실행과 Yardlet queue 경계 충돌 |
+  | subagent·worker | L14, L34, L162, L236-253, L558-587의 pressure scenario·dispatch·RED/GREEN 반복 | fresh-context worker/subagent 실행과 AgentOS queue 경계 충돌 |
   | API·비용 | L577-585의 "slow and expensive", raw API call 또는 single-shot subagent, variant별 5회 이상 반복 | provider API 또는 worker CLI 비용이 반복 수만큼 발생. API secret은 원문에 직접 명시되지 않았지만 실제 provider 호출은 worker profile·billing gate 밖에서 자동 실행할 수 없음 |
   | local tool | L261-266 `wc`, L292-321 Graphviz·`render-graphs.js` | shell, Node 실행과 graphviz 설치 필요 |
   | external mutation | L664-666의 fork push·PR | git remote write와 PR 생성 승인 필요 |
-  | cross-skill | L18, L393의 `superpowers:test-driven-development` 필수 전제 | Yardlet 번들 이름·activation과 맞지 않는 외부 skill 의존 |
+  | cross-skill | L18, L393의 `superpowers:test-driven-development` 필수 전제 | AgentOS 번들 이름·activation과 맞지 않는 외부 skill 의존 |
 
 - 포함 예정 참고문도 전수 확인했다. `anthropic-best-practices.md`는 1,150줄이며
   `platform.claude.com`, `code.claude.com` 문서 링크, `mintcdn.com` 원격 이미지 3종과 srcset을
@@ -292,12 +292,12 @@ skill별 LICENSE 파일은 없고 frontmatter에 license 필드도 없으므로 
   subagent dispatch, shell/Node/graphviz, package 설치, MCP tools, push/PR. 직접 secret 문자열을
   요구하지는 않지만 provider API·external mutation은 기존 gate 밖에서 실행할 수 없다.
 - activation 범위: overlay 후보. skill 작성/개선 시 trigger
-- overlap: **높음**. Yardlet S2/S3 `skill_author`(docs/skills.md), ANT-01 skill-creator
+- overlap: **높음**. AgentOS S2/S3 `skill_author`(docs/skills.md), ANT-01 skill-creator
 - adaptation: 높음. 동봉은 self-contained 재작성 `SKILL.md`와
   `persuasion-principles.md`만이다. 나머지 문서·script·asset은 전부 제외한다. 재작성본에는 pinned
   Agent Skills 필수 구조를 짧은 local checklist로 직접 넣고, external URL, raw API/subagent 반복,
   Graphviz/render, external push/PR, Claude 전용 model/runtime/MCP/package 지시를 제거한다. 검증은
-  Yardlet의 기존 `skill_author` task와 evaluator/review 계약으로 번역한다. 잔여 요구는 configured
+  AgentOS의 기존 `skill_author` task와 evaluator/review 계약으로 번역한다. 잔여 요구는 configured
   queue에 명시적으로 배정된 configured `skill_author`·evaluator·review worker 호출 비용뿐이며,
   별도 raw API 반복이나 추가 network·secret·tool·subagent·external mutation은 없다. 이 제거판이
   작성·검증되기 전에는 설치하지 않는다.
@@ -326,11 +326,11 @@ README(pinned)도 문서 4종을 "source-available, not open source"로 명시:
   `run_eval.py`, `run_loop.py`, `aggregate_benchmark.py`, `generate_report.py`, `improve_description.py`)
 - 정적 확인: `quick_validate.py`/`package_skill.py`/`utils.py`는 로컬 파일 작업만(직접 network import 없음).
   `run_eval.py`는 `claude -p` subprocess를 구동(로컬 worker CLI 재사용, 직접 API 호출 없음).
-  단, eval 실행은 worker CLI 비용 발생 지점이므로 Yardlet billing guard 관점에서 명시적 실행으로 제한 필요
+  단, eval 실행은 worker CLI 비용 발생 지점이므로 AgentOS billing guard 관점에서 명시적 실행으로 제한 필요
 - 요구: 설치 시 없음. eval 계열 실행 시 python3 + `claude` CLI. secret 직접 요구 없음
 - activation 범위: overlay 후보. skill 작성/평가 시 trigger
-- overlap: **높음**. Yardlet S2/S3 skill_author, SPW-13
-- adaptation: 높음. Yardlet은 자체 skill 작성 경로가 있으므로 검증 script(`quick_validate.py`)와
+- overlap: **높음**. AgentOS S2/S3 skill_author, SPW-13
+- adaptation: 높음. AgentOS은 자체 skill 작성 경로가 있으므로 검증 script(`quick_validate.py`)와
   구조 가이드만 발췌 참조가 적정. 전체 번들 채택은 과잉
 - verification: static-verified @ `9d2f1ae`
 
@@ -340,7 +340,7 @@ README(pinned)도 문서 4종을 "source-available, not open source"로 명시:
   `scripts/` py 2(`connections.py`, `evaluation.py`) + `example_evaluation.xml` + `requirements.txt`
 - 정적 확인: `requirements.txt`= `anthropic>=0.39.0`, `mcp>=1.1.0`. `evaluation.py`가
   `from anthropic import Anthropic`으로 **실행 시 Anthropic API(=API key, network) 필요**.
-  Yardlet 기본 sanitized env(billing var 스크럽, `src/guard.rs`)와 충돌하므로 eval script는
+  AgentOS 기본 sanitized env(billing var 스크럽, `src/guard.rs`)와 충돌하므로 eval script는
   기본 비활성 문서화 필요
 - 정적 확인(YARD-005 보강): eval script와 별개로 **SKILL.md 본문 자체가 network를 지시한다**
   (YARD-004 F-002). pinned 본문이 `https://modelcontextprotocol.io/sitemap.xml`과 `.md` 페이지
@@ -417,9 +417,9 @@ README(pinned)도 문서 4종을 "source-available, not open source"로 명시:
 | ANT-08..11 | docx/pdf/pptx/xlsx | **재배포 불가 license**: blob `c55ab42` 전문이 Anthropic 약관 종속을 명시(source-available). fresh install 번들 = 재배포에 해당 |
 | ANT-06 | web-artifacts-builder | **용도 비적합 + 실행 시 network 과다**: claude.ai artifact 전용, `init-artifact.sh`가 npm/pnpm 전역 설치와 다수 패키지 다운로드 수행 |
 | ANT-12 | algorithmic-art, brand-guidelines, canvas-design, internal-comms, slack-gif-creator, theme-factory | **수요 무관**: Apache-2.0로 license는 적격이나 현 workspace repo archetype에 대응 수요 없음. 필요 시 on-demand 재평가 |
-| SPW-11 | dispatching-parallel-agents | **아키텍처 충돌**: Claude Code subagent 모델 전제. Yardlet의 queue-vs-subagent 경계(docs/parallel-queue.md)와 상충, 오작동 지시 위험 |
+| SPW-11 | dispatching-parallel-agents | **아키텍처 충돌**: Claude Code subagent 모델 전제. AgentOS의 queue-vs-subagent 경계(docs/parallel-queue.md)와 상충, 오작동 지시 위험 |
 | SPW-12 | subagent-driven-development | 동일 충돌 + bundled bash 3종이 subagent 세션 구조에 종속 |
-| SPW-14 | using-superpowers | **주입 모델 충돌**: 자체 skill 탐색/강제 활성화 메타 지시. Yardlet은 packet catalog 주입(H1)이 담당하므로 이중 dispatcher가 됨 |
+| SPW-14 | using-superpowers | **주입 모델 충돌**: 자체 skill 탐색/강제 활성화 메타 지시. AgentOS은 packet catalog 주입(H1)이 담당하므로 이중 dispatcher가 됨 |
 | KDS-01 | K-Dense-AI/scientific-agent-skills | **도메인 무관**: 과학 연구 특화 140종. 현 workspace 수요 없음(MIT, 유지 상태는 양호). 조사 시점 pin `4d97e29`(3절) |
 | HDN-01 | hoodini/ai-agents-skills | **license 없음(null) + 개인 AI 생성 curation**: provenance 신뢰 근거 부족. 조사 시점 pin `f7a43d8`(3절) |
 | (비대상) | openai/codex, anthropics/claude-code | skill 소비 harness이지 skill library가 아님 |
@@ -439,7 +439,7 @@ DS 계열은 검증 상태 `not-a-candidate`로 어떤 계층에도 배정될 �
 ## 6. Overlap 및 로컬 비교 근거
 
 ### 6.1 로컬 yard `.agents/skills` (11종 설치)와의 겹침
-- `planning-gate` vs SPW-04/05: 계획 산출 절차 중복. Yardlet planner가 상위에 있으므로 외부 후보는 재범위화 필수
+- `planning-gate` vs SPW-04/05: 계획 산출 절차 중복. AgentOS planner가 상위에 있으므로 외부 후보는 재범위화 필수
 - `git-finish`, `git-finish-4`, `process-git-finish(-fixture)` vs SPW-08: 로컬 학습 자산이 더 구체적(증거 독립 검증 절차 포함). SPW-08 채택 시 보완 관계로만
 - `golden-failed-check-repair` vs SPW-02: 특정 실패 재현 vs 일반 디버깅 방법론, 보완 관계
 - `trust-autonomy`, `tui`, `v09-audit-evidence-map`, `i18n-leak-audit`, `mirror-readme-*`: 외부 후보와 겹침 없음(repo 고유)
@@ -457,21 +457,21 @@ DS 계열은 검증 상태 `not-a-candidate`로 어떤 계층에도 배정될 �
 
 ### 6.3 후보 간 겹침
 - SPW-13(writing-skills)과 ANT-01(skill-creator): 동일 목적(skill 작성). 동시 채택 금지 권고,
-  Yardlet skill_author의 참고 문헌으로 택1
-- SPW-04/05(writing/executing-plans)와 Yardlet planner/queue: 구조적 중복, 재범위화 없이 동시 사용 불가
+  AgentOS skill_author의 참고 문헌으로 택1
+- SPW-04/05(writing/executing-plans)와 AgentOS planner/queue: 구조적 중복, 재범위화 없이 동시 사용 불가
 - SPW-08과 SPW-03: 종결 검증 절차 일부 중복(verification 우선, finishing은 git 흐름 특화)
 
-## 7. Yardlet adaptation 공통 노트
+## 7. AgentOS adaptation 공통 노트
 
 - 주입 경로: 채택 skill은 `.agents/skills/<name>/SKILL.md`로 배치되어 packet catalog(H1)로
   progressive load된다(docs/skills.md). name은 spec 2.1의 디렉토리 일치 규칙을 지켜야 함
-- 권한 모델: Yardlet worker env는 기본 sanitized(billing 스크럽, `src/guard.rs` + `.agents/billing-policy.yaml`).
+- 권한 모델: AgentOS worker env는 기본 sanitized(billing 스크럽, `src/guard.rs` + `.agents/billing-policy.yaml`).
   ANT-02 eval처럼 API key를 요구하는 script는 번들에서 제외하거나 opt-in(`invocation.pass_env`) 문서화 필요.
   script 제외로 요구가 사라지지 않는 경우도 있다: ANT-02는 SKILL.md 본문이 WebFetch를, SPW-02는
   본문 예시가 env/keychain/codesign을, SPW-13은 본문과 포함 예정 참고문이 external URL,
   API/subagent 반복 비용, graphviz·package·MCP·push/PR 표면을 지시하므로 본문 수정과 참고문 제외까지가
   adaptation 범위다(각 후보 상세 참조)
-- 용어 중립화: superpowers 계열의 "subagent/dispatch" 표현은 Yardlet의 task queue 용어로 재작성
+- 용어 중립화: superpowers 계열의 "subagent/dispatch" 표현은 AgentOS의 task queue 용어로 재작성
   (queue-vs-subagent 경계: docs/parallel-queue.md)
 - 단일 작성자 원칙: 어떤 후보도 worker가 직접 설치하지 않는다. 설치는 향후 구현(out of scope)에서
   `src/state.rs` 경유로만(본 intent에서는 파일 배치 자체가 범위 밖)

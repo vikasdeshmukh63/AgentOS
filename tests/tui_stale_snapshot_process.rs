@@ -53,10 +53,10 @@ fn a_wedged_workspace_shows_a_stale_banner_instead_of_a_silently_frozen_home() {
         .unwrap();
     assert!(
         init.status.success(),
-        "yardlet init failed: {}",
+        "agentos init failed: {}",
         String::from_utf8_lossy(&init.stderr)
     );
-    let config_path = root.join(".agents/yardlet.yaml");
+    let config_path = root.join(".agents/agentos.yaml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("language: auto", "language: en");
@@ -69,7 +69,7 @@ fn a_wedged_workspace_shows_a_stale_banner_instead_of_a_silently_frozen_home() {
     let child = Command::new(&binary)
         .current_dir(&root)
         .env("TERM", "xterm-256color")
-        .env("YARDLET_PROCESS_FIXTURE", "1")
+        .env("AGENTOS_PROCESS_FIXTURE", "1")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)

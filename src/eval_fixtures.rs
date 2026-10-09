@@ -1,4 +1,4 @@
-//! Deterministic, provider-free mechanism fixtures for `yardlet eval fixtures`.
+//! Deterministic, provider-free mechanism fixtures for `agentos eval fixtures`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,7 +98,7 @@ const FIXTURES: &[FixtureDef] = &[
 ];
 
 pub fn run(selected: &[String]) -> Result<FixtureReport> {
-    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("yardlet"));
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentos"));
     preflight_required(selected, &executable)?;
 
     let defs: Vec<&FixtureDef> = if selected.is_empty() {
@@ -154,7 +154,7 @@ fn preflight_required(required: &[String], executable: &Path) -> Result<()> {
     }
 
     bail!(
-        "fixture capability preflight failed for target binary '{}': missing required fixture id(s): {}. The target Yardlet build artifact may be older than the source fixture registry. Run `cargo clean -p yardlet`, rebuild with `cargo build --bin yardlet`, confirm with `{} eval fixtures --list --json`, then retry. Fixture body was not started.",
+        "fixture capability preflight failed for target binary '{}': missing required fixture id(s): {}. The target AgentOS build artifact may be older than the source fixture registry. Run `cargo clean -p agentos`, rebuild with `cargo build --bin agentos`, confirm with `{} eval fixtures --list --json`, then retry. Fixture body was not started.",
         executable.display(),
         missing.join(", "),
         executable.display(),
@@ -221,7 +221,7 @@ impl FixtureWorkspace {
         let root = loop {
             let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let candidate = std::env::temp_dir().join(format!(
-                "yardlet-eval-{}-{sequence}-{id}",
+                "agentos-eval-{}-{sequence}-{id}",
                 std::process::id()
             ));
             match std::fs::create_dir(&candidate) {
@@ -241,7 +241,7 @@ impl FixtureWorkspace {
 
     fn init_git(&self) -> Result<()> {
         git(&self.root, &["init", "-q"])?;
-        git(&self.root, &["config", "user.name", "Yardlet Fixture"])?;
+        git(&self.root, &["config", "user.name", "AgentOS Fixture"])?;
         git(
             &self.root,
             &["config", "user.email", "fixture@example.invalid"],
@@ -1036,8 +1036,8 @@ mod tests {
         assert!(message.contains("fixture capability preflight failed"));
         assert!(message.contains("fixture-added-after-build-alpha"));
         assert!(message.contains("fixture-added-after-build-beta"));
-        assert!(message.contains("cargo clean -p yardlet"));
-        assert!(message.contains("cargo build --bin yardlet"));
+        assert!(message.contains("cargo clean -p agentos"));
+        assert!(message.contains("cargo build --bin agentos"));
         assert!(message.contains("older than the source fixture registry"));
         assert!(!message.contains("unknown fixture"));
     }

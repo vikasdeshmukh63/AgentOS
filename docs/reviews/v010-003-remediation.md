@@ -6,7 +6,7 @@
 HIGH-001부터 HIGH-004와 MEDIUM-001만 재현하고 보수한 증거다. 규범 기준은
 `docs/v0.10-shared-session-state-contract.md`의 event, action, ordering,
 persistence, replay 계약과 root checkout의 내부 roadmap
-`docs/yardlet-roadmap.md:696-752`다.
+`docs/agentos-roadmap.md:696-752`다.
 
 현재 remediation worktree의 HEAD에는 1차 review 문서와 roadmap 문서가 없었다.
 1차 review 문서는 같은 저장소의 독립 review worktree에서, roadmap은 root
@@ -119,7 +119,7 @@ Worker A가 question을 만든 뒤 A command를 unavailable하게 하고 ready w
 fallback으로 둔 수정 전 결과는 다음과 같았다.
 
 ```text
-yardlet: prepared attempt does not match invocation
+agentos: prepared attempt does not match invocation
 test result: FAILED. 0 passed; 1 failed
 ```
 
@@ -158,7 +158,7 @@ test result: FAILED. 0 passed; 1 failed
 ### Fix
 
 - `src/run.rs:1391-1412`는 모든 prepared answer/redirect continuation을 restart에서
-  찾는다. Debug fixture 환경의 `YARDLET_TEST_CRASH_AFTER_REDIRECT_RECEIPT=1`은
+  찾는다. Debug fixture 환경의 `AGENTOS_TEST_CRASH_AFTER_REDIRECT_RECEIPT=1`은
   terminal receipt와 prepared attempt 확인 뒤 새 run directory 또는 worker spawn
   전에만 failpoint를 연다.
 - `src/state.rs:3224-3240`은 cancelled run이 Queued로 돌아온 경우 terminal redirect

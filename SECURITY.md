@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-Security fixes target the latest released version of Yardlet and the current
+Security fixes target the latest released version of AgentOS and the current
 `main` branch. Older releases may be affected and are supported on a best-effort
-basis. Reports should identify the exact Yardlet version or commit.
+basis. Reports should identify the exact AgentOS version or commit.
 
 ## Report a vulnerability privately
 
@@ -12,11 +12,11 @@ Do not open a public issue or pull request for a suspected vulnerability.
 
 Use GitHub's private vulnerability reporting:
 
-<https://github.com/zzunkie/yardlet/security/advisories/new>
+<https://github.com/zzunkie/agentos/security/advisories/new>
 
 If that form is unavailable, use the contact method listed on the
 [@zzunkie GitHub profile](https://github.com/zzunkie) with the subject
-`[yardlet security]` and no secrets in the subject line.
+`[agentos security]` and no secrets in the subject line.
 
 Include as much of the following as possible:
 
@@ -33,9 +33,9 @@ The maintainer aims to acknowledge a report within three business days and
 provide an initial assessment within seven business days. These are response
 targets, not disclosure deadlines.
 
-## What Yardlet treats as security-sensitive
+## What AgentOS treats as security-sensitive
 
-Yardlet launches installed AI worker CLIs and writes canonical workspace state.
+AgentOS launches installed AI worker CLIs and writes canonical workspace state.
 Reports are especially useful when they involve:
 
 - command or argument injection into a worker process;
@@ -48,7 +48,7 @@ Reports are especially useful when they involve:
 
 An ordinary functional bug without a security-boundary impact can use the
 public bug form. A vulnerability in a third-party worker CLI should also be
-reported to that provider; report it to Yardlet when Yardlet causes or worsens
+reported to that provider; report it to AgentOS when AgentOS causes or worsens
 the exposure.
 
 ## Coordinated disclosure

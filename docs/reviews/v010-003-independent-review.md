@@ -17,7 +17,7 @@ commit은 `7a41942db42f161301b4b314b04937194a877193`, 그 remediation parent는
   읽었고 SHA-256은
   `8dabe01c969fca5bd9c7a28ed4a0da0114503526309990afa6770a8175cca8f4`다.
 - roadmap의 V010-003 요구는 root checkout의 ignored 내부 문서
-  `/Users/zzunkie/Desktop/workspace/yard/docs/yardlet-roadmap.md:696-752`에서
+  `/Users/zzunkie/Desktop/workspace/yard/docs/agentos-roadmap.md:696-752`에서
   읽었다. SHA-256은
   `cf4d16bac80f735ae58c8a2c410631dddbb35e6e3a140a18af1067b42cd8025b`다.
 - 1차 review는 독립 review worktree의
@@ -26,7 +26,7 @@ commit은 `7a41942db42f161301b4b314b04937194a877193`, 그 remediation parent는
   `759d2b6fd06ce42eefd519a2563594245972bc587a3fd48fedf8810c1fae3e74`다.
 - 현재 branch에는 위 roadmap과 1차 review가 없고, task packet이 지정한
   `.agents/runs/run-20260714-195009/evidence/repo-summary.md`도 시작부터 없었다.
-  `git check-ignore -v docs/yardlet-roadmap.md`는 `.gitignore:50`을 반환했다.
+  `git check-ignore -v docs/agentos-roadmap.md`는 `.gitignore:50`을 반환했다.
   이 portability 결함은 아래 MINOR-001에 기록한다. 활성 intent, queue 또는 기존
   `.agents/runs` history는 fixture 입력으로 읽거나 수정하지 않았다.
 - 현재 branch에 있는 `docs/reviews/v010-003-dogfood.md`와
@@ -113,5 +113,5 @@ Critical, major, high, medium finding과 failed check는 없다.
 `repo-summary.md`에 의존한다. 동일 checkout만 보존하면 최초 normative/review artifact의
 원문 접근성이 떨어진다. 구체적 개선은 후속 evidence 정리 시 V010-003 normative excerpt와
 1차 review를 tracked stable path에 보존하고, 생성되지 않은 repo-summary 링크는 실제
-Yardlet 생성 artifact로 대체하는 것이다. 이 final review는 exact path, digest, finding,
+AgentOS 생성 artifact로 대체하는 것이다. 이 final review는 exact path, digest, finding,
 red-green 결과를 함께 기록해 현재 판정의 재현성을 보완한다.

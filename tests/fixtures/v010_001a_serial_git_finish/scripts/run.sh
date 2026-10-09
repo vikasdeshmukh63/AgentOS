@@ -2,11 +2,11 @@
 set -euo pipefail
 
 if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 <yardlet-bin> <evidence-dir>" >&2
+  echo "usage: $0 <agentos-bin> <evidence-dir>" >&2
   exit 64
 fi
 
-YARDLET_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+AGENTOS_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EVIDENCE_DIR="$2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REAL_GIT="$(command -v git)"
@@ -24,8 +24,8 @@ export XDG_CONFIG_HOME="$STERILE_HOME/.config"
 export GIT_CONFIG_GLOBAL="$STERILE_HOME/global.gitconfig"
 export GIT_CONFIG_SYSTEM="$STERILE_HOME/system.gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
-export YARDLET_FIXTURE_ROOT="$ROOT"
-export YARDLET_FIXTURE_PYTHON="$PYTHON"
+export AGENTOS_FIXTURE_ROOT="$ROOT"
+export AGENTOS_FIXTURE_PYTHON="$PYTHON"
 unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 while IFS='=' read -r name _; do
   case "$name" in
@@ -121,7 +121,7 @@ PY
   fail "intentional EXIT trap cleanup probe"
 }
 
-if [[ "${YARDLET_FIXTURE_EXIT_TRAP_PROBE:-0}" == "1" ]]; then
+if [[ "${AGENTOS_FIXTURE_EXIT_TRAP_PROBE:-0}" == "1" ]]; then
   run_exit_trap_probe
 fi
 
@@ -176,9 +176,9 @@ PY
 
 write_config() {
   local ws="$1"
-  cat >"$ws/.agents/yardlet.yaml" <<'EOF'
+  cat >"$ws/.agents/agentos.yaml" <<'EOF'
 schema_version: 1
-product: yardlet-fixture
+product: agentos-fixture
 workspace_id: fixture
 created_at: 2099-01-01T00:00:00Z
 state_dir: .agents
@@ -204,7 +204,7 @@ git_finish:
   target_ref: refs/heads/main
   pre_push_checks:
     - name: fixture-check
-      command: 'printf "check\n" >> "$YARDLET_FIXTURE_CHECK_LOG"'
+      command: 'printf "check\n" >> "$AGENTOS_FIXTURE_CHECK_LOG"'
 EOF
 }
 
@@ -318,18 +318,18 @@ new_workspace() {
   local ws="$scenario/clone"
   mkdir -p "$seed" "$scenario/attempts" "$scenario/packets"
   "$REAL_GIT" -C "$seed" init -q -b main
-  "$REAL_GIT" -C "$seed" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$seed" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$seed" config user.email "fixture@example.test"
   printf 'baseline\n' >"$seed/baseline.txt"
   "$REAL_GIT" -C "$seed" add baseline.txt
   "$REAL_GIT" -C "$seed" commit -q -m baseline
   "$REAL_GIT" clone -q --bare "$seed" "$remote"
   "$REAL_GIT" clone -q -b main "$remote" "$ws"
-  "$REAL_GIT" -C "$ws" config user.name "Yardlet Fixture"
+  "$REAL_GIT" -C "$ws" config user.name "AgentOS Fixture"
   "$REAL_GIT" -C "$ws" config user.email "fixture@example.test"
-  "$YARDLET_BIN" init --path "$ws" >/dev/null 2>&1 || (
+  "$AGENTOS_BIN" init --path "$ws" >/dev/null 2>&1 || (
     cd "$ws"
-    "$YARDLET_BIN" init >/dev/null
+    "$AGENTOS_BIN" init >/dev/null
   )
   write_config "$ws"
   write_intent_and_queue "$ws" "$scenario"
@@ -348,12 +348,12 @@ run_env() {
   (
     cd "$ws"
     PATH="$WRAPPER_DIR:$PATH" \
-      YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-      YARDLET_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
-      YARDLET_FIXTURE_CHECK_LOG="$scenario/checks.log" \
-      YARDLET_FIXTURE_CRASH_MODE="$mode" \
-      YARDLET_FIXTURE_EVENT="$event" \
-      "$YARDLET_BIN" "$@"
+      AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+      AGENTOS_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
+      AGENTOS_FIXTURE_CHECK_LOG="$scenario/checks.log" \
+      AGENTOS_FIXTURE_CRASH_MODE="$mode" \
+      AGENTOS_FIXTURE_EVENT="$event" \
+      "$AGENTOS_BIN" "$@"
   )
 }
 
@@ -379,10 +379,10 @@ assert_wrapper_rejects_escape() {
     (
       cd "$ws"
       PATH="$WRAPPER_DIR:$PATH" \
-        YARDLET_FIXTURE_REAL_GIT="$REAL_GIT" \
-        YARDLET_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
-        YARDLET_FIXTURE_ROOT="$ROOT" \
-        YARDLET_FIXTURE_PYTHON="$PYTHON" \
+        AGENTOS_FIXTURE_REAL_GIT="$REAL_GIT" \
+        AGENTOS_FIXTURE_GIT_LOG="$scenario/wrapper.log" \
+        AGENTOS_FIXTURE_ROOT="$ROOT" \
+        AGENTOS_FIXTURE_PYTHON="$PYTHON" \
         git "$@"
     ) >"$scenario/wrapper-escape-$label.log" 2>&1
     status=$?
@@ -411,26 +411,26 @@ launch_grouped_run() {
   local mode="$3"
   local event="$4"
   local stdout="$5"
-  "$PYTHON" - "$YARDLET_BIN" "$ws" "$WRAPPER_DIR" "$REAL_GIT" \
+  "$PYTHON" - "$AGENTOS_BIN" "$ws" "$WRAPPER_DIR" "$REAL_GIT" \
     "$scenario/wrapper.log" "$scenario/checks.log" "$mode" "$event" "$stdout" <<'PY' &
 import os
 import sys
 
-yardlet, workspace, wrapper, real_git, git_log, check_log, mode, event, stdout = sys.argv[1:]
+agentos, workspace, wrapper, real_git, git_log, check_log, mode, event, stdout = sys.argv[1:]
 os.setsid()
 os.chdir(workspace)
 env = os.environ.copy()
 env["PATH"] = wrapper + os.pathsep + env.get("PATH", "")
-env["YARDLET_FIXTURE_REAL_GIT"] = real_git
-env["YARDLET_FIXTURE_GIT_LOG"] = git_log
-env["YARDLET_FIXTURE_CHECK_LOG"] = check_log
-env["YARDLET_FIXTURE_CRASH_MODE"] = mode
-env["YARDLET_FIXTURE_EVENT"] = event
+env["AGENTOS_FIXTURE_REAL_GIT"] = real_git
+env["AGENTOS_FIXTURE_GIT_LOG"] = git_log
+env["AGENTOS_FIXTURE_CHECK_LOG"] = check_log
+env["AGENTOS_FIXTURE_CRASH_MODE"] = mode
+env["AGENTOS_FIXTURE_EVENT"] = event
 fd = os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.dup2(fd, 1)
 os.dup2(fd, 2)
 os.close(fd)
-os.execve(yardlet, [yardlet, "run", "--auto", "--execute", "--headless"], env)
+os.execve(agentos, [agentos, "run", "--auto", "--execute", "--headless"], env)
 PY
   GROUP_PID=$!
   ACTIVE_GROUP_PID="$GROUP_PID"
@@ -484,7 +484,7 @@ assert_run_projection() {
     assert_eq "$(json_field "$finish" baseline_oid)" "$base" "$task_id finish baseline OID"
     assert_eq "$(json_field "$finish" remote_oid)" "$expected" "$task_id remote read-back"
     if [[ "$task_id" == "$ALREADY_APPLIED_TASK" ]]; then
-      # A crash after the push subprocess succeeded but before Yardlet saw the
+      # A crash after the push subprocess succeeded but before AgentOS saw the
       # result must recover by reading the remote back, not by pushing again.
       assert_eq "$(json_field "$finish" status)" already_applied \
         "$task_id idempotent post-push recovery"
@@ -511,7 +511,7 @@ assert_run_projection() {
     branch="$(yaml_value "$run_yaml" worktree_branch)"
     ! "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/$branch" \
       || fail "$task_id successful target branch was retained"
-    ! "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/yardlet-txn/$branch" \
+    ! "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/agentos-txn/$branch" \
       || fail "$task_id successful transaction ref was retained"
     previous="$expected"
   done
@@ -573,8 +573,8 @@ assert_no_unsafe_finish() {
   assert_eq "$forced_other" 0 "--force outside owned-worktree cleanup must never appear"
   escaped_removal="$( (grep -E '(^|[[:space:]])worktree[[:space:]]+remove([[:space:]]|$)' "$scenario/wrapper.log" || true) \
     | grep -Fvc '/.agents/worktrees/' || true)"
-  assert_eq "$escaped_removal" 0 "worktree removal must stay inside the Yardlet-owned directory"
-  assert_eq "$(grep -c '^PUSH_SUCCESS' "$scenario/wrapper.log" || true)" 4 "one Yardlet-owned push per successful task"
+  assert_eq "$escaped_removal" 0 "worktree removal must stay inside the AgentOS-owned directory"
+  assert_eq "$(grep -c '^PUSH_SUCCESS' "$scenario/wrapper.log" || true)" 4 "one AgentOS-owned push per successful task"
 }
 
 run_scenario() {
@@ -625,7 +625,7 @@ run_scenario() {
       branch="$(yaml_value "$run_dir/run.yaml" worktree_branch)"
       assert_eq "$("$REAL_GIT" -C "$ws" rev-parse --verify "refs/heads/$branch")" "$baseline" \
         "transaction commit must not publish the target branch before CAS"
-      transaction_oid="$("$REAL_GIT" -C "$ws" rev-parse --verify "refs/heads/yardlet-txn/$branch")"
+      transaction_oid="$("$REAL_GIT" -C "$ws" rev-parse --verify "refs/heads/agentos-txn/$branch")"
       [[ "$transaction_oid" != "$baseline" ]] \
         || fail "after_transaction_commit stopped before native commit completed"
       assert_eq "$(head_oid "$ws")" "$baseline" \
@@ -642,7 +642,7 @@ run_scenario() {
         "after_worktree_remove must preserve the integrated main OID"
       "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/$branch" \
         || fail "after_worktree_remove stopped after target ref deletion"
-      "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/yardlet-txn/$branch" \
+      "$REAL_GIT" -C "$ws" show-ref --verify --quiet "refs/heads/agentos-txn/$branch" \
         || fail "after_worktree_remove stopped after transaction ref deletion"
     fi
     worker_before="$(cat "$scenario/attempts/YARD-001")"

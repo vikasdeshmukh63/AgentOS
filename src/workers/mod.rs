@@ -6,7 +6,7 @@
 //! task packet in -> worker subprocess -> structured result files out
 //! ```
 //!
-//! Yardlet treats Codex CLI and Claude Code CLI as hidden, subscription-backed
+//! AgentOS treats Codex CLI and Claude Code CLI as hidden, subscription-backed
 //! workers. The exact CLI flags are adapter-owned here so business logic does
 //! not hard-code brittle host assumptions.
 
@@ -491,7 +491,7 @@ pub fn last_complete_json_object(raw: &[u8]) -> Option<(usize, usize, serde_json
         })
 }
 
-/// A result Yardlet recovered from captured stdout instead of the result file.
+/// A result AgentOS recovered from captured stdout instead of the result file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredResult {
     pub byte_start: usize,
@@ -829,7 +829,7 @@ pub fn build_command(
                 cmd.arg("-c")
                     .arg(format!("model_reasoning_effort=\"{effort}\""));
             }
-            // Attach images natively (codex vision), so Yardlet does not lose it.
+            // Attach images natively (codex vision), so AgentOS does not lose it.
             for img in images {
                 cmd.arg("-i").arg(img);
             }
@@ -873,7 +873,7 @@ pub fn build_command(
 
 /// The file a `prompt_transport: file` worker reads its packet from.
 ///
-/// Fixed by convention and written INTO the run directory Yardlet already owns,
+/// Fixed by convention and written INTO the run directory AgentOS already owns,
 /// so the run's own lifecycle (retention/gc) is what removes it and no separate
 /// cleanup path can leak a packet after the run.
 pub const PROMPT_FILE_NAME: &str = "packet-prompt.txt";
@@ -1140,7 +1140,7 @@ fn exited_without_reaping(_child: &std::process::Child) -> bool {
     false
 }
 
-/// How long a worker gets to stop on its own before Yardlet insists.
+/// How long a worker gets to stop on its own before AgentOS insists.
 ///
 /// Long enough for an agent CLI to flush what it was writing, short enough that
 /// the operator's second Ctrl-C is not the one that finally works.
@@ -1154,7 +1154,7 @@ pub struct WorkerOutcome {
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub timed_out: bool,
-    /// The operator stopped Yardlet, and this worker was taken down with it
+    /// The operator stopped AgentOS, and this worker was taken down with it
     /// rather than left holding the run directory (issue #107). Distinct from a
     /// timeout: nothing was exceeded, the run was interrupted.
     pub stopped: bool,
@@ -1280,7 +1280,7 @@ fn capture_prefixed_session_ref(
 /// Spawn a worker with a sanitized environment, feeding the packet on stdin and
 /// capturing all output to `output_log`. Enforces a wall-clock timeout.
 ///
-/// This is the only place Yardlet launches a worker. It uses the env produced by
+/// This is the only place AgentOS launches a worker. It uses the env produced by
 /// the zero-key guard; it never injects an AI provider API key.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -1487,7 +1487,7 @@ fn spawn_internal(
     use std::io::{Read, Write};
 
     // `worker_run_dir` may be a staging directory inside an isolated worktree,
-    // while `output_log` and worker.pid remain owned by the main Yardlet
+    // while `output_log` and worker.pid remain owned by the main AgentOS
     // process in the canonical run directory.
     let control_run_dir = output_log.parent().unwrap_or(cwd);
     guard::invocation_contract(profile).map_err(anyhow::Error::msg)?;
@@ -1566,7 +1566,7 @@ fn spawn_internal(
     }
     // Keep environment-based adapters aligned with the OS cwd too. This is
     // not a security boundary, but avoids a stale inherited PWD pointing
-    // relative worker operations at the Yardlet parent workspace.
+    // relative worker operations at the AgentOS parent workspace.
     cmd.env("PWD", cwd);
     if packet_on_stdin {
         cmd.stdin(Stdio::piped());
@@ -1575,10 +1575,10 @@ fn spawn_internal(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    // A worker must outlive the terminal that started it. Yardlet's contract is
+    // A worker must outlive the terminal that started it. AgentOS's contract is
     // that quitting the orchestrator does not kill workers — the next start
     // ADOPTS a live one — and that held for `q` but not for the window closing:
-    // a plain spawn inherits Yardlet's process group, which is the controlling
+    // a plain spawn inherits AgentOS's process group, which is the controlling
     // pty's foreground group, so pty teardown SIGHUPs the worker too and a whole
     // reasoning pass is lost (issue #52). Leading its own group detaches it from
     // that signal. Safe here because all three of its stdio ends are pipes, so
@@ -1752,7 +1752,7 @@ fn spawn_internal(
     // exit) is what keeps the monitor non-empty during a run.
     // Failing here must not leave the worker running. These `?`s returned with a
     // live child that nothing else could reach — an independent review made
-    // `worker-output.log` a directory and watched Yardlet exit 1 while its worker
+    // `worker-output.log` a directory and watched AgentOS exit 1 while its worker
     // kept going, which is the orphan #107 is about arriving through an error
     // path instead of a signal.
     let open_log = || -> Result<Option<std::fs::File>> {
@@ -2069,7 +2069,7 @@ fn spawn_internal(
 
     // A worker that finished in the same instant the operator interrupted still
     // belongs to an interrupted run: whatever comes next — integration, a commit,
-    // the next task — is what the stop was asking Yardlet not to do. The loop
+    // the next task — is what the stop was asking AgentOS not to do. The loop
     // checks `try_wait` before the flag, so without this a fast worker (or one
     // that exits between spawn and the first poll) wins the race and the task can
     // land Done despite the Ctrl-C.
@@ -2093,7 +2093,7 @@ fn spawn_internal(
         session_id,
         public_events_dropped: public_events_dropped.load(std::sync::atomic::Ordering::Relaxed),
         note: if stopped {
-            "worker stopped with Yardlet at the operator's request".to_string()
+            "worker stopped with AgentOS at the operator's request".to_string()
         } else if timed_out {
             "worker exceeded wall-clock limit and was stopped".to_string()
         } else {

@@ -1,6 +1,6 @@
-//! Explicit skill authoring (docs/skills.md S2/S3): `yardlet skill research`,
+//! Explicit skill authoring (docs/skills.md S2/S3): `agentos skill research`,
 //! `create`, and `apply`. A researcher-role worker drafts a candidate SKILL.md
-//! into an ISOLATED run dir; Yardlet (the deterministic core) is the sole writer
+//! into an ISOLATED run dir; AgentOS (the deterministic core) is the sole writer
 //! that installs it. This path never touches the live `intent-contract.yaml` /
 //! `work-queue.yaml` — the queue isolation the S3 deferral called for: it runs
 //! a one-off worker (like the planner) but derives no canonical intent/queue.
@@ -118,8 +118,8 @@ fn draft(
     Ok((run_id, run_dir_rel, worker_id, result))
 }
 
-/// `yardlet skill research "<topic>"` — draft a candidate SKILL.md into the run
-/// dir and install NOTHING. The user inspects it and runs `yardlet skill apply
+/// `agentos skill research "<topic>"` — draft a candidate SKILL.md into the run
+/// dir and install NOTHING. The user inspects it and runs `agentos skill apply
 /// <run-id>` to install.
 pub fn research(ws: &Workspace, topic: &str) -> Result<SkillReport> {
     let (run_id, run_dir_rel, worker_id, r) = draft(ws, "research", topic)?;
@@ -143,7 +143,7 @@ pub fn research(ws: &Workspace, topic: &str) -> Result<SkillReport> {
     let mut lines = vec![
         format!("drafted by {worker_id} \u{2014} nothing installed yet"),
         format!("draft: {run_dir_rel}/SKILL.md"),
-        format!("install with: yardlet skill apply {run_id}"),
+        format!("install with: agentos skill apply {run_id}"),
     ];
     if !r.rationale.trim().is_empty() {
         lines.push(format!("rationale: {}", r.rationale.trim()));
@@ -155,7 +155,7 @@ pub fn research(ws: &Workspace, topic: &str) -> Result<SkillReport> {
     })
 }
 
-/// `yardlet skill create <name> [--from "<topic>"]` — author and INSTALL a skill.
+/// `agentos skill create <name> [--from "<topic>"]` — author and INSTALL a skill.
 /// The user-given `name` wins (predictable); `from` adds context for the worker.
 pub fn create(ws: &Workspace, name: &str, from: Option<&str>) -> Result<SkillReport> {
     let subject = match from {
@@ -166,14 +166,14 @@ pub fn create(ws: &Workspace, name: &str, from: Option<&str>) -> Result<SkillRep
     install(ws, run_id, name, &r.description, &r.body, &r.rationale)
 }
 
-/// `yardlet skill apply <run-id>` — install a skill previously drafted by
-/// `yardlet skill research`. Reads that run's `skill-result.json`; Yardlet writes it.
+/// `agentos skill apply <run-id>` — install a skill previously drafted by
+/// `agentos skill research`. Reads that run's `skill-result.json`; AgentOS writes it.
 pub fn apply(ws: &Workspace, run_id: &str) -> Result<SkillReport> {
     let run_dir = ws.runs_dir().join(run_id);
     let result_path = run_dir.join("skill-result.json");
     let raw = std::fs::read_to_string(&result_path).with_context(|| {
         format!(
-            "no skill draft at {} (is the run id right? try `yardlet skill research` first)",
+            "no skill draft at {} (is the run id right? try `agentos skill research` first)",
             result_path.display()
         )
     })?;

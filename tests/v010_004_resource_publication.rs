@@ -33,7 +33,7 @@ mod unix {
                 .unwrap()
                 .as_nanos();
             let root = std::env::temp_dir().join(format!(
-                "yardlet-v010-004-{label}-{}-{nonce}",
+                "agentos-v010-004-{label}-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();

@@ -36,7 +36,7 @@ Present the verified state and ask the human to choose one bounded outcome:
 3. preserve the branch and worktree as-is;
 4. discard work after explicit destructive confirmation.
 
-Record this as a NeedsUser decision when the flow is running inside Yardlet.
+Record this as a NeedsUser decision when the flow is running inside AgentOS.
 Do not reinterpret silence or a branch classification as approval.
 
 ## 4. Execute Only the Chosen, Authorized Path

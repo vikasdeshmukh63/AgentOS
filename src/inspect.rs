@@ -1,6 +1,6 @@
 //! Cheap, deterministic local evidence gathering.
 //!
-//! Yardlet collects this *before* invoking a worker so the worker spends fewer
+//! AgentOS collects this *before* invoking a worker so the worker spends fewer
 //! tokens rediscovering the environment. Nothing here calls an AI API.
 
 use std::path::{Path, PathBuf};

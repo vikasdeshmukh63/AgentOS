@@ -60,8 +60,8 @@ offline event.
 
 Report abusive, harassing, or otherwise unacceptable behavior privately using
 the contact method listed on the
-[@zzunkie GitHub profile](https://github.com/zzunkie). Use the subject
-`[agentos conduct]`. Do not include sensitive incident details in a public
+[@vikasdeshmukh63 GitHub profile](https://github.com/vikasdeshmukh63). Use the subject
+`[AgentOS conduct]`. Do not include sensitive incident details in a public
 issue.
 
 All complaints will be reviewed and investigated promptly and fairly. Community

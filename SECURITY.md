@@ -3,6 +3,7 @@
 ## Supported versions
 
 Security fixes target the latest released version of AgentOS and the current
+Security fixes target the latest released version of AgentOS and the current
 `main` branch. Older releases may be affected and are supported on a best-effort
 basis. Reports should identify the exact AgentOS version or commit.
 
@@ -12,11 +13,11 @@ Do not open a public issue or pull request for a suspected vulnerability.
 
 Use GitHub's private vulnerability reporting:
 
-<https://github.com/zzunkie/agentos/security/advisories/new>
+<https://github.com/vikasdeshmukh63/AgentOS/security/advisories/new>
 
 If that form is unavailable, use the contact method listed on the
-[@zzunkie GitHub profile](https://github.com/zzunkie) with the subject
-`[agentos security]` and no secrets in the subject line.
+[@vikasdeshmukh63 GitHub profile](https://github.com/vikasdeshmukh63) with the subject
+`[AgentOS security]` and no secrets in the subject line.
 
 Include as much of the following as possible:
 

@@ -101,15 +101,15 @@ and before changing release automation:
 Useful read-only checks:
 
 ```bash
-gh api repos/zzunkie/agentos/collaborators
-gh api repos/zzunkie/agentos/branches/main/protection
-gh api repos/zzunkie/agentos/rulesets
-gh api repos/zzunkie/agentos/actions/permissions
-gh api repos/zzunkie/agentos/actions/permissions/workflow
-gh api repos/zzunkie/agentos/actions/permissions/fork-pr-contributor-approval
-gh api repos/zzunkie/agentos/keys
-gh api repos/zzunkie/agentos/hooks
-gh api repos/zzunkie/agentos/environments
+gh api repos/vikasdeshmukh63/AgentOS/collaborators
+gh api repos/vikasdeshmukh63/AgentOS/branches/main/protection
+gh api repos/vikasdeshmukh63/AgentOS/rulesets
+gh api repos/vikasdeshmukh63/AgentOS/actions/permissions
+gh api repos/vikasdeshmukh63/AgentOS/actions/permissions/workflow
+gh api repos/vikasdeshmukh63/AgentOS/actions/permissions/fork-pr-contributor-approval
+gh api repos/vikasdeshmukh63/AgentOS/keys
+gh api repos/vikasdeshmukh63/AgentOS/hooks
+gh api repos/vikasdeshmukh63/AgentOS/environments
 ```
 
 Never print secret values. Repository APIs expose secret names and timestamps,

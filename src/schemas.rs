@@ -2870,7 +2870,12 @@ pub struct Artifact {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceOwnership {
-    #[serde(rename = "agentos", alias = "agent_os", alias = "agent_o_s", alias = "yardlet")]
+    #[serde(
+        rename = "agentos",
+        alias = "agent_os",
+        alias = "agent_o_s",
+        alias = "yardlet"
+    )]
     AgentOS,
     Worker,
     User,

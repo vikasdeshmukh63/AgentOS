@@ -5,7 +5,7 @@ use std::io;
 pub fn is_contention(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(libc::EINTR | libc::EAGAIN | libc::EWOULDBLOCK)
+        Some(code) if code == libc::EINTR || code == libc::EAGAIN || code == libc::EWOULDBLOCK
     )
 }
 

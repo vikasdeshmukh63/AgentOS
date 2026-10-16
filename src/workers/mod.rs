@@ -1319,7 +1319,7 @@ pub fn spawn(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn spawn_attempt(
     profile: &WorkerProfile,
     bin: &Path,
@@ -1354,7 +1354,7 @@ pub fn spawn_attempt(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn spawn_attempt_with_sink(
     profile: &WorkerProfile,
     bin: &Path,

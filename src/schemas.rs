@@ -2870,11 +2870,13 @@ pub struct Artifact {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceOwnership {
+    #[serde(rename = "agentos", alias = "agent_os", alias = "agent_o_s", alias = "yardlet")]
     AgentOS,
     Worker,
     User,
     External,
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -5017,5 +5019,28 @@ tasks:
         answer.validate().unwrap();
         assert_eq!(attempt.continuation, ContinuationMode::NativeResume);
         assert_eq!(answer.question_id, question.question_id);
+    }
+
+    #[test]
+    fn resource_ownership_deserializes_agentos() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct Wrapper {
+            ownership: ResourceOwnership,
+        }
+        for name in ["agentos", "agent_os", "agent_o_s", "yardlet"] {
+            let json = format!(r#"{{"ownership": "{name}"}}"#);
+            let parsed: Wrapper = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+            assert_eq!(parsed.ownership, ResourceOwnership::AgentOS);
+        }
+        let parsed_unknown: Wrapper = serde_json::from_str(r#"{"ownership": "something_else"}"#)
+            .expect("should fallback to Unknown");
+        assert_eq!(parsed_unknown.ownership, ResourceOwnership::Unknown);
+
+        let serialized = serde_json::to_string(&Wrapper {
+            ownership: ResourceOwnership::AgentOS,
+        })
+        .unwrap();
+        assert_eq!(serialized, r#"{"ownership":"agentos"}"#);
     }
 }

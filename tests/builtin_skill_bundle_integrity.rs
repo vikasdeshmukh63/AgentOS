@@ -109,7 +109,8 @@ fn assert_sha(value: &str, label: &str) {
 }
 
 fn frontmatter_name(skill_md: &str) -> String {
-    let rest = skill_md
+    let normalized = skill_md.replace("\r\n", "\n");
+    let rest = normalized
         .strip_prefix("---\n")
         .expect("SKILL.md must start with YAML frontmatter");
     let (yaml, _) = rest
